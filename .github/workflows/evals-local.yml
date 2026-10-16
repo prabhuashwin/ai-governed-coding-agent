@@ -13,6 +13,8 @@ on:
 jobs:
   evals-local:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +60,11 @@ jobs:
           gca -c gca.toml eval ${ONLY:+--only "$ONLY"} | tee eval.log
           echo "## Local-model eval results (${{ inputs.model }})" >> "$GITHUB_STEP_SUMMARY"
           cat evals/results/*.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish results to the eval-results branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/actions-publish-results.sh "local-ollama-${{ github.run_number }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
