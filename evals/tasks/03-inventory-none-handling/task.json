@@ -1,0 +1,11 @@
+{
+  "title": "Inventory report crashes when a SKU has no price",
+  "description": "report.total_value() raises TypeError when an item has price None (unpriced items). Unpriced items should be skipped in the total and listed by unpriced_skus(). See tests/test_report.py. Do not change the tests.",
+  "acceptance_criteria": [
+    "total_value() ignores items whose price is None",
+    "unpriced_skus() returns the SKUs of items with price None, in input order",
+    "all tests pass"
+  ],
+  "test_command": ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+  "budget": {"max_turns": 20, "max_cost_usd": 0.75, "max_seconds": 400}
+}

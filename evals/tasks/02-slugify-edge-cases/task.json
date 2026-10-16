@@ -1,0 +1,12 @@
+{
+  "title": "slugify: handle unicode, punctuation runs and empty input",
+  "description": "slugify() is used for URL slugs. It currently produces double hyphens for punctuation runs, leaves leading/trailing hyphens, and crashes on None. Make the tests in tests/test_slugify.py pass without changing them.",
+  "acceptance_criteria": [
+    "consecutive separators collapse to a single hyphen",
+    "no leading or trailing hyphens",
+    "None and empty string return ''",
+    "existing passing tests keep passing"
+  ],
+  "test_command": ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+  "budget": {"max_turns": 20, "max_cost_usd": 0.75, "max_seconds": 400}
+}

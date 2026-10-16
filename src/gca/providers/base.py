@@ -1,0 +1,92 @@
+"""Provider-agnostic message schema.
+
+The agent loop only speaks this schema. Each adapter translates to/from its API's wire format,
+so swapping providers is a config change, and tests can use scripted/replay providers.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any, Literal, Protocol, runtime_checkable
+
+from pydantic import BaseModel, Field
+
+
+class TextBlock(BaseModel):
+    type: Literal["text"] = "text"
+    text: str
+
+
+class ToolUseBlock(BaseModel):
+    type: Literal["tool_use"] = "tool_use"
+    id: str
+    name: str
+    input: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolResultBlock(BaseModel):
+    type: Literal["tool_result"] = "tool_result"
+    tool_use_id: str
+    content: str
+    is_error: bool = False
+
+
+Block = TextBlock | ToolUseBlock | ToolResultBlock
+
+
+class Message(BaseModel):
+    role: Literal["user", "assistant"]
+    content: list[Block]
+
+    @staticmethod
+    def user_text(text: str) -> Message:
+        return Message(role="user", content=[TextBlock(text=text)])
+
+    def text(self) -> str:
+        return "\n".join(b.text for b in self.content if isinstance(b, TextBlock))
+
+
+class ModelResponse(BaseModel):
+    content: list[Block]
+    stop_reason: str = "end_turn"  # end_turn | tool_use | max_tokens | error
+    input_tokens: int = 0
+    output_tokens: int = 0
+    raw: dict[str, Any] | None = None
+
+    @property
+    def text(self) -> str:
+        return "\n".join(b.text for b in self.content if isinstance(b, TextBlock))
+
+    @property
+    def tool_calls(self) -> list[ToolUseBlock]:
+        return [b for b in self.content if isinstance(b, ToolUseBlock)]
+
+    def as_message(self) -> Message:
+        return Message(role="assistant", content=self.content)
+
+
+class ProviderError(Exception):
+    pass
+
+
+@runtime_checkable
+class Provider(Protocol):
+    name: str
+    model: str
+
+    def complete(self, system: str, messages: list[Message], tools: list[dict[str, Any]]) -> ModelResponse: ...
+
+
+def parse_tool_arguments(raw: Any) -> dict[str, Any]:
+    """Tool arguments may arrive as a JSON string (OpenAI) or a dict (Anthropic)."""
+    if raw is None or raw == "":
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            v = json.loads(raw)
+            return v if isinstance(v, dict) else {"value": v}
+        except json.JSONDecodeError:
+            return {"_unparsed": raw}
+    return {"value": raw}

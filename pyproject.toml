@@ -1,0 +1,56 @@
+[project]
+name = "governed-coding-agent"
+version = "0.1.0"
+description = "A governed coding-agent runner: work item -> approval -> isolated agent run -> independent verification -> auditable PR."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+dependencies = [
+    "pydantic>=2.5,<3",
+    "httpx>=0.25,<1",
+    "tomli>=2.0; python_version < '3.11'",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4",
+    "pytest-timeout>=2.2",
+    "ruff>=0.4",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+gca = "gca.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 120
+markers = [
+    "safety: red-team / control tests",
+    "e2e: end-to-end pipeline tests",
+    "eval: real-model evals (cost money; skipped unless GCA_RUN_EVALS=1)",
+]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = false
+ignore_missing_imports = true
+
+[tool.ruff.lint.per-file-ignores]
+"src/gca/cli.py" = ["E702", "E501"]

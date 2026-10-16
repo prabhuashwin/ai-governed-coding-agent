@@ -1,0 +1,27 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  fast-suite:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "${{ matrix.python }}" }
+      - run: python -m pip install -e ".[dev]"
+      - run: ruff check src tests
+      - run: mypy src
+      - run: python -m pytest -q
+  # Real-model evals run manually or on a schedule; never on every push.
+  evals:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install -e .
+      - run: gca init && gca eval
+        env: { ANTHROPIC_API_KEY: "${{ secrets.ANTHROPIC_API_KEY }}" }

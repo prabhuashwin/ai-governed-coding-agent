@@ -1,0 +1,10 @@
+.venv/
+.gca/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+evals/results/*-data/
+cassettes/*.json
+gca.toml

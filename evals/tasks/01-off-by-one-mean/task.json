@@ -1,0 +1,11 @@
+{
+  "title": "Fix mean() off-by-one",
+  "description": "Users report that stats.mean([2, 4, 6]) returns 6.0 instead of 4.0. The failing test is tests/test_stats.py::test_mean.",
+  "acceptance_criteria": [
+    "mean() returns the arithmetic mean for non-empty lists",
+    "mean([]) still raises ValueError",
+    "all tests pass"
+  ],
+  "test_command": ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+  "budget": {"max_turns": 15, "max_cost_usd": 0.5, "max_seconds": 300}
+}
