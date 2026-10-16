@@ -7,15 +7,16 @@ src="$(pwd)"
 tmp="$(mktemp -d)"
 git config --global user.name "gca-ci"
 git config --global user.email "gca-ci@users.noreply.github.com"
-if git ls-remote --exit-code --heads origin eval-results >/dev/null 2>&1; then
-  git clone -q --branch eval-results --depth 1 "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$tmp"
+url="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+if git ls-remote --exit-code --heads "$url" eval-results >/dev/null 2>&1; then
+  git clone -q --branch eval-results --depth 1 "$url" "$tmp"
 else
   git init -q -b eval-results "$tmp"
-  git -C "$tmp" remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+  git -C "$tmp" remote add origin "$url"
 fi
 dest="$tmp/runs/$label"
 mkdir -p "$dest"
-cp -r "$src"/evals/results/* "$dest"/ 2>/dev/null || true
+cp -r "$src"/evals/results/. "$dest"/ 2>/dev/null || true
 cp "$src"/eval.log "$dest"/ 2>/dev/null || true
 cp "$src"/ollama.log "$dest"/ 2>/dev/null || true
 {

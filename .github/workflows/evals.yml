@@ -50,6 +50,17 @@ jobs:
         run: |
           if [ "${{ inputs.provider }}" = "openai" ] && [ -z "$OPENAI_API_KEY" ]; then echo "::error::OPENAI_API_KEY secret is not set"; exit 1; fi
           if [ "${{ inputs.provider }}" = "anthropic" ] && [ -z "$ANTHROPIC_API_KEY" ]; then echo "::error::ANTHROPIC_API_KEY secret is not set"; exit 1; fi
+      - name: Apply the per-task cost cap
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          cap = float("${{ inputs.max_cost_per_task }}")
+          for t in pathlib.Path("evals/tasks").glob("*/task.json"):
+              d = json.loads(t.read_text()); d.setdefault("budget", {})
+              d["budget"]["max_cost_usd"] = min(cap, d["budget"].get("max_cost_usd", cap))
+              t.write_text(json.dumps(d, indent=2))
+              print(t.parent.name, "max_cost_usd =", d["budget"]["max_cost_usd"])
+          PY
       - name: Run golden-task evals
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -59,6 +70,11 @@ jobs:
           gca -c gca.toml eval --repeats "${{ inputs.repeats }}" ${ONLY:+--only "$ONLY"} | tee eval.log
           echo "## Eval results (${{ inputs.provider }})" >> "$GITHUB_STEP_SUMMARY"
           cat evals/results/*.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish results to the eval-results branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/actions-publish-results.sh "real-${{ inputs.provider }}-${{ github.run_number }}"
       - name: Publish results to the eval-results branch
         if: always()
         env:
