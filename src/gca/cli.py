@@ -19,6 +19,15 @@ EXAMPLE_CONFIG = """# gca.toml — governed coding agent configuration
 data_dir = ".gca"
 worker_id = "worker-1"
 
+[workspace]
+# kind: worktree (git worktree on this host) | container (each command in a throwaway docker/podman container)
+kind = "worktree"
+runtime = "docker"
+image = "python:3.12-slim"   # must contain the toolchain your test command needs
+network = "none"
+memory = "2g"
+cpus = "2"
+
 [provider]
 # kind: anthropic | openai_compatible | scripted | replay
 kind = "anthropic"
@@ -38,6 +47,12 @@ max_tokens = 4096
 # kind = "openai_compatible"; base_url = "http://localhost:11434/v1"; model = "qwen2.5-coder:14b"
 # api_key_env = ""; require_api_key = false
 
+[servicenow]                # optional: `gca servicenow-sync` polls this table (approval happens in ServiceNow)
+# instance_url = "https://dev12345.service-now.com"
+# table = "x_gca_work_item"
+# user_env = "SN_USER"
+# password_env = "SN_PASSWORD"
+
 [budget]
 max_turns = 30
 max_tool_calls = 120
@@ -45,6 +60,8 @@ max_input_tokens = 400000
 max_output_tokens = 60000
 max_cost_usd = 2.0
 max_seconds = 900
+max_files_changed = 20     # verifier fails the job if the diff is larger than this
+max_lines_changed = 800
 
 [policy]
 allowed_commands = ["python", "python3", "pytest", "npm", "node", "npx", "ls", "cat", "grep"]
@@ -91,6 +108,10 @@ def cmd_submit(args, cfg):
         budget.max_cost_usd = args.max_cost
     if args.max_turns is not None:
         budget.max_turns = args.max_turns
+    if args.max_files is not None:
+        budget.max_files_changed = args.max_files
+    if args.max_lines is not None:
+        budget.max_lines_changed = args.max_lines
     q = _queue(cfg)
     job = q.submit(item, budget)
     AuditLog(cfg.audit_dir, job.id).record(args.requester, "submitted", work_item=item.model_dump(), budget=budget.model_dump())
@@ -177,6 +198,34 @@ def cmd_audit(args, cfg):
     return 0
 
 
+def cmd_publish(args, cfg):
+    from .publish import publish_job
+    res = publish_job(cfg, _queue(cfg), args.job_id, remote=args.remote, base=args.base, draft=not args.ready,
+                      create_pr=not args.no_pr, allow_failed=args.allow_failed)
+    print(f"pushed {res.branch} -> {res.pushed_to}")
+    if res.pr_url:
+        print(f"pull request: {res.pr_url}")
+    if res.note:
+        print(res.note)
+    return 0
+
+
+def cmd_servicenow_sync(args, cfg):
+    import time as _time
+
+    from .sources.servicenow import ServiceNowSource, sync_once
+    source = ServiceNowSource(cfg.servicenow)
+    q = _queue(cfg)
+    while True:
+        rep = sync_once(cfg, q, source)
+        for k in ("queued", "updated", "errors"):
+            for line in rep[k]:
+                print(f"{k}: {line}")
+        if args.once:
+            return 1 if rep["errors"] else 0
+        _time.sleep(args.poll or cfg.servicenow.poll_seconds)
+
+
 def cmd_eval(args, cfg):
     from .evals import run_evals
     summary = run_evals(cfg, Path(args.tasks_dir), Path(args.out), only=args.only, repeats=args.repeats)
@@ -199,6 +248,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--test-cmd", help="e.g. 'python -m pytest -q'")
     s.add_argument("--allowed-path", action="append"); s.add_argument("--requester", default="cli")
     s.add_argument("--idempotency-key"); s.add_argument("--max-cost", type=float); s.add_argument("--max-turns", type=int)
+    s.add_argument("--max-files", type=int, help="diff may touch at most N files"); s.add_argument("--max-lines", type=int, help="diff may change at most N lines")
     s.set_defaults(fn=cmd_submit)
 
     s = sub.add_parser("approve", help="approve (or --reject) a job"); s.add_argument("job_id"); s.add_argument("--approver", required=True); s.add_argument("--note", default=""); s.add_argument("--reject", action="store_true"); s.set_defaults(fn=cmd_approve)
@@ -207,6 +257,8 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status"); s.add_argument("job_id", nargs="?"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("report"); s.add_argument("job_id"); s.add_argument("--out"); s.add_argument("--diff", action="store_true"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("audit"); s.add_argument("job_id"); s.add_argument("--verify", action="store_true"); s.set_defaults(fn=cmd_audit)
+    s = sub.add_parser("publish", help="push a succeeded job's branch and open a draft pull request"); s.add_argument("job_id"); s.add_argument("--remote", default="origin"); s.add_argument("--base", help="base branch (default: the remote's HEAD)"); s.add_argument("--ready", action="store_true", help="open as ready for review instead of draft"); s.add_argument("--no-pr", action="store_true", help="push only"); s.add_argument("--allow-failed", action="store_true", help="publish a failed job's branch for inspection"); s.set_defaults(fn=cmd_publish)
+    s = sub.add_parser("servicenow-sync", help="poll ServiceNow for approved work items and write status back"); s.add_argument("--once", action="store_true"); s.add_argument("--poll", type=float); s.set_defaults(fn=cmd_servicenow_sync)
     s = sub.add_parser("eval", help="run golden-task evals against the configured provider"); s.add_argument("--tasks-dir", default="evals/tasks"); s.add_argument("--out", default="evals/results"); s.add_argument("--only"); s.add_argument("--repeats", type=int, default=1); s.set_defaults(fn=cmd_eval)
     return p
 

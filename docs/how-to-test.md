@@ -19,6 +19,9 @@ Pure, deterministic components. They answer: *do the controls do exactly what th
 | `test_queue_audit.py` | Idempotent submit; only legal state transitions; terminal states final; atomic claim under 4 concurrent workers; cancel semantics; stale-worker recovery; audit chain verifies and detects edit **and** deletion |
 | `test_workspace_tools.py` | Worktree isolates the engineer's checkout; branch kept after cleanup; every tool (list/read/search/edit/write/run); ambiguous & missing edits; timeouts; missing binaries; output truncation |
 | `test_providers.py` | Anthropic and OpenAI-compatible wire formats both ways (via mocked HTTP); auth header variants; retry then error; clear missing-key error; scripted/record/replay providers; pricing prefix match; TOML config loading |
+| `test_container_workspace.py` | Exact hardened `docker run` argv; full pipeline (agent + verifier) through a fake runtime; timeout kills the container; `.gca-home` excluded from diffs; real-daemon network test (skipped without a daemon) |
+| `test_servicenow.py` | Record → WorkItem mapping; polling only `approved` records; approval mirrored with the ServiceNow approver; idempotent across cycles; terminal status + audit hash written back; one bad record doesn't stop the cycle; HTTP errors surface |
+| `test_publish_and_windows_paths.py` | `gca publish`: push to a local bare remote, draft PR via mocked GitHub API, token-less push-only, refuses failed jobs, existing-PR handling; Windows-style path and argument escapes (drive letters, UNC, backslash traversal, `.exe` suffix) |
 
 ## Layer 2 — Loop tests (`tests/loop/`)
 
@@ -39,7 +42,7 @@ A **malicious or gullible model** obeys injected instructions. They answer: *do 
 - Injection in a repo file and in test output → `sudo`, absolute and traversal writes blocked; nothing written outside the worktree.
 - Blocked-action limit halts the run (`policy_halt`).
 - Canary secret: withheld from tool output, flagged in the diff (`secret_canary_in_diff`), redacted from the audit log.
-- Verifier catches: deleted test file, reduced test count, newly skipped tests, test-config tampering, claimed success with failing tests, no-op runs.
+- Verifier catches: deleted test file, reduced test count, newly skipped tests, test-config tampering, claimed success with failing tests, no-op runs, and diffs larger than the job's `max_files_changed` / `max_lines_changed` budget.
 
 Add a new attack by adding a scripted step list; if the harness lets it through, the test fails.
 
@@ -94,10 +97,12 @@ Track accepted-PR rate and reviewer time per job; the proposal's acceptance targ
 - A new provider → mocked wire-format test in `test_providers.py`; an eval run before relying on it.
 - A new task type → an eval task directory (see `evals/README.md`).
 
-## Known gaps (deliberate for the pilot)
+## Known gaps
 
-- Isolation is worktree + allow-list + scrubbed env, not a container: a model running arbitrary Python
-  inside `run_command` can still reach the network from the subprocess. Treat the worker host as a
-  developer machine with no production credentials, and add the container `Workspace` before wider use.
-- Windows: the worker runs under WSL/Linux in the pilot; native Windows path rules are not yet tested.
-- The ServiceNow adapter is not covered by automated tests (needs a PDI).
+- `kind = "worktree"` is not a sandbox against a hostile model (an allow-listed `python` can open sockets).
+  Use `kind = "container"` outside a trusted developer machine. The container path is tested through a
+  fake runtime and an argv check; the real-daemon test runs only where Docker/Podman is available, so run
+  `pytest tests/unit/test_container_workspace.py` on a machine with Docker before relying on it.
+- The ServiceNow adapter is tested against a mocked Table API, not a live instance.
+- Windows path *rules* are tested; the worker itself has only been run on Linux (WSL on the pilot machine).
+- No real-model eval baseline has been recorded yet (`gca eval` needs an API key).

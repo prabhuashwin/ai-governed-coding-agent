@@ -109,8 +109,8 @@ class PolicyEngine:
             raise PolicyViolation(
                 f"command {exe!r} is not on the allow-list {sorted(self.cfg.allowed_commands)}")
         for tok in argv[1:]:
-            if tok.startswith("/") or tok.startswith("~") or (len(tok) > 1 and tok[1] == ":" and tok[0].isalpha()):
-                raise PolicyViolation(f"absolute paths in arguments are not allowed: {tok}")
+            if (tok.startswith(("/", "~", "\\")) or (len(tok) > 1 and tok[1] == ":" and tok[0].isalpha())):
+                raise PolicyViolation(f"absolute or UNC paths in arguments are not allowed: {tok}")
             if ".." in PurePosixPath(tok.replace("\\", "/")).parts:
                 raise PolicyViolation(f"path traversal in arguments is not allowed: {tok}")
         return argv

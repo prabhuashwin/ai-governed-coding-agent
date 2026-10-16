@@ -56,15 +56,19 @@ dies leaves a stale heartbeat; `recover_stale` moves the job to `failed` with a 
 | Blocked-action halt; blocked action ⇒ job fails | `AgentLoop`, `Worker` | loop, safety |
 | Canary secrets withheld from output, flagged in diff, redacted in audit | `ToolExecutor`, `Verifier`, `AuditLog` | safety |
 | Test tamper detection (deleted/renamed/skipped tests, fewer tests, config changes) | `Verifier.tamper_flags` | safety |
+| Diff-size budget (files / lines changed) | `Verifier.verify` from `Budget` | safety |
+| Container isolation (no network, dropped caps, limits) for agent and verifier | `ContainerWorkspace`, `make_runner` | unit (fake runtime), real daemon when present |
+| Publishing is explicit and human-invoked; PRs open as drafts | `publish.py` | unit |
 | Independent test run from clean checkout | `Verifier.verify` | safety, e2e |
 | Hash-chained audit log | `AuditLog`, `verify_chain` | unit, e2e |
 | Idempotent submit, atomic claim, crash recovery | `JobQueue` | unit |
 
 ## Residual risks (pilot)
 
-1. **Subprocess escape** — `run_command` runs allow-listed programs (python, node…) which can themselves open
-   sockets or read files outside the worktree. Mitigation now: scrubbed env, no credentials on the host,
-   short timeouts. Mitigation next: container/VM `Workspace` with no network and a read-only base image.
+1. **Subprocess escape (worktree mode)** — allow-listed programs (python, node…) can open sockets or read host
+   files. Mitigation: `[workspace] kind = "container"` runs each command and the verifier in a throwaway
+   container with `--network=none`, `--cap-drop=ALL`, `no-new-privileges`, memory/CPU/pid limits and only the
+   worktree mounted. Residual: the container image itself must be trusted and kept patched.
 2. **Prompt injection changing the *fix*** — a hostile file could steer the model into a subtle bad change that
    still passes tests. Mitigation: human review of every PR (the report highlights blocked actions and
    diff size); keep tasks bounded; add diff-size budgets per task.
@@ -73,8 +77,8 @@ dies leaves a stale heartbeat; `recover_stale` moves the job to `failed` with a 
 
 ## Extending
 
-- **Container backend**: implement `Workspace` (run/diff/changed_files/diff_stat/commit_all/cleanup) over
-  `docker run --network none -v <worktree>:/work`; the agent and verifier do not change.
+- **Container backend**: `ContainerWorkspace` + `make_runner` already route agent commands and the verifier
+  through `docker run --network=none …`; swap the image per language toolchain.
 - **New provider**: subclass nothing — implement `complete(system, messages, tools) -> ModelResponse`.
 - **ServiceNow**: `sources/servicenow.py` polls approved records and writes status/report back; approval
   stays in ServiceNow.

@@ -56,7 +56,13 @@ gca approve <job_id> --approver lead
 gca run --once                             # or: gca run  (long-running worker)
 gca report <job_id> --diff                 # the PR description + diff
 gca audit <job_id> --verify                # hash-chain check of the audit log
+gca publish <job_id>                       # push gca/<job_id> and open a draft PR (GITHUB_TOKEN)
+gca servicenow-sync --once                 # poll a ServiceNow table for approved items, write status back
 ```
+
+Isolation is chosen in `gca.toml`: `[workspace] kind = "worktree"` (default) or `kind = "container"`, which
+runs every agent command *and* the verifier inside a throwaway Docker/Podman container with no network,
+dropped capabilities and memory/CPU/pid limits, the repository bind-mounted at `/work`.
 
 The agent's work lands on branch `gca/<job_id>` in your repository; your working copy is never touched.
 
@@ -73,15 +79,16 @@ src/gca/
   config.py      gca.toml → Config (provider, budget, policy, pricing)
   policy.py      PolicyEngine (paths, commands, env, canaries) + BudgetTracker
   queue.py       SQLite job queue: idempotent submit, atomic claim, stale recovery
-  workspace.py   GitWorktreeWorkspace (container backend can replace it)
+  workspace.py   GitWorktreeWorkspace, ContainerWorkspace (docker/podman, no network), factory + runner
   tools.py       tool schemas + ToolExecutor
   agent.py       AgentLoop
   verifier.py    independent verification + tamper detection
   worker.py      claim → run → verify → report
   report.py      PR-style markdown report
   audit.py       hash-chained JSONL audit log
+  publish.py     push branch + open GitHub pull request
   providers/     base schema, anthropic, openai_compat, testing (scripted/record/replay)
-  sources/       servicenow.py (experimental Table API adapter)
+  sources/       servicenow.py (Table API adapter + sync loop; tested against a mocked API)
   evals.py       golden-task eval runner
   cli.py         `gca`
 tests/           unit · loop · safety · e2e
@@ -91,6 +98,8 @@ docs/            architecture, threat model, how-to-test
 
 ## Status
 
-Pilot-grade. Isolation is git-worktree + allow-listed commands + scrubbed environment; it is **not** a
-sandbox against a hostile *model* that can run arbitrary Python. The `Workspace` interface is the seam
-where a container/VM backend goes before any deployment outside a trusted developer machine.
+Pilot-grade. With `kind = "worktree"`, isolation is a git worktree + allow-listed commands + scrubbed
+environment — fine for a trusted developer machine, not a sandbox against a hostile model. Use
+`kind = "container"` anywhere else. Still open: a real-model eval baseline (`gca eval` with your key),
+validating the ServiceNow adapter against a live instance, and a local-model (`openai_compatible`)
+run for customers that forbid external inference.

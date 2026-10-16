@@ -10,11 +10,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
-from .config import PolicyConfig
+from .config import PolicyConfig, WorkspaceConfig
 from .models import VerificationResult
 from .policy import PolicyEngine
+from .workspace import make_runner
 
 TEST_FILE_PATTERNS = [
     r"(^|/)tests?/", r"(^|/)test_[^/]+\.py$", r"_test\.py$", r"\.test\.[cm]?[jt]sx?$", r"\.spec\.[cm]?[jt]sx?$",
@@ -53,13 +55,18 @@ def _count_tests(path: str, text: str) -> int:
 
 class Verifier:
     def __init__(self, repo_path: str | Path, base_commit: str, branch: str, test_command: list[str],
-                 policy_cfg: PolicyConfig, *, timeout: int | None = None):
+                 policy_cfg: PolicyConfig, *, timeout: int | None = None, run_fn: Callable | None = None,
+                 max_files_changed: int | None = None, max_lines_changed: int | None = None):
         self.repo = Path(repo_path).resolve()
         self.base = base_commit
         self.branch = branch
         self.test_command = list(test_command)
         self.policy_cfg = policy_cfg
         self.timeout = timeout or policy_cfg.command_timeout_seconds
+        self.max_files_changed = max_files_changed
+        self.max_lines_changed = max_lines_changed
+        # (argv, cwd, env, timeout) -> CommandResult; defaults to a host subprocess
+        self.run_fn = run_fn or make_runner(WorkspaceConfig(), "verify")
 
     def tamper_flags(self) -> list[str]:
         """Detect deleted/weakened tests and test-config changes between base and branch."""
@@ -94,15 +101,9 @@ class Verifier:
         try:
             _git(self.repo, "worktree", "add", "--detach", str(wt), self.branch)
             policy = PolicyEngine(self.policy_cfg, wt)
-            try:
-                cp = subprocess.run(self.test_command, cwd=str(wt), env=policy.subprocess_env(),
-                                    capture_output=True, text=True, timeout=self.timeout,
-                                    stdin=subprocess.DEVNULL, errors="replace")
-                exit_code, out, ran = cp.returncode, cp.stdout + ("\n[stderr]\n" + cp.stderr if cp.stderr else ""), True
-            except subprocess.TimeoutExpired:
-                exit_code, out, ran = -1, f"[test command timed out after {self.timeout}s]", True
-            except FileNotFoundError as e:
-                exit_code, out, ran = 127, f"test command not found: {e}", False
+            res = self.run_fn(self.test_command, wt, policy.subprocess_env(), self.timeout)
+            exit_code, out, ran = res.exit_code, res.output, res.exit_code != 127
+            shutil.rmtree(wt / ".gca-home", ignore_errors=True)
 
             diff = _git(self.repo, "diff", "--no-color", f"{self.base}..{self.branch}")
             canaries = policy.find_canaries(diff)
@@ -118,6 +119,10 @@ class Verifier:
                     if p[0].isdigit() and p[1].isdigit():
                         ins += int(p[0])
                         dels += int(p[1])
+            if self.max_files_changed is not None and len(files) > self.max_files_changed:
+                flags.append(f"diff_too_large:files:{len(files)}>{self.max_files_changed}")
+            if self.max_lines_changed is not None and ins + dels > self.max_lines_changed:
+                flags.append(f"diff_too_large:lines:{ins + dels}>{self.max_lines_changed}")
             passed = ran and exit_code == 0 and not flags and bool(files)
             return VerificationResult(passed=passed, tests_ran=ran, exit_code=exit_code,
                                       output_tail=out[-4000:], flags=flags, files_changed=files,

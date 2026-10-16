@@ -179,3 +179,23 @@ def test_test_config_tampering_is_flagged(config, work_item):
     ]
     job, _, _ = run_pipeline(config, work_item, steps)
     assert job.status == JobStatus.FAILED and "test_config_modified:conftest.py" in job.result.verification.flags
+
+
+def test_diff_size_budget_is_enforced(config, work_item):
+    big = "\n".join(f"# filler line {i}" for i in range(400)) + "\n"
+    steps = [
+        {"tool_calls": [{"name": "edit_file", "arguments": {"path": "calc.py", "old": CALC_FIX_OLD, "new": CALC_FIX_NEW}}]},
+        {"tool_calls": [{"name": "write_file", "arguments": {"path": "junk1.py", "content": big}}]},
+        {"tool_calls": [{"name": "write_file", "arguments": {"path": "junk2.py", "content": big}}]},
+        {"tool_calls": [{"name": "finish", "arguments": {"summary": "fixed (and refactored a bit)", "success": True}}]},
+    ]
+    config.budget.max_files_changed = 2
+    config.budget.max_lines_changed = 100
+    q = JobQueue(config.db_path)
+    job = q.submit(work_item, config.budget)
+    q.approve(job.id, "approver")
+    job = Worker(config, q, provider_factory=lambda: ScriptedProvider(steps)).run_once()
+    assert job.status == JobStatus.FAILED
+    flags = job.result.verification.flags
+    assert "diff_too_large:files:3>2" in flags and any(f.startswith("diff_too_large:lines:") for f in flags)
+    assert job.result.verification.exit_code == 0  # tests passed; size alone failed it

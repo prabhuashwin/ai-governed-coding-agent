@@ -53,6 +53,9 @@ class Budget(BaseModel):
     max_cost_usd: float = 2.0
     max_seconds: int = 900
     max_tool_calls: int = 120
+    # Diff-size limits checked by the verifier: a small bug fix should not touch half the repo.
+    max_files_changed: int = 20
+    max_lines_changed: int = 800  # insertions + deletions
 
 
 class WorkItem(BaseModel):

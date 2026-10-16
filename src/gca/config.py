@@ -75,8 +75,31 @@ class PricingConfig(BaseModel):
     output_per_million: dict[str, float] = Field(default_factory=dict)
 
 
+class WorkspaceConfig(BaseModel):
+    kind: str = "worktree"  # worktree | container
+    runtime: str = "docker"  # docker | podman (container kind only)
+    image: str = "python:3.12-slim"
+    network: str = "none"
+    memory: str = "2g"
+    cpus: str = "2"
+    pids_limit: int = 256
+    extra_args: list[str] = Field(default_factory=list)
+    run_as_host_user: bool = True
+
+
+class ServiceNowConfig(BaseModel):
+    instance_url: str = ""  # e.g. https://dev12345.service-now.com
+    table: str = "x_gca_work_item"
+    user_env: str = "SN_USER"
+    password_env: str = "SN_PASSWORD"
+    timeout_seconds: float = 30.0
+    poll_seconds: float = 30.0
+
+
 class Config(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
+    servicenow: ServiceNowConfig = Field(default_factory=ServiceNowConfig)
     budget: Budget = Field(default_factory=Budget)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     pricing: PricingConfig = Field(default_factory=PricingConfig)

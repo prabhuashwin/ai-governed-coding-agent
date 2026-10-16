@@ -22,7 +22,7 @@ from .queue import JobQueue
 from .report import render_report
 from .tools import ToolExecutor
 from .verifier import Verifier
-from .workspace import GitWorktreeWorkspace
+from .workspace import make_runner, make_workspace
 
 
 class Worker:
@@ -56,9 +56,10 @@ class Worker:
         ws = None
         result = RunResult(job_id=job.id)
         try:
-            ws = GitWorktreeWorkspace(wi.repo_path, job.id, wi.base_ref)
+            ws = make_workspace(self.cfg.workspace, wi.repo_path, job.id, wi.base_ref)
             result.branch = ws.branch
-            audit.record(f"worker:{self.worker_id}", "workspace_created", branch=ws.branch, base=ws.base_commit)
+            audit.record(f"worker:{self.worker_id}", "workspace_created", branch=ws.branch, base=ws.base_commit,
+                         kind=self.cfg.workspace.kind, image=self.cfg.workspace.image if self.cfg.workspace.kind == "container" else None)
 
             policy = PolicyEngine(self.cfg.policy, ws.root, wi.allowed_paths)
             tracker = BudgetTracker(job.budget)
@@ -87,7 +88,10 @@ class Worker:
 
             job = self.queue.transition(job.id, JobStatus.VERIFYING)
             self.queue.heartbeat(job.id)
-            verifier = Verifier(wi.repo_path, ws.base_commit, ws.branch, wi.test_command, self.cfg.policy)
+            verifier = Verifier(wi.repo_path, ws.base_commit, ws.branch, wi.test_command, self.cfg.policy,
+                                run_fn=make_runner(self.cfg.workspace, job.id),
+                                max_files_changed=job.budget.max_files_changed,
+                                max_lines_changed=job.budget.max_lines_changed)
             verification = verifier.verify()
             result.verification = verification
             audit.record("verifier", "verified", passed=verification.passed, flags=verification.flags,

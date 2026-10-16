@@ -100,7 +100,8 @@ class AgentLoop:
     def run(self, item: WorkItem) -> AgentOutcome:
         b = self.tracker.budget
         budget_note = (f"Budget: {b.max_turns} turns, {b.max_tool_calls} tool calls, "
-                       f"{b.max_seconds // 60} minutes, ${b.max_cost_usd:.2f}")
+                       f"{b.max_seconds // 60} minutes, ${b.max_cost_usd:.2f}; the final diff may touch at most "
+                       f"{b.max_files_changed} files / {b.max_lines_changed} changed lines")
         self.messages = [Message.user_text(_task_message(item, budget_note))]
         self.audit.record("agent", "started", provider=self.provider.name, model=self.provider.model,
                           budget=b.model_dump())
