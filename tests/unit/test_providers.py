@@ -188,10 +188,11 @@ def test_extract_text_tool_calls_variants():
 def test_extract_text_tool_calls_rejects_prose_and_unknown_tools():
     assert extract_text_tool_calls("I will now fix the bug in stats.py.", KNOWN) == []
     assert extract_text_tool_calls('{"name": "rm_rf", "arguments": {}}', KNOWN) == []
-    prose = ("Here is a long explanation of what I would do and why it matters, with lots of detail about the approach, "
-             "the risks, the alternatives considered and so on, which mentions "
-             '{"name": "run_tests", "arguments": {}} only as an example of the syntax rather than a real request. ' * 2)
-    assert extract_text_tool_calls(prose, KNOWN) == []
+    quoted = ('I could call {"name": "run_tests", "arguments": {}} but first let me explain the approach in detail.')
+    assert extract_text_tool_calls(quoted, KNOWN) == []
+    explained_then_called = ("The relevant files are conftest.py and textutil.py.\n\nLet's run the tests.\n\n[tool call]\n"
+                             '{"name": "run_tests", "arguments": {}}\n\n')
+    assert [c.name for c in extract_text_tool_calls(explained_then_called, KNOWN)] == ["run_tests"]
     assert extract_text_tool_calls('{"name": "run_tests", "arguments": {}} and also {"foo": 1}', KNOWN) == []
 
 

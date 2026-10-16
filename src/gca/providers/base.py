@@ -106,10 +106,12 @@ def extract_text_tool_calls(text: str, known_tools: set[str]) -> list[ToolUseBlo
         if name not in known_tools:
             return []
         calls.append(ToolUseBlock(id=f"text_{uuid.uuid4().hex[:8]}", name=name, input=parse_tool_arguments(args)))
-    # reject if there was substantial prose besides the JSON (likely an explanation quoting a call)
-    stripped = re.sub(r"\s", "", body)
-    json_chars = sum(len(json.dumps(c.input, separators=(",", ":"))) + len(c.name) for c in calls)
-    if calls and len(stripped) > json_chars * 3 + 80:
+    if not calls:
+        return []
+    # Accept "some explanation, then the call(s)" — but reject JSON buried mid-prose with more prose after it
+    # (that is an explanation quoting a call, not a request). `i` is the end of the last JSON object.
+    trailing = re.sub(r"[\s`\[\]]|tool call|\[tool call\]", "", body[i:], flags=re.I)
+    if trailing:
         return []
     return calls
 
