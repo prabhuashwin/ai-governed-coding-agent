@@ -78,11 +78,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: .github/actions-publish-results.sh "real-${{ inputs.provider }}-${{ github.run_number }}"
-      - name: Publish results to the eval-results branch
-        if: always()
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: .github/actions-publish-results.sh "real-${{ inputs.provider }}-${{ github.run_number }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
