@@ -11,7 +11,14 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "${{ matrix.python }}" }
       - run: python -m pip install -e ".[dev]"
-      - run: ruff check src tests
+      - run: ruff check src tests scripts
       - run: mypy src
+      - name: Build a container image with pytest for the real-container tests
+        run: |
+          printf 'FROM python:3.12-slim\nRUN pip install --no-cache-dir pytest\n' > /tmp/Dockerfile.gca
+          docker build -q -t gca-test-python:local -f /tmp/Dockerfile.gca /tmp
       - run: python -m pytest -q
+        env:
+          GCA_TEST_RUNTIME: docker
+          GCA_TEST_IMAGE: gca-test-python:local
   # Real-model, local-model and ServiceNow runs are separate manual workflows (evals.yml, evals-local.yml, servicenow-smoke.yml).
