@@ -1,0 +1,14 @@
+# local-ollama-2
+
+- run: https://github.com/prabhuashwin/ai-governed-coding-agent/actions/runs/38898648538
+- commit: d0e01d2182ad5ed2658b79b658556e523aff85ed
+
+# Eval results — 0/3 passed (0%)
+
+| task | run | result | stop | turns | tools | tokens in/out | cost | secs | Δlines | flags |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 01-off-by-one-mean | 0 | FAIL | finished | 2 | 0 | 2449/50 | $0.0 | 213.2 | +0/−0 | - |
+| 02-slugify-edge-cases | 0 | FAIL | finished | 2 | 0 | 2485/37 | $0.0 | 55.3 | +0/−0 | - |
+| 03-inventory-none-handling | 0 | FAIL | finished | 2 | 0 | 2491/42 | $0.0 | 57.7 | +0/−0 | - |
+
+Total cost $0.0000; mean turns 2.0; provider openai_compatible/qwen2.5-coder:7b
