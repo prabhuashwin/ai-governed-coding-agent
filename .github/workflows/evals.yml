@@ -1,0 +1,66 @@
+name: evals (real model)
+# Manual: Actions → "evals (real model)" → Run workflow. Needs repository secret ANTHROPIC_API_KEY or OPENAI_API_KEY.
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "anthropic | openai"
+        default: "anthropic"
+        type: choice
+        options: [anthropic, openai]
+      model:
+        description: "model name (blank = provider default)"
+        default: ""
+      repeats:
+        description: "runs per task (variance)"
+        default: "1"
+      only:
+        description: "substring filter on task name (blank = all)"
+        default: ""
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install -q -e .
+      - name: Write gca.toml
+        run: |
+          if [ "${{ inputs.provider }}" = "openai" ]; then
+            MODEL="${{ inputs.model }}"; MODEL="${MODEL:-gpt-4.1}"
+            printf '[provider]\nkind = "openai_compatible"\nmodel = "%s"\napi_key_env = "OPENAI_API_KEY"\nmax_tokens = 4096\n' "$MODEL" > gca.toml
+          else
+            MODEL="${{ inputs.model }}"; MODEL="${MODEL:-claude-sonnet-4-5}"
+            printf '[provider]\nkind = "anthropic"\nmodel = "%s"\napi_key_env = "ANTHROPIC_API_KEY"\nmax_tokens = 4096\n' "$MODEL" > gca.toml
+          fi
+          cat >> gca.toml <<'TOML'
+          [pricing]
+          input_per_million = { "claude-sonnet-4-5" = 3.0, "claude-haiku-4-5" = 1.0, "claude-opus-4" = 15.0, "gpt-4.1" = 2.0, "gpt-4.1-mini" = 0.4, "gpt-5" = 1.25 }
+          output_per_million = { "claude-sonnet-4-5" = 15.0, "claude-haiku-4-5" = 5.0, "claude-opus-4" = 75.0, "gpt-4.1" = 8.0, "gpt-4.1-mini" = 1.6, "gpt-5" = 10.0 }
+          TOML
+          cat gca.toml
+      - name: Check the key is present
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ "${{ inputs.provider }}" = "openai" ] && [ -z "$OPENAI_API_KEY" ]; then echo "::error::OPENAI_API_KEY secret is not set"; exit 1; fi
+          if [ "${{ inputs.provider }}" = "anthropic" ] && [ -z "$ANTHROPIC_API_KEY" ]; then echo "::error::ANTHROPIC_API_KEY secret is not set"; exit 1; fi
+      - name: Run golden-task evals
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          ONLY="${{ inputs.only }}"
+          gca -c gca.toml eval --repeats "${{ inputs.repeats }}" ${ONLY:+--only "$ONLY"} | tee eval.log
+          echo "## Eval results (${{ inputs.provider }})" >> "$GITHUB_STEP_SUMMARY"
+          cat evals/results/*.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results-${{ inputs.provider }}-${{ github.run_number }}
+          path: |
+            evals/results/
+            eval.log

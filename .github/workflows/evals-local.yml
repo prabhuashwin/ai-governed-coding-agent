@@ -1,0 +1,68 @@
+name: evals (local model, Ollama)
+# Manual. Runs the golden tasks against a local model served by Ollama on the runner — the
+# "no external inference" customer profile. Needs no API key. CPU inference is slow; budgets are raised.
+on:
+  workflow_dispatch:
+    inputs:
+      model:
+        description: "Ollama model with tool-calling support"
+        default: "qwen2.5-coder:7b"
+      only:
+        description: "substring filter on task name (blank = all)"
+        default: ""
+jobs:
+  evals-local:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install -q -e .
+      - name: Install and start Ollama
+        run: |
+          curl -fsSL https://ollama.com/install.sh | sh
+          (ollama serve > ollama.log 2>&1 &)
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:11434/api/tags >/dev/null && break; sleep 2; done
+          ollama pull "${{ inputs.model }}"
+          ollama list
+      - name: Write gca.toml (OpenAI-compatible endpoint, no key)
+        run: |
+          cat > gca.toml <<TOML
+          [provider]
+          kind = "openai_compatible"
+          base_url = "http://127.0.0.1:11434/v1"
+          model = "${{ inputs.model }}"
+          api_key_env = ""
+          require_api_key = false
+          max_tokens = 2048
+          timeout_seconds = 600
+          [budget]
+          max_turns = 25
+          max_seconds = 2400
+          max_cost_usd = 100
+          TOML
+          cat gca.toml
+      - name: Raise per-task time budgets for CPU inference
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          for t in pathlib.Path("evals/tasks").glob("*/task.json"):
+              d = json.loads(t.read_text()); d.setdefault("budget", {})
+              d["budget"].update({"max_seconds": 2400, "max_turns": 25, "max_cost_usd": 100})
+              t.write_text(json.dumps(d, indent=2))
+          PY
+      - name: Run golden-task evals
+        run: |
+          ONLY="${{ inputs.only }}"
+          gca -c gca.toml eval ${ONLY:+--only "$ONLY"} | tee eval.log
+          echo "## Local-model eval results (${{ inputs.model }})" >> "$GITHUB_STEP_SUMMARY"
+          cat evals/results/*.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: eval-results-local-${{ github.run_number }}
+          path: |
+            evals/results/
+            eval.log
+            ollama.log

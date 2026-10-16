@@ -90,6 +90,8 @@ class WorkspaceConfig(BaseModel):
 class ServiceNowConfig(BaseModel):
     instance_url: str = ""  # e.g. https://dev12345.service-now.com
     table: str = "x_gca_work_item"
+    # "" for a scoped-app table (fields like repo_path); "u_" for a global custom table (u_repo_path)
+    field_prefix: str = ""
     user_env: str = "SN_USER"
     password_env: str = "SN_PASSWORD"
     timeout_seconds: float = 30.0

@@ -1,0 +1,56 @@
+name: servicenow smoke test
+# Manual. Needs repository secrets SN_INSTANCE_URL (https://devNNNNN.service-now.com), SN_USER, SN_PASSWORD
+# (an admin on a Personal Developer Instance is fine). Creates u_gca_work_item if missing, seeds an approved
+# record pointing at a fixture repo on the runner, runs sync → worker → sync, and verifies the write-back.
+on:
+  workflow_dispatch:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SN_INSTANCE_URL: ${{ secrets.SN_INSTANCE_URL }}
+      SN_USER: ${{ secrets.SN_USER }}
+      SN_PASSWORD: ${{ secrets.SN_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install -q -e . pytest
+      - name: Check secrets
+        run: |
+          for v in SN_INSTANCE_URL SN_USER SN_PASSWORD; do
+            if [ -z "${!v}" ]; then echo "::error::$v secret is not set"; exit 1; fi
+          done
+      - name: Create table (idempotent)
+        run: python scripts/servicenow_bootstrap.py create-table
+      - name: Prepare fixture repository on the runner
+        run: |
+          cp -r evals/tasks/01-off-by-one-mean/repo "$RUNNER_TEMP/repo"
+          git -C "$RUNNER_TEMP/repo" init -q -b main
+          git -C "$RUNNER_TEMP/repo" -c user.name=smoke -c user.email=smoke@localhost add -A
+          git -C "$RUNNER_TEMP/repo" -c user.name=smoke -c user.email=smoke@localhost commit -q -m fixture
+          echo "REPO=$RUNNER_TEMP/repo" >> "$GITHUB_ENV"
+      - name: Seed an approved work item
+        run: |
+          SYS_ID=$(python scripts/servicenow_bootstrap.py seed --repo "$REPO" --number "GCA-${{ github.run_number }}")
+          echo "SYS_ID=$SYS_ID" >> "$GITHUB_ENV"; echo "seeded $SYS_ID"
+      - name: Write gca.toml (scripted provider; the ServiceNow round-trip is what we are testing)
+        run: |
+          cat > gca.toml <<'TOML'
+          [provider]
+          kind = "scripted"
+          script_path = "scripts/smoke_script.json"
+          [servicenow]
+          table = "u_gca_work_item"
+          field_prefix = "u_"
+          TOML
+      - name: sync → run → sync
+        run: |
+          gca -c gca.toml servicenow-sync --once
+          gca -c gca.toml status
+          gca -c gca.toml run --once
+          gca -c gca.toml servicenow-sync --once
+          gca -c gca.toml status
+      - name: Verify the record was written back
+        run: python scripts/servicenow_bootstrap.py verify "$SYS_ID" --expect succeeded | tee -a "$GITHUB_STEP_SUMMARY"

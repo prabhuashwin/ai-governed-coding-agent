@@ -2,10 +2,12 @@
 
 Covered by tests against a mocked Table API; not yet validated against a live instance (needs a PDI).
 
-Expected scoped table (e.g. x_gca_work_item):
-    number, short_description, description, acceptance_criteria (one per line), repo_path, base_ref,
+Expected table (scoped app `x_gca_work_item` with field_prefix "" — or a global custom table
+`u_gca_work_item` with field_prefix "u_"; see scripts/servicenow_bootstrap.py which creates the latter):
+    short_description, description, acceptance_criteria (one per line), repo_path, base_ref,
     test_command, allowed_paths (comma-separated), state, approver,
     gca_job_id, gca_branch, gca_status, gca_report, gca_error, gca_audit_hash
+    (+ number / opened_by if the table has them)
 
 State contract:
     requested  -> engineer created it (ignored by gca)
@@ -30,13 +32,22 @@ from ..queue import JobQueue
 
 class ServiceNowSource:
     def __init__(self, cfg: ServiceNowConfig, *, transport: httpx.BaseTransport | None = None):
-        if not cfg.instance_url:
-            raise ValueError("[servicenow] instance_url is not configured")
+        instance = cfg.instance_url or os.environ.get("SN_INSTANCE_URL", "")
+        if not instance:
+            raise ValueError("[servicenow] instance_url is not configured (or set SN_INSTANCE_URL)")
         self.cfg = cfg
-        self.base = cfg.instance_url.rstrip("/")
+        self.base = instance.rstrip("/")
         self.table = cfg.table
         self.auth = (os.environ.get(cfg.user_env, ""), os.environ.get(cfg.password_env, ""))
         self._transport = transport
+        self.p = cfg.field_prefix or ""
+
+    def f(self, name: str) -> str:
+        """Field name with the configured prefix (sys_* fields are never prefixed)."""
+        return name if name.startswith("sys_") else f"{self.p}{name}"
+
+    def g(self, rec: dict[str, Any], name: str, default: Any = "") -> Any:
+        return rec.get(self.f(name), default)
 
     def _client(self) -> httpx.Client:
         return httpx.Client(timeout=self.cfg.timeout_seconds, auth=self.auth, transport=self._transport,
@@ -47,7 +58,7 @@ class ServiceNowSource:
 
     # ------------------------------------------------------------------ read
     def fetch_approved(self, limit: int = 10) -> list[dict[str, Any]]:
-        params = {"sysparm_query": "state=approved^gca_job_idISEMPTY^ORDERBYsys_created_on",
+        params = {"sysparm_query": f"{self.f('state')}=approved^{self.f('gca_job_id')}ISEMPTY^ORDERBYsys_created_on",
                   "sysparm_limit": str(limit), "sysparm_display_value": "false"}
         with self._client() as c:
             r = c.get(self._url(), params=params)
@@ -55,8 +66,9 @@ class ServiceNowSource:
             return r.json().get("result", [])
 
     def fetch_in_flight(self, limit: int = 100) -> list[dict[str, Any]]:
-        params = {"sysparm_query": "gca_job_idISNOTEMPTY^stateINapproved,running",
-                  "sysparm_limit": str(limit), "sysparm_fields": "sys_id,number,gca_job_id,state"}
+        params = {"sysparm_query": f"{self.f('gca_job_id')}ISNOTEMPTY^{self.f('state')}INapproved,running",
+                  "sysparm_limit": str(limit),
+                  "sysparm_fields": ",".join(["sys_id", self.f("number"), self.f("gca_job_id"), self.f("state")])}
         with self._client() as c:
             r = c.get(self._url(), params=params)
             r.raise_for_status()
@@ -67,28 +79,31 @@ class ServiceNowSource:
         return v.get("display_value") or v.get("value") or "" if isinstance(v, dict) else (v or "")
 
     def to_work_item(self, rec: dict[str, Any]) -> WorkItem:
-        crit = [c.strip() for c in (rec.get("acceptance_criteria") or "").splitlines() if c.strip()]
-        allowed = [p.strip() for p in (rec.get("allowed_paths") or "").split(",") if p.strip()]
-        test_cmd = shlex.split(rec.get("test_command") or "python -m pytest -q")
-        if not rec.get("repo_path"):
-            raise ValueError(f"{rec.get('number', rec.get('sys_id'))}: repo_path is empty")
+        g = self.g
+        crit = [c.strip() for c in (g(rec, "acceptance_criteria") or "").splitlines() if c.strip()]
+        allowed = [p.strip() for p in (g(rec, "allowed_paths") or "").split(",") if p.strip()]
+        test_cmd = shlex.split(g(rec, "test_command") or "python -m pytest -q")
+        label = g(rec, "number") or rec.get("sys_id")
+        if not g(rec, "repo_path"):
+            raise ValueError(f"{label}: repo_path is empty")
+        requester = self._ref(g(rec, "opened_by")) or rec.get("sys_created_by") or "servicenow"
         return WorkItem(
-            title=rec.get("short_description") or rec.get("number") or "ServiceNow work item",
-            description=rec.get("description") or "", acceptance_criteria=crit,
-            repo_path=rec["repo_path"], base_ref=rec.get("base_ref") or "HEAD", test_command=test_cmd,
-            allowed_paths=allowed, requester=self._ref(rec.get("opened_by")) or "servicenow",
+            title=g(rec, "short_description") or g(rec, "number") or "ServiceNow work item",
+            description=g(rec, "description") or "", acceptance_criteria=crit,
+            repo_path=g(rec, "repo_path"), base_ref=g(rec, "base_ref") or "HEAD", test_command=test_cmd,
+            allowed_paths=allowed, requester=requester,
             source="servicenow", source_ref=rec["sys_id"], idempotency_key=f"servicenow:{rec['sys_id']}",
         )
 
     # ----------------------------------------------------------------- write
     def write_back(self, sys_id: str, job: Job, audit_hash: str | None = None) -> None:
-        body: dict[str, Any] = {"state": job.status.value, "gca_job_id": job.id, "gca_status": job.status.value,
-                                "gca_error": job.error or ""}
+        body: dict[str, Any] = {self.f("state"): job.status.value, self.f("gca_job_id"): job.id,
+                                self.f("gca_status"): job.status.value, self.f("gca_error"): job.error or ""}
         if job.result:
-            body["gca_branch"] = job.result.branch or ""
-            body["gca_report"] = (job.result.report_markdown or "")[:60000]
+            body[self.f("gca_branch")] = job.result.branch or ""
+            body[self.f("gca_report")] = (job.result.report_markdown or "")[:60000]
         if audit_hash:
-            body["gca_audit_hash"] = audit_hash
+            body[self.f("gca_audit_hash")] = audit_hash
         with self._client() as c:
             r = c.patch(self._url(sys_id), json=body)
             r.raise_for_status()
@@ -109,29 +124,30 @@ def sync_once(cfg: Config, queue: JobQueue, source: ServiceNowSource) -> dict[st
             audit = AuditLog(cfg.audit_dir, job.id, redactions=cfg.policy.canary_strings)
             if job.status == JobStatus.SUBMITTED:
                 audit.record(item.requester, "submitted", work_item=item.model_dump(), source="servicenow",
-                             record=rec.get("number"))
-                approver = source._ref(rec.get("approver")) or "servicenow"
-                job = queue.approve(job.id, approver, note=f"approved in ServiceNow ({rec.get('number', '')})")
+                             record=source.g(rec, "number"))
+                approver = source._ref(source.g(rec, "approver")) or "servicenow"
+                job = queue.approve(job.id, approver, note=f"approved in ServiceNow ({source.g(rec, 'number')})")
                 audit.record(approver, "approved", note="mirrored from ServiceNow")
             source.write_back(rec["sys_id"], job)
-            report["queued"].append(f"{rec.get('number', rec['sys_id'])}->{job.id}")
+            report["queued"].append(f"{source.g(rec, 'number') or rec['sys_id']}->{job.id}")
         except Exception as e:  # noqa: BLE001 - one bad record must not stop the cycle
-            report["errors"].append(f"{rec.get('number', rec.get('sys_id'))}: {e}")
+            report["errors"].append(f"{source.g(rec, 'number') or rec.get('sys_id')}: {e}")
 
     for rec in source.fetch_in_flight():
+        label = source.g(rec, "number") or rec.get("sys_id")
         try:
-            job = queue.get(rec["gca_job_id"])
+            job = queue.get(source.g(rec, "gca_job_id"))
         except KeyError:
-            report["errors"].append(f"{rec.get('number')}: unknown job {rec.get('gca_job_id')}")
+            report["errors"].append(f"{label}: unknown job {source.g(rec, 'gca_job_id')}")
             continue
-        if job.status.value != rec.get("state"):
+        if job.status.value != source.g(rec, "state"):
             audit_hash = None
             if job.status in TERMINAL_STATES:
                 events = AuditLog(cfg.audit_dir, job.id).events()
                 audit_hash = events[-1].hash if events else None
             try:
                 source.write_back(rec["sys_id"], job, audit_hash)
-                report["updated"].append(f"{rec.get('number')}:{job.status.value}")
+                report["updated"].append(f"{label}:{job.status.value}")
             except Exception as e:  # noqa: BLE001
-                report["errors"].append(f"{rec.get('number')}: {e}")
+                report["errors"].append(f"{label}: {e}")
     return report

@@ -68,8 +68,9 @@ The agent's work lands on branch `gca/<job_id>` in your repository; your working
 
 ## Testing
 
-Fast suite (no model, no network, ~20 s): `make test` or `pytest`.
-Real-model evals (cost money): `gca eval`. See **docs/how-to-test.md** for the full layered plan.
+Fast suite (no model, no network, ~30 s): `make test` or `pytest`.
+Real-model evals: `gca eval` locally, or the manual GitHub workflows **evals (real model)**, **evals (local model, Ollama)**
+and **servicenow smoke test** — keys stay in repository secrets. See **docs/how-to-test.md**.
 
 ## Layout
 

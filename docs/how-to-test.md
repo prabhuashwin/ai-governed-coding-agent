@@ -74,6 +74,28 @@ Read the `.md` in `evals/results/`. What to look for:
 Set `record = true` + `cassette_path` in the provider config to capture a real run as a cassette, then
 `kind = "replay"` to re-run it deterministically in CI (layer 2 with real model behaviour).
 
+### Running the evals without handling keys locally — GitHub Actions
+
+Three manual workflows (Actions tab → Run workflow). Keys live only in repository secrets.
+
+| Workflow | Needs | What it does |
+|---|---|---|
+| **evals (real model)** | `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` secret | `gca eval` against the chosen provider/model; results in the job summary and as an artifact |
+| **evals (local model, Ollama)** | nothing | Installs Ollama on the runner, pulls a tool-capable model (default `qwen2.5-coder:7b`), runs the evals through the `openai_compatible` adapter — the no-external-inference profile |
+| **servicenow smoke test** | `SN_INSTANCE_URL`, `SN_USER`, `SN_PASSWORD` secrets (a PDI admin is fine) | Creates `u_gca_work_item` if missing, seeds an approved record, runs sync → worker → sync, verifies state/branch/report/audit hash were written back |
+
+### Container tests on a real runtime
+
+`tests/unit/test_container_workspace.py` runs three tests against a real Docker/Podman when one answers
+`<runtime> info`; otherwise they skip. Point them at an image that has `python3` and `pytest`:
+
+```
+GCA_TEST_RUNTIME=podman GCA_TEST_IMAGE=localhost/gca-python:noble pytest tests/unit/test_container_workspace.py
+```
+
+(Validated on 16 Oct 2026 with rootful podman 4.9 and a debootstrap-built Ubuntu image: no network inside,
+agent + verifier both containerised, timeout kills the container.)
+
 ## Layer 6 — Static checks
 
 `ruff` (style, imports, bugbear) and `mypy` on `src/`. Both run in `make lint` and CI.
@@ -100,9 +122,9 @@ Track accepted-PR rate and reviewer time per job; the proposal's acceptance targ
 ## Known gaps
 
 - `kind = "worktree"` is not a sandbox against a hostile model (an allow-listed `python` can open sockets).
-  Use `kind = "container"` outside a trusted developer machine. The container path is tested through a
-  fake runtime and an argv check; the real-daemon test runs only where Docker/Podman is available, so run
-  `pytest tests/unit/test_container_workspace.py` on a machine with Docker before relying on it.
-- The ServiceNow adapter is tested against a mocked Table API, not a live instance.
+  Use `kind = "container"` outside a trusted developer machine.
+- The ServiceNow adapter is tested against a mocked Table API; the live round-trip is the manual
+  `servicenow smoke test` workflow (needs a PDI).
 - Windows path *rules* are tested; the worker itself has only been run on Linux (WSL on the pilot machine).
-- No real-model eval baseline has been recorded yet (`gca eval` needs an API key).
+- Real-model eval baselines are produced by the manual eval workflows; commit the resulting `evals/results/*.md`
+  to track regressions.
