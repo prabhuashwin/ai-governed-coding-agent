@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import shutil
 import stat
-import subprocess
 import sys
 from pathlib import Path
 
@@ -42,7 +41,8 @@ def test_container_run_argv_is_hardened_and_exact(tmp_path: Path):
 
 def test_make_workspace_errors_without_runtime(calc_repo: Path, monkeypatch):
     monkeypatch.setenv("PATH", str(calc_repo))  # nothing on PATH
-    with pytest.raises(RuntimeError, match="not found"):
+    monkeypatch.setattr("gca.workspace._RUNTIME_CACHE", {})
+    with pytest.raises(RuntimeError, match="no working container runtime"):
         make_workspace(WorkspaceConfig(kind="container"), calc_repo, "job_c0")
     with pytest.raises(ValueError):
         make_workspace(WorkspaceConfig(kind="bogus"), calc_repo, "job_c0")
@@ -58,7 +58,7 @@ log = os.environ.get("FAKE_DOCKER_LOG")
 if log:
     with open(log, "a") as f:
         f.write(json.dumps(args) + "\n")
-if args[:1] == ["kill"]:
+if args[:1] in (["kill"], ["info"]):
     sys.exit(0)
 assert args[0] == "run", args
 host_dir = None; env = {}; i = 1; image_idx = None
@@ -95,6 +95,7 @@ def fake_docker(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_DOCKER_LOG", str(log))
     monkeypatch.setenv("FAKE_DOCKER_PYTHON", sys.executable)
+    monkeypatch.setattr("gca.workspace._RUNTIME_CACHE", {})
     return log
 
 
@@ -106,7 +107,7 @@ def test_container_workspace_runs_through_runtime(calc_repo: Path, fake_docker: 
         assert res.exit_code == 0
         assert (ws.root / "made.txt").exists()  # ran inside the mounted worktree
         assert "made.txt" in ws.changed_files() and ".gca-home" not in ws.diff()
-        calls = [line for line in fake_docker.read_text().splitlines()]
+        calls = [line for line in fake_docker.read_text().splitlines() if '"run"' in line]
         assert len(calls) == 1 and '"--network=none"' in calls[0] and '"--cap-drop=ALL"' in calls[0]
     finally:
         ws.cleanup(keep_branch=False)
@@ -151,28 +152,61 @@ def test_make_runner_host_and_container(tmp_path: Path, fake_docker: Path):
 
 
 # ------------------------------------------------------------------ real daemon
+# Set GCA_TEST_IMAGE to an image that has python3 + pytest (default python:3.12-slim, which needs a registry);
+# GCA_TEST_RUNTIME to prefer docker or podman.
+REAL_IMAGE = os.environ.get("GCA_TEST_IMAGE", "python:3.12-slim")
+REAL_RUNTIME = os.environ.get("GCA_TEST_RUNTIME", "docker")
+
+
 def _daemon_available() -> bool:
-    rt = detect_runtime()
-    if not rt:
-        return False
-    try:
-        return subprocess.run([rt, "info"], capture_output=True, timeout=15).returncode == 0
-    except Exception:
-        return False
+    return detect_runtime(REAL_RUNTIME) is not None
 
 
-@pytest.mark.skipif(not _daemon_available(), reason="no container daemon available")
+needs_daemon = pytest.mark.skipif(not _daemon_available(), reason="no working container runtime available")
+
+
+@needs_daemon
 def test_real_container_has_no_network_and_sees_only_the_worktree(calc_repo: Path):
-    ws = ContainerWorkspace(calc_repo, "job_real", image="python:3.12-slim")
+    ws = ContainerWorkspace(calc_repo, "job_real", image=REAL_IMAGE, runtime=REAL_RUNTIME)
     try:
-        res = ws.run(["python", "-c",
+        res = ws.run(["python3", "-c",
                       "import socket,os\n"
                       "try:\n socket.create_connection(('1.1.1.1',80),timeout=3); print('NET=yes')\n"
                       "except Exception as e: print('NET=no', type(e).__name__)\n"
-                      "print('ROOT', sorted(os.listdir('/work'))[:5])"],
-                     env={"PATH": "/x"}, timeout=120)
+                      "print('ROOT', sorted(os.listdir('/work'))[:5])\n"
+                      "print('HOSTFS', os.path.exists('/etc/hostname-of-host'))"],
+                     env={"PATH": "/x", "GCA_SANDBOX": "1"}, timeout=180)
         assert res.exit_code == 0, res.output
         assert "NET=no" in res.stdout and "calc.py" in res.stdout
+        # writes land in the worktree, owned by the host user
+        res2 = ws.run(["python3", "-c", "open('from_container.txt','w').write('x')"], env={"PATH": "/x"}, timeout=120)
+        assert res2.exit_code == 0, res2.output
+        assert (ws.root / "from_container.txt").read_text() == "x"
+    finally:
+        ws.cleanup(keep_branch=False)
+
+
+@needs_daemon
+def test_real_pipeline_agent_and_verifier_in_containers(config, work_item):
+    """The scripted agent fixes the bug; every command and the verifier run in real containers."""
+    config.workspace = WorkspaceConfig(kind="container", image=REAL_IMAGE, runtime=REAL_RUNTIME)
+    work_item.test_command = ["python3", "-m", "pytest", "-q", "-p", "no:cacheprovider"]
+    q = JobQueue(config.db_path)
+    job = q.submit(work_item)
+    q.approve(job.id, "a")
+    job = Worker(config, q, provider_factory=lambda: ScriptedProvider(steps_fix_calc())).run_once()
+    assert job.status == JobStatus.SUCCEEDED, (job.error, job.result and job.result.verification)
+    assert job.result.verification.passed and "4 passed" in job.result.verification.output_tail or \
+           "3 passed" in job.result.verification.output_tail
+    assert ".gca-home" not in job.result.diff
+
+
+@needs_daemon
+def test_real_container_timeout_is_enforced(calc_repo: Path):
+    ws = ContainerWorkspace(calc_repo, "job_real_t", image=REAL_IMAGE, runtime=REAL_RUNTIME)
+    try:
+        res = ws.run(["python3", "-c", "import time; time.sleep(30)"], env={"PATH": "/x"}, timeout=5)
+        assert res.timed_out and "container killed" in res.stderr
     finally:
         ws.cleanup(keep_branch=False)
 

@@ -142,10 +142,26 @@ def container_run_argv(*, runtime: str, image: str, host_dir: Path, argv: list[s
     return cmd
 
 
+_RUNTIME_CACHE: dict[str, bool] = {}
+
+
+def runtime_works(rt: str) -> bool:
+    """True if `rt info` succeeds, i.e. the binary exists AND can reach a daemon / run rootless."""
+    if rt not in _RUNTIME_CACHE:
+        ok = False
+        if shutil.which(rt):
+            try:
+                ok = subprocess.run([rt, "info"], capture_output=True, timeout=20).returncode == 0
+            except (subprocess.TimeoutExpired, OSError):
+                ok = False
+        _RUNTIME_CACHE[rt] = ok
+    return _RUNTIME_CACHE[rt]
+
+
 def detect_runtime(preferred: str = "docker") -> str | None:
-    """Return the first available container runtime binary name, or None."""
+    """Return the first *working* container runtime (preferred first, then docker, podman), or None."""
     for cand in [preferred] + [r for r in ("docker", "podman") if r != preferred]:
-        if shutil.which(cand):
+        if runtime_works(cand):
             return cand
     return None
 
@@ -189,8 +205,8 @@ class ContainerWorkspace(GitWorktreeWorkspace):
                  parent_dir: str | None = None):
         rt = detect_runtime(runtime)
         if rt is None:
-            raise RuntimeError(f"container runtime {runtime!r} not found on PATH (install Docker or Podman, "
-                               f"or set [workspace] kind = \"worktree\")")
+            raise RuntimeError(f"no working container runtime ({runtime!r}, docker, podman): install Docker or Podman "
+                               f"and make sure `{runtime} info` succeeds, or set [workspace] kind = \"worktree\"")
         super().__init__(repo_path, job_id, base_ref, parent_dir=parent_dir)
         self.runtime, self.image, self.network = rt, image, network
         self.memory, self.cpus, self.pids_limit = memory, cpus, pids_limit
@@ -249,7 +265,7 @@ def make_runner(ws_cfg, job_id: str):
 
     runtime = detect_runtime(ws_cfg.runtime)
     if runtime is None:
-        raise RuntimeError(f"container runtime {ws_cfg.runtime!r} not found on PATH")
+        raise RuntimeError(f"no working container runtime ({ws_cfg.runtime!r}, docker, podman)")
     counter = {"n": 0}
 
     def container_run(argv: list[str], cwd: Path, env: dict[str, str], timeout: int) -> CommandResult:
