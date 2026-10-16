@@ -77,6 +77,43 @@ class Provider(Protocol):
     def complete(self, system: str, messages: list[Message], tools: list[dict[str, Any]]) -> ModelResponse: ...
 
 
+def extract_text_tool_calls(text: str, known_tools: set[str]) -> list[ToolUseBlock]:
+    """Find JSON objects like {"name": "<tool>", "arguments": {...}} in free text (optionally fenced).
+    Returns [] unless *every* JSON object found is a valid tool call for a known tool."""
+    import re
+    import uuid
+
+    body = re.sub(r"```(?:json)?", "", text or "")
+    dec = json.JSONDecoder()
+    i, calls = 0, []
+    while True:
+        j = body.find("{", i)
+        if j < 0:
+            break
+        try:
+            obj, end = dec.raw_decode(body, j)
+        except json.JSONDecodeError:
+            i = j + 1
+            continue
+        i = end
+        if not isinstance(obj, dict):
+            return []
+        name = obj.get("name") or obj.get("tool") or obj.get("function")
+        args = obj.get("arguments", obj.get("parameters", obj.get("input", {})))
+        if isinstance(name, dict):  # {"function": {"name":..., "arguments":...}}
+            args = name.get("arguments", args)
+            name = name.get("name")
+        if name not in known_tools:
+            return []
+        calls.append(ToolUseBlock(id=f"text_{uuid.uuid4().hex[:8]}", name=name, input=parse_tool_arguments(args)))
+    # reject if there was substantial prose besides the JSON (likely an explanation quoting a call)
+    stripped = re.sub(r"\s", "", body)
+    json_chars = sum(len(json.dumps(c.input, separators=(",", ":"))) + len(c.name) for c in calls)
+    if calls and len(stripped) > json_chars * 3 + 80:
+        return []
+    return calls
+
+
 def parse_tool_arguments(raw: Any) -> dict[str, Any]:
     """Tool arguments may arrive as a JSON string (OpenAI) or a dict (Anthropic)."""
     if raw is None or raw == "":

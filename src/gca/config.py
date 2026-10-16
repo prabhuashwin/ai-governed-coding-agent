@@ -33,6 +33,9 @@ class ProviderConfig(BaseModel):
     timeout_seconds: float = 120.0
     max_tokens: int = 4096
     temperature: float | None = None
+    # openai_compatible: if a reply has no structured tool_calls but its text is JSON tool-call objects
+    # (common with small local models), parse them as tool calls. Logged in the audit trail.
+    parse_text_tool_calls: bool = True
     # scripted / replay providers
     script_path: str | None = None
     cassette_path: str | None = None

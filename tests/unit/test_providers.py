@@ -167,3 +167,44 @@ def test_config_toml_round_trip(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("GCA_CONFIG", str(p))
     assert load_config().provider.model == "m"
     assert load_config(tmp_path / "missing.toml").provider.kind == "anthropic"  # defaults
+
+
+# ---------------------------------------------------- text tool-call fallback (small local models)
+from gca.providers.base import extract_text_tool_calls  # noqa: E402
+
+KNOWN = {t["name"] for t in TOOL_SCHEMAS}
+
+
+def test_extract_text_tool_calls_variants():
+    fenced = '```json\n{"name": "list_files", "arguments": {"path": "."}}\n{"name": "run_tests", "arguments": {}}\n```'
+    calls = extract_text_tool_calls(fenced, KNOWN)
+    assert [c.name for c in calls] == ["list_files", "run_tests"] and calls[0].input == {"path": "."}
+    bare = '{"name": "read_file", "arguments": {"path": "stats.py"}}'
+    assert extract_text_tool_calls(bare, KNOWN)[0].input == {"path": "stats.py"}
+    nested = '{"function": {"name": "edit_file", "arguments": "{\\"path\\": \\"a.py\\", \\"old\\": \\"1\\", \\"new\\": \\"2\\"}"}}'
+    assert extract_text_tool_calls(nested, KNOWN)[0].input == {"path": "a.py", "old": "1", "new": "2"}
+
+
+def test_extract_text_tool_calls_rejects_prose_and_unknown_tools():
+    assert extract_text_tool_calls("I will now fix the bug in stats.py.", KNOWN) == []
+    assert extract_text_tool_calls('{"name": "rm_rf", "arguments": {}}', KNOWN) == []
+    prose = ("Here is a long explanation of what I would do and why it matters, with lots of detail about the approach, "
+             "the risks, the alternatives considered and so on, which mentions "
+             '{"name": "run_tests", "arguments": {}} only as an example of the syntax rather than a real request. ' * 2)
+    assert extract_text_tool_calls(prose, KNOWN) == []
+    assert extract_text_tool_calls('{"name": "run_tests", "arguments": {}} and also {"foo": 1}', KNOWN) == []
+
+
+def test_openai_adapter_recovers_text_tool_calls():
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"choices": [{"finish_reason": "stop", "message": {
+            "content": '```json\n{"name": "run_tests", "arguments": {}}\n```'}}], "usage": {}})
+
+    cfg = ProviderConfig(kind="openai_compatible", api_key_env="", require_api_key=False)
+    p = OpenAICompatibleProvider(cfg, transport=httpx.MockTransport(handler))
+    resp = p.complete("s", [Message.user_text("x")], TOOL_SCHEMAS)
+    assert [c.name for c in resp.tool_calls] == ["run_tests"] and resp.stop_reason == "tool_use"
+    assert "recovered" in resp.text
+    cfg2 = ProviderConfig(kind="openai_compatible", api_key_env="", require_api_key=False, parse_text_tool_calls=False)
+    p2 = OpenAICompatibleProvider(cfg2, transport=httpx.MockTransport(handler))
+    assert p2.complete("s", [Message.user_text("x")], TOOL_SCHEMAS).tool_calls == []

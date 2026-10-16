@@ -14,7 +14,16 @@ from typing import Any
 import httpx
 
 from ..config import ProviderConfig
-from .base import Message, ModelResponse, ProviderError, TextBlock, ToolResultBlock, ToolUseBlock, parse_tool_arguments
+from .base import (
+    Message,
+    ModelResponse,
+    ProviderError,
+    TextBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+    extract_text_tool_calls,
+    parse_tool_arguments,
+)
 from .http import post_json
 
 DEFAULT_BASE = "https://api.openai.com/v1"
@@ -91,6 +100,11 @@ class OpenAICompatibleProvider:
                                         name=fn.get("name", ""), input=parse_tool_arguments(fn.get("arguments"))))
         finish = choice.get("finish_reason") or "stop"
         stop = {"stop": "end_turn", "tool_calls": "tool_use", "length": "max_tokens"}.get(finish, finish)
+        if self.cfg.parse_text_tool_calls and text and not any(isinstance(b, ToolUseBlock) for b in content):
+            recovered = extract_text_tool_calls(text, {t["name"] for t in tools})
+            if recovered:
+                content = [TextBlock(text="[tool calls recovered from text]")] + recovered
+                stop = "tool_use"
         usage = data.get("usage") or {}
         return ModelResponse(content=content, stop_reason=stop,
                              input_tokens=int(usage.get("prompt_tokens", 0)),
