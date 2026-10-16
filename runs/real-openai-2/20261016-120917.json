@@ -1,0 +1,25 @@
+[
+ {
+  "task": "01-off-by-one-mean",
+  "job_id": "job_89cb9a910885",
+  "status": "succeeded",
+  "passed": true,
+  "stop_reason": "finished",
+  "claimed_success": true,
+  "turns": 8,
+  "tool_calls": 7,
+  "input_tokens": 9834,
+  "output_tokens": 209,
+  "cost_usd": 0.0043,
+  "seconds": 10.5,
+  "files_changed": 1,
+  "insertions": 1,
+  "deletions": 1,
+  "flags": [],
+  "blocked_actions": 0,
+  "error": null,
+  "provider": "openai_compatible",
+  "model": "gpt-4.1-mini",
+  "repeat": 0
+ }
+]
