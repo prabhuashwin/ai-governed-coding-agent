@@ -93,8 +93,10 @@ src/gca/
   evals.py       golden-task eval runner
   cli.py         `gca`
 tests/           unit · loop · safety · e2e
-evals/tasks/     golden tasks (small repos with seeded bugs)
-docs/            architecture, threat model, how-to-test
+evals/tasks/     golden tasks (small repos with seeded bugs); results are published to the `eval-results` branch
+scripts/         servicenow_bootstrap.py (create table / seed / verify on a PDI), smoke_script.json
+docs/            architecture + threat model, how-to-test, eval-baseline, sample report and audit
+.github/         ci.yml (fast suite + container tests), evals.yml, evals-local.yml, servicenow-smoke.yml
 ```
 
 ## Status
