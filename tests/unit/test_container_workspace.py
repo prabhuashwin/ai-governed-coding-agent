@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import stat
+import subprocess
 import sys
 from pathlib import Path
 
@@ -158,11 +159,23 @@ REAL_IMAGE = os.environ.get("GCA_TEST_IMAGE", "python:3.12-slim")
 REAL_RUNTIME = os.environ.get("GCA_TEST_RUNTIME", "docker")
 
 
-def _daemon_available() -> bool:
-    return detect_runtime(REAL_RUNTIME) is not None
+def _image_available() -> str | None:
+    """Reason to skip, or None when a runtime works and the image is present or pullable."""
+    rt = detect_runtime(REAL_RUNTIME)
+    if rt is None:
+        return "no working container runtime available"
+    if subprocess.run([rt, "image", "exists", REAL_IMAGE] if rt == "podman" else [rt, "image", "inspect", REAL_IMAGE],
+                      capture_output=True).returncode == 0:
+        return None
+    try:
+        pulled = subprocess.run([rt, "pull", REAL_IMAGE], capture_output=True, text=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        return f"pulling {REAL_IMAGE} timed out"
+    return None if pulled.returncode == 0 else f"image {REAL_IMAGE} unavailable: {pulled.stderr.strip()[-160:]}"
 
 
-needs_daemon = pytest.mark.skipif(not _daemon_available(), reason="no working container runtime available")
+_SKIP_REASON = _image_available()
+needs_daemon = pytest.mark.skipif(_SKIP_REASON is not None, reason=_SKIP_REASON or "")
 
 
 @needs_daemon
