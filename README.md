@@ -99,8 +99,9 @@ docs/            architecture, threat model, how-to-test
 
 ## Status
 
-Pilot-grade. With `kind = "worktree"`, isolation is a git worktree + allow-listed commands + scrubbed
-environment — fine for a trusted developer machine, not a sandbox against a hostile model. Use
-`kind = "container"` anywhere else. Still open: a real-model eval baseline (`gca eval` with your key),
-validating the ServiceNow adapter against a live instance, and a local-model (`openai_compatible`)
-run for customers that forbid external inference.
+Pilot-grade, with a measured baseline (see **docs/eval-baseline.md**): hosted small models pass 15/15 verified
+golden tasks at ≈ $0.005 per task; a 7B local model passes 1/3 and the harness contained every failure mode.
+With `kind = "worktree"`, isolation is a git worktree + allow-listed commands + scrubbed environment — fine for
+a trusted developer machine, not a sandbox against a hostile model; use `kind = "container"` anywhere else
+(validated on podman and Docker). Still open: the ServiceNow adapter against a live instance
+(`servicenow smoke test` workflow, needs a PDI).
