@@ -17,6 +17,9 @@ on:
       only:
         description: "substring filter on task name (blank = all)"
         default: ""
+      max_cost_per_task:
+        description: "hard USD cap per task (the harness stops the job at this spend)"
+        default: "0.25"
 jobs:
   evals:
     runs-on: ubuntu-latest
