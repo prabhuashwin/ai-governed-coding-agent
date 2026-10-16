@@ -1,0 +1,25 @@
+[
+ {
+  "task": "01-off-by-one-mean",
+  "job_id": "job_3c42dd6bfbe5",
+  "status": "failed",
+  "passed": false,
+  "stop_reason": "finished",
+  "claimed_success": true,
+  "turns": 12,
+  "tool_calls": 11,
+  "input_tokens": 18252,
+  "output_tokens": 869,
+  "cost_usd": 0.0087,
+  "seconds": 17.8,
+  "files_changed": 2,
+  "insertions": 16,
+  "deletions": 1,
+  "flags": [],
+  "blocked_actions": 0,
+  "error": "verification_failed:tests",
+  "provider": "openai_compatible",
+  "model": "gpt-4.1-mini",
+  "repeat": 0
+ }
+]
