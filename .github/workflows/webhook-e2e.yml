@@ -1,0 +1,36 @@
+name: webhook e2e (cross-process)
+# Manual. gca (webhook-serve + worker), a stand-in platform ("Koru") and a driver run as separate processes
+# and talk over signed HTTP. provider=scripted is free; provider=openai uses the OPENAI_API_KEY secret.
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        type: choice
+        options: [scripted, openai]
+        default: scripted
+      model:
+        default: "gpt-4.1-mini"
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install -q -e . pytest
+      - name: Run the cross-process webhook test
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          mkdir -p evals/results
+          python scripts/webhook_e2e.py --provider "${{ inputs.provider }}" --model "${{ inputs.model }}" \
+            --out evals/results/webhook-e2e | tee eval.log
+          cat evals/results/webhook-e2e.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Publish results to the eval-results branch
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: .github/actions-publish-results.sh "webhook-e2e-${{ inputs.provider }}-${{ github.run_number }}"
