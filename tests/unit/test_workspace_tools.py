@@ -95,3 +95,23 @@ def test_output_truncation(calc_repo: Path):
         assert "truncated" in r.content and len(r.content) < 800
     finally:
         ws.cleanup(keep_branch=False)
+
+
+def test_build_artifacts_never_reach_the_job_branch(calc_repo: Path):
+    """A repo without a .gitignore: compiled caches created during the run must not be committed."""
+    ws = GitWorktreeWorkspace(calc_repo, "job_art")
+    try:
+        (ws.root / "__pycache__").mkdir()
+        (ws.root / "__pycache__" / "calc.cpython-313.pyc").write_bytes(b"\xf3\x0d\x0d\x0a binary")
+        (ws.root / "tests" / "__pycache__").mkdir()
+        (ws.root / "tests" / "__pycache__" / "t.pyc").write_bytes(b"\x00")
+        (ws.root / ".pytest_cache").mkdir()
+        (ws.root / ".pytest_cache" / "README.md").write_text("cache")
+        assert ws.changed_files() == [] and ws.diff() == "" and ws.commit_all("nothing real") is None
+        (ws.root / "calc.py").write_text((ws.root / "calc.py").read_text().replace(CALC_FIX_OLD, CALC_FIX_NEW))
+        assert ws.changed_files() == ["calc.py"]
+        sha = ws.commit_all("real change")
+        files = git(calc_repo, "show", "--name-only", "--format=", sha).split()
+        assert files == ["calc.py"]
+    finally:
+        ws.cleanup(keep_branch=False)

@@ -1,0 +1,10 @@
+{
+  "title": "Implement parse_duration and test it",
+  "category": "add-tests",
+  "description": "durations.parse_duration is a stub. Implement it per its docstring (h, m and s units in that order, any subset, non-negative integers; ValueError otherwise). Add at least three meaningful tests of your own to tests/test_durations.py covering valid and invalid input.",
+  "acceptance_criteria": ["parse_duration handles h/m/s combinations", "invalid input raises ValueError", "at least three new tests are added", "all tests pass"],
+  "test_command": ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+  "hidden_tests": "hidden",
+  "min_new_tests": 3,
+  "budget": {"max_turns": 20, "max_cost_usd": 0.25, "max_seconds": 400}
+}

@@ -41,6 +41,15 @@ class Workspace(Protocol):
     def cleanup(self) -> None: ...
 
 
+# Build/test artifacts that must never land on a job branch, even in repositories without a .gitignore.
+ARTIFACT_EXCLUDES = [":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.pyc", ":(exclude,glob)**/.pytest_cache/**",
+                     ":(exclude,glob)**/.gca-home/**"]
+
+
+def _stage(root: Path, *extra: str) -> None:
+    _git(root, "add", "-A", *extra, "--", ".", *ARTIFACT_EXCLUDES, check=False)
+
+
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.setdefault("GIT_AUTHOR_NAME", "gca")
@@ -81,16 +90,16 @@ class GitWorktreeWorkspace:
 
     # ------------------------------------------------------------------ git
     def diff(self) -> str:
-        _git(self.root, "add", "-A", "--intent-to-add", check=False)
+        _stage(self.root, "--intent-to-add")
         return _git(self.root, "diff", "--no-color", self.base_commit).stdout
 
     def changed_files(self) -> list[str]:
-        _git(self.root, "add", "-A", "--intent-to-add", check=False)
+        _stage(self.root, "--intent-to-add")
         out = _git(self.root, "diff", "--name-only", self.base_commit).stdout
         return [line for line in out.splitlines() if line.strip()]
 
     def diff_stat(self) -> tuple[int, int]:
-        _git(self.root, "add", "-A", "--intent-to-add", check=False)
+        _stage(self.root, "--intent-to-add")
         out = _git(self.root, "diff", "--numstat", self.base_commit).stdout
         ins = dels = 0
         for line in out.splitlines():
@@ -101,8 +110,8 @@ class GitWorktreeWorkspace:
         return ins, dels
 
     def commit_all(self, message: str) -> str | None:
-        _git(self.root, "add", "-A")
-        if not _git(self.root, "status", "--porcelain").stdout.strip():
+        _stage(self.root)
+        if not _git(self.root, "diff", "--cached", "--name-only").stdout.strip():
             return None
         _git(self.root, "commit", "-q", "-m", message)
         return _git(self.root, "rev-parse", "HEAD").stdout.strip()
@@ -240,7 +249,7 @@ class ContainerWorkspace(GitWorktreeWorkspace):
 
     def diff(self) -> str:
         # exclude the scratch HOME the container uses
-        _git(self.root, "add", "-A", "--intent-to-add", check=False)
+        _stage(self.root, "--intent-to-add")
         return _git(self.root, "diff", "--no-color", self.base_commit, "--", ".", ":(exclude).gca-home").stdout
 
     def commit_all(self, message: str) -> str | None:

@@ -1,0 +1,9 @@
+{
+  "title": "Invoice totals are wrong",
+  "category": "multi-file",
+  "description": "Customers are being charged the wrong amount. A net price of 100 should cost 120 with 20% VAT, and a 10% discount must be applied to the net amount before tax (so 100 with 10% off = 108). The logic is spread across shop/pricing.py and shop/invoice.py.",
+  "acceptance_criteria": ["price_with_tax adds VAT rather than returning only the tax", "discount_pct is a percentage applied to the net amount before tax", "all tests pass"],
+  "test_command": ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+  "hidden_tests": "hidden",
+  "budget": {"max_turns": 20, "max_cost_usd": 0.25, "max_seconds": 400}
+}

@@ -1,0 +1,8 @@
+{
+  "title": "slugify() in the Node service produces bad slugs",
+  "category": "node",
+  "description": "src/slug.js slugify() leaves punctuation, produces repeated and leading/trailing hyphens, and crashes on null/undefined. Fix it so the existing tests in test/slug.test.js pass without changing them.",
+  "acceptance_criteria": ["non-alphanumeric runs become a single hyphen", "no leading or trailing hyphens", "null/undefined return ''", "all tests pass"],
+  "test_command": ["node", "--test"],
+  "budget": {"max_turns": 15, "max_cost_usd": 0.25, "max_seconds": 300}
+}
