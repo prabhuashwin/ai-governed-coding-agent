@@ -24,8 +24,19 @@ jobs:
           printf 'FROM python:3.12-slim\nRUN pip install --no-cache-dir pytest\n' > /tmp/Dockerfile.gca
           docker build -q -t gca-test-python:local -f /tmp/Dockerfile.gca /tmp
       - run: git config --global user.name ci && git config --global user.email ci@localhost
-      - run: python -m pytest -q
+      - run: python -m pytest -q --junitxml=junit.xml
         env:
           GCA_TEST_RUNTIME: docker
           GCA_TEST_IMAGE: gca-test-python:local
+      - name: Report failing tests as annotations
+        if: failure()
+        shell: python
+        run: |
+          import xml.etree.ElementTree as ET, os
+          if os.path.exists("junit.xml"):
+              for case in ET.parse("junit.xml").getroot().iter("testcase"):
+                  for bad in list(case.findall("failure")) + list(case.findall("error")):
+                      msg = (bad.get("message") or "") + " | " + (bad.text or "")[-900:]
+                      msg = msg.replace("%", "%25").replace("\r", "").replace("\n", "%0A")
+                      print(f"::error title={case.get('classname')}.{case.get('name')}::{msg}")
   # Real-model, local-model and ServiceNow runs are separate manual workflows (evals.yml, evals-local.yml, servicenow-smoke.yml).

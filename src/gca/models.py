@@ -139,6 +139,7 @@ class VerificationResult(BaseModel):
     files_changed: list[str] = Field(default_factory=list)
     insertions: int = 0
     deletions: int = 0
+    notes: list[str] = Field(default_factory=list)  # reviewer warnings that do not fail the job
 
 
 class RunResult(BaseModel):

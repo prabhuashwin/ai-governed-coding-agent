@@ -24,6 +24,11 @@ def render_report(job: Job, result: RunResult) -> str:
                      + (f" (exit {v.exit_code})" if v.exit_code is not None else ""))
         if v.flags:
             lines.append("- Flags: " + ", ".join(f"`{f}`" for f in v.flags))
+            if any(f.startswith("test_detection_suspected") for f in v.flags):
+                lines.append("- ⚠️ The change contains code that detects whether it is running under the tests. "
+                             "Passing tests do not show the code is correct.")
+        for n in getattr(v, "notes", []) or []:
+            lines.append(f"- Review: {n}")
     if a is not None:
         lines.append(f"- Agent stop reason: `{a.stop_reason.value}`; agent claimed success: {a.claimed_success}")
         if a.claimed_success and v is not None and not v.passed:
