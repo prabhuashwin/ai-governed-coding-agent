@@ -23,7 +23,7 @@ from .queue import JobQueue
 from .report import render_report
 from .tools import ToolExecutor
 from .verifier import Verifier
-from .workspace import make_runner, make_workspace
+from .workspace import cleanup_orphan_worktree, make_runner, make_workspace
 
 
 class Worker:
@@ -34,6 +34,22 @@ class Worker:
         self.provider_factory = provider_factory or (lambda: build_provider(config.provider))
         self.worker_id = worker_id or config.worker_id
         webhooks.install(config)
+
+    def recover_stale(self) -> list[Job]:
+        """Fail jobs whose worker died (stale heartbeat), remove their orphaned workspaces, and record a
+        `finished` event so audit consumers and webhooks learn the outcome."""
+        recovered = self.queue.recover_stale(self.cfg.stale_heartbeat_seconds)
+        for job in recovered:
+            audit = AuditLog(self.cfg.audit_dir, job.id, redactions=self.cfg.policy.canary_strings)
+            ws_path = next((e.data.get("path") for e in reversed(audit.events())
+                            if e.event == "workspace_created" and e.data.get("path")), None)
+            cleaned = False
+            if ws_path:
+                cleaned = cleanup_orphan_worktree(job.work_item.repo_path, ws_path)
+            audit.record(f"worker:{self.worker_id}", "recovered", reason=job.error, orphan_workspace=ws_path,
+                         orphan_removed=cleaned)
+            audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value, error=job.error)
+        return recovered
 
     def run_once(self) -> Job | None:
         job = self.queue.claim_next(self.worker_id)
@@ -68,6 +84,7 @@ class Worker:
             ws = make_workspace(self.cfg.workspace, wi.repo_path, job.id, wi.base_ref)
             result.branch = ws.branch
             audit.record(f"worker:{self.worker_id}", "workspace_created", branch=ws.branch, base=ws.base_commit,
+                         path=str(ws.root),
                          kind=self.cfg.workspace.kind, image=self.cfg.workspace.image if self.cfg.workspace.kind == "container" else None)
 
             policy = PolicyEngine(self.cfg.policy, ws.root, wi.allowed_paths)

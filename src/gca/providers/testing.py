@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -58,6 +59,8 @@ class ScriptedProvider:
         if self._i < len(self.steps):
             step = self.steps[self._i]
             self._i += 1
+            if step.get("sleep"):  # simulate a slow model (used to crash workers mid-run in tests)
+                time.sleep(float(step["sleep"]))
             return _step_to_response(step)
         if self.on_exhausted == "error":
             raise ProviderError("scripted provider exhausted")

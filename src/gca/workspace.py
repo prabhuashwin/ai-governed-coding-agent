@@ -115,6 +115,19 @@ class GitWorktreeWorkspace:
         _git(self.repo, "worktree", "prune", check=False)
 
 
+def cleanup_orphan_worktree(repo_path: str | Path, worktree_path: str | Path) -> bool:
+    """Remove a worktree left behind by a crashed worker. The job branch is kept for inspection."""
+    wt = Path(worktree_path)
+    repo = Path(repo_path)
+    if not (repo / ".git").exists():
+        return False
+    _git(repo, "worktree", "remove", "--force", str(wt), check=False)
+    if wt.parent.name.startswith("gca-"):
+        shutil.rmtree(wt.parent, ignore_errors=True)
+    _git(repo, "worktree", "prune", check=False)
+    return not wt.exists()
+
+
 # ----------------------------------------------------------------------------- containers
 def container_run_argv(*, runtime: str, image: str, host_dir: Path, argv: list[str], env: dict[str, str],
                        name: str, network: str = "none", memory: str = "2g", cpus: str = "2",

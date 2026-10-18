@@ -155,10 +155,9 @@ def cmd_cancel(args, cfg):
 
 def cmd_run(args, cfg):
     q = _queue(cfg)
-    recovered = q.recover_stale(cfg.stale_heartbeat_seconds)
-    for j in recovered:
-        print(f"recovered stale job {j.id} -> failed", file=sys.stderr)
     w = Worker(cfg, q)
+    for j in w.recover_stale():
+        print(f"recovered stale job {j.id} -> failed (worker crashed); orphaned workspace removed", file=sys.stderr)
     if args.once:
         job = w.run_once()
         if job is None:
