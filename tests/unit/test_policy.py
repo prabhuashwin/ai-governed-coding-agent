@@ -49,7 +49,13 @@ def test_symlink_escape_blocked(engine: PolicyEngine):
         engine.resolve_path("escape_link")
 
 
-@pytest.mark.parametrize("protected", [".env", "keys/id_rsa", ".git/config"])
+@pytest.mark.parametrize("protected", [".env", "keys/id_rsa", ".git/config",
+                                       # found by tests/unit/test_fuzz.py: `**/` globs missed root-level files
+                                       "x.pem", "id_rsa", "secrets.txt", "deploy/server.pem",
+                                       # case-insensitive filesystems
+                                       ".ENV", "ID_RSA", "Secrets.yaml", "sub/.Git/config",
+                                       # nested repositories
+                                       "vendor/lib/.git/HEAD"])
 def test_protected_paths_blocked(engine: PolicyEngine, protected: str):
     with pytest.raises(PolicyViolation):
         engine.resolve_path(protected)
@@ -74,6 +80,7 @@ def test_allowed_command_passes(engine: PolicyEngine):
     ["curl", "http://evil"], ["bash", "-c", "ls"], ["sh", "-c", "ls"], ["git", "push"], ["rm", "-rf", "/"],
     ["python", "-c", "print(1)", "|", "cat"], ["python", "/etc/passwd"], ["python", "../x.py"], ["sudo", "ls"],
     ["ls", "&&", "curl", "x"], ["pip", "install", "requests"], ["python", "C:\\secrets.py"], [],
+    [" "], ["  ", "python"], [""],  # found by tests/unit/test_fuzz.py: blank argv crashed instead of being rejected
 ])
 def test_bad_commands_blocked(engine: PolicyEngine, argv: list[str]):
     with pytest.raises(PolicyViolation):

@@ -83,13 +83,30 @@ class PolicyEngine:
             raise PolicyViolation(f"path escapes workspace: {rel}") from e
         # If the file exists as a symlink chain pointing outside, resolve() already caught it.
         rel_posix = candidate.relative_to(self.root).as_posix()
-        for g in self.cfg.denied_path_globs:
-            if fnmatch.fnmatch(rel_posix, g) or fnmatch.fnmatch(os.path.basename(rel_posix), g):
-                raise PolicyViolation(f"access to protected path is denied: {rel}")
+        if self._is_protected(rel_posix):
+            raise PolicyViolation(f"access to protected path is denied: {rel}")
         if for_write and self.allowed_paths:
             if not any(rel_posix == a or rel_posix.startswith(a + "/") for a in self.allowed_paths):
                 raise PolicyViolation(f"writes outside allowed paths {self.allowed_paths} are denied: {rel}")
         return candidate
+
+    def _is_protected(self, rel_posix: str) -> bool:
+        """Match protected globs against the whole path, the basename and every path component.
+
+        `**/x` also matches `x` at the repository root, and matching is case-insensitive so `.ENV`, `ID_RSA` or
+        `Secrets.txt` are protected on case-insensitive filesystems (Windows, macOS).
+        """
+        path = rel_posix.lower()
+        parts = [c for c in path.split("/") if c]
+        for g in self.cfg.denied_path_globs:
+            g = g.lower()
+            patterns = [g, g[3:]] if g.startswith("**/") else [g]
+            for pat in patterns:
+                if fnmatch.fnmatchcase(path, pat):
+                    return True
+                if "/" not in pat and any(fnmatch.fnmatchcase(c, pat) for c in parts):
+                    return True
+        return False
 
     # ------------------------------------------------------------- commands
     def check_command(self, argv: list[str]) -> list[str]:
@@ -98,6 +115,8 @@ class PolicyEngine:
         if len(argv) == 1 and (" " in argv[0]):
             # agent passed a shell string; tokenise safely rather than invoking a shell
             argv = shlex.split(argv[0])
+        if not argv or not argv[0].strip():
+            raise PolicyViolation("empty command")
         joined = " ".join(argv)
         for bad in self.cfg.denied_argv_substrings:
             if bad in joined:

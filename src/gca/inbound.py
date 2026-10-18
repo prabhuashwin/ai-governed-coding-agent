@@ -17,7 +17,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import sqlite3
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -26,7 +25,7 @@ from pydantic import ValidationError
 
 from .audit import AuditLog
 from .config import Config
-from .models import Budget, JobStatus, WorkItem, now_iso
+from .models import Budget, JobStatus, WorkItem, now_iso, open_db
 from .queue import InvalidTransition, JobQueue
 from .webhooks import verify_signature
 
@@ -46,7 +45,7 @@ class CommandHandler:
         self.cfg = cfg
         self.queue = queue
         self.secret = os.environ.get(cfg.webhooks.inbound_secret_env, "")
-        self._conn = sqlite3.connect(str(cfg.db_path), isolation_level=None, check_same_thread=False)
+        self._conn = open_db(self, str(cfg.db_path))
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS inbound_deliveries (

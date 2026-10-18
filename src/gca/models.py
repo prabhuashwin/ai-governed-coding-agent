@@ -2,12 +2,25 @@
 
 from __future__ import annotations
 
+import sqlite3
 import uuid
+import weakref
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, Field
+
+
+def open_db(owner: object, path: str) -> sqlite3.Connection:
+    """Open an SQLite connection that is closed when `owner` is garbage-collected (or at interpreter exit).
+
+    Deterministic closing matters on Windows, where an open handle locks the database file.
+    """
+    conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+    conn.execute("PRAGMA busy_timeout=5000")
+    weakref.finalize(owner, conn.close)
+    return conn
 
 
 def now_iso() -> str:

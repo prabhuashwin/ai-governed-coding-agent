@@ -10,11 +10,10 @@ Guarantees tested:
 from __future__ import annotations
 
 import builtins
-import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .models import TRANSITIONS, Approval, Budget, Job, JobStatus, RunResult, WorkItem, now_iso
+from .models import TRANSITIONS, Approval, Budget, Job, JobStatus, RunResult, WorkItem, now_iso, open_db
 
 
 class InvalidTransition(Exception):
@@ -25,7 +24,7 @@ class JobQueue:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), isolation_level=None, check_same_thread=False)
+        self._conn = open_db(self, str(self.db_path))
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(

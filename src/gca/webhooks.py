@@ -37,7 +37,7 @@ import httpx
 
 from . import audit as _audit
 from .config import Config
-from .models import AuditEvent, Job, now_iso
+from .models import AuditEvent, Job, now_iso, open_db
 
 EVENT_TYPES = (
     "job.submitted", "approval.requested", "approval.decided", "job.started", "job.blocked_action",
@@ -101,7 +101,7 @@ class Outbox:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), isolation_level=None, check_same_thread=False)
+        self._conn = open_db(self, str(self.db_path))
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS webhook_outbox (
@@ -201,8 +201,10 @@ class Deliverer:
 def _load_job(cfg: Config, job_id: str) -> Job | None:
     try:
         conn = sqlite3.connect(str(cfg.db_path))
-        row = conn.execute("SELECT body FROM jobs WHERE id=?", (job_id,)).fetchone()
-        conn.close()
+        try:
+            row = conn.execute("SELECT body FROM jobs WHERE id=?", (job_id,)).fetchone()
+        finally:
+            conn.close()
         return Job.model_validate_json(row[0]) if row else None
     except sqlite3.Error:
         return None

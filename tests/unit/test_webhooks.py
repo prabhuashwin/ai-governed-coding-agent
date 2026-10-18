@@ -189,7 +189,8 @@ def test_receiver_down_does_not_break_jobs_and_flush_recovers(wh_config, work_it
     assert job.status == JobStatus.SUCCEEDED  # delivery failure never affects the job
     assert receiver.events == [] and len(Outbox(wh_config.db_path).rows("pending")) == 5
     receiver.fail_with = []
-    Outbox(wh_config.db_path)._conn.execute("UPDATE webhook_outbox SET next_attempt_at='2000-01-01'")
+    ob = Outbox(wh_config.db_path)
+    ob._conn.execute("UPDATE webhook_outbox SET next_attempt_at='2000-01-01'")
     assert webhooks.flush(wh_config)["delivered"] == 5
     assert receiver.types()[-1] == "job.finished"
 
