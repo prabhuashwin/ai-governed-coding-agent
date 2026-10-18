@@ -59,7 +59,8 @@ class PolicyConfig(BaseModel):
         default_factory=lambda: [".git", ".git/**", ".env", ".env.*", "**/*.pem", "**/id_rsa*", "**/secrets*"]
     )
     # Environment variables passed through to subprocesses. Everything else is stripped.
-    env_passthrough: list[str] = Field(default_factory=lambda: ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "PYTHONIOENCODING"])
+    env_passthrough: list[str] = Field(default_factory=lambda: ["PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "TEMP", "TMP", "SYSTEMROOT", "PYTHONIOENCODING",
+                                                                       "PATHEXT", "COMSPEC", "WINDIR"])
     command_timeout_seconds: int = 300
     max_output_chars: int = 12_000
     max_file_read_chars: int = 60_000

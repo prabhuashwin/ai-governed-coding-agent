@@ -87,6 +87,8 @@ sys.exit(r.returncode)
 
 @pytest.fixture
 def fake_docker(tmp_path: Path, monkeypatch):
+    if sys.platform == "win32":
+        pytest.skip("the fake runtime is a POSIX script")
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir()
     exe = bin_dir / "docker"

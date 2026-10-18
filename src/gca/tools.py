@@ -73,6 +73,22 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
 TOOL_NAMES = {t["name"] for t in TOOL_SCHEMAS}
 
 
+def _read_exact(p) -> str:
+    """Read text without newline translation, so CRLF files stay CRLF."""
+    with open(p, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def _write_exact(p, text: str) -> None:
+    """Write text without newline translation (no LF->CRLF on Windows)."""
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def _uses_crlf(text: str) -> bool:
+    return text.count("\r\n") > 0 and text.count("\r\n") >= text.count("\n") / 2
+
+
 @dataclass
 class ToolResult:
     content: str
@@ -168,18 +184,27 @@ class ToolExecutor:
     def _t_write_file(self, path: str, content: str) -> str:
         p = self.policy.resolve_path(path, for_write=True)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        # keep the existing file's line-ending convention when the model sends plain LF content
+        if p.is_file() and "\r\n" not in content and _uses_crlf(_read_exact(p)):
+            content = content.replace("\n", "\r\n")
+        _write_exact(p, content)
         return f"wrote {len(content)} chars to {path}"
 
     def _t_edit_file(self, path: str, old: str, new: str) -> str:
         p = self.policy.resolve_path(path, for_write=True)
-        text = p.read_text(encoding="utf-8")
+        text = _read_exact(p)
         n = text.count(old)
+        if n == 0 and "\r\n" in text and "\r\n" not in old and "\n" in old:
+            # the model sees LF; the file on disk is CRLF (common on Windows checkouts)
+            old, new = old.replace("\n", "\r\n"), new.replace("\r\n", "\n").replace("\n", "\r\n")
+            n = text.count(old)
         if n == 0:
             return "edit failed: `old` not found in file (read the file and copy the snippet exactly)"
         if n > 1:
             return f"edit failed: `old` occurs {n} times; include more context to make it unique"
-        p.write_text(text.replace(old, new, 1), encoding="utf-8")
+        if "\r\n" in text and "\r\n" not in new and "\n" in new and _uses_crlf(text):
+            new = new.replace("\n", "\r\n")
+        _write_exact(p, text.replace(old, new, 1))
         return f"edited {path}"
 
     def _run(self, argv: list[str]) -> str:

@@ -115,3 +115,32 @@ def test_build_artifacts_never_reach_the_job_branch(calc_repo: Path):
         assert files == ["calc.py"]
     finally:
         ws.cleanup(keep_branch=False)
+
+
+def test_line_endings_are_preserved(calc_repo: Path):
+    """Editing must not rewrite a whole file's line endings (CRLF repos on Linux, LF repos on Windows)."""
+    crlf = "def a():\r\n    return 1\r\n\r\n\r\ndef b():\r\n    return 2\r\n"
+    (calc_repo / "win.py").write_bytes(crlf.encode())
+    git(calc_repo, "add", "-A")
+    git(calc_repo, "-c", "core.autocrlf=false", "commit", "-q", "-m", "crlf file")
+    ws, _, ex = make(calc_repo)
+    try:
+        # model sends LF snippets (that is what it sees); the file stays CRLF and only one line changes
+        r = ex.execute("edit_file", {"path": "win.py", "old": "def b():\n    return 2", "new": "def b():\n    return 3"})
+        assert not r.is_error, r.content
+        data = (ws.root / "win.py").read_bytes()
+        assert data == crlf.replace("return 2", "return 3").encode()
+        assert ws.diff_stat() == (1, 1)
+        # LF files stay LF
+        before = (ws.root / "calc.py").read_bytes()
+        assert b"\r\n" not in before
+        ex.execute("edit_file", {"path": "calc.py", "old": CALC_FIX_OLD, "new": CALC_FIX_NEW})
+        assert b"\r\n" not in (ws.root / "calc.py").read_bytes()
+        # overwriting a CRLF file with LF content keeps CRLF
+        ex.execute("write_file", {"path": "win.py", "content": "x = 1\ny = 2\n"})
+        assert (ws.root / "win.py").read_bytes() == b"x = 1\r\ny = 2\r\n"
+        # new files are written exactly as given
+        ex.execute("write_file", {"path": "new.py", "content": "a\nb\n"})
+        assert (ws.root / "new.py").read_bytes() == b"a\nb\n"
+    finally:
+        ws.cleanup(keep_branch=False)

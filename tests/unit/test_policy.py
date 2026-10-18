@@ -23,7 +23,10 @@ def ws(tmp_path: Path) -> Path:
     (root / "keys" / "id_rsa").write_text("private\n")
     outside = tmp_path / "outside.txt"
     outside.write_text("outside\n")
-    os.symlink(outside, root / "escape_link")
+    try:
+        os.symlink(outside, root / "escape_link")
+    except OSError:  # Windows without the symlink privilege
+        pass
     return root
 
 
@@ -44,7 +47,9 @@ def test_escapes_are_blocked(engine: PolicyEngine, bad: str):
         engine.resolve_path(bad)
 
 
-def test_symlink_escape_blocked(engine: PolicyEngine):
+def test_symlink_escape_blocked(engine: PolicyEngine, ws: Path):
+    if not (ws / "escape_link").is_symlink():
+        pytest.skip("symlinks not available on this platform/user")
     with pytest.raises(PolicyViolation):
         engine.resolve_path("escape_link")
 
