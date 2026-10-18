@@ -19,12 +19,12 @@ Approval never happens in gca; it only mirrors ServiceNow's decision.
 from __future__ import annotations
 
 import os
-import shlex
 from typing import Any
 
 import httpx
 
 from ..audit import AuditLog
+from ..cmdline import split_command
 from ..config import Config, ServiceNowConfig
 from ..models import TERMINAL_STATES, Job, JobStatus, WorkItem
 from ..queue import JobQueue
@@ -82,7 +82,7 @@ class ServiceNowSource:
         g = self.g
         crit = [c.strip() for c in (g(rec, "acceptance_criteria") or "").splitlines() if c.strip()]
         allowed = [p.strip() for p in (g(rec, "allowed_paths") or "").split(",") if p.strip()]
-        test_cmd = shlex.split(g(rec, "test_command") or "python -m pytest -q")
+        test_cmd = split_command(g(rec, "test_command") or "python -m pytest -q")
         label = g(rec, "number") or rec.get("sys_id")
         if not g(rec, "repo_path"):
             raise ValueError(f"{label}: repo_path is empty")

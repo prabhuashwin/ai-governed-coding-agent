@@ -122,7 +122,9 @@ class Outbox:
                     (event["id"], url, event["type"], event.get("job_id"), body, event["created_at"], event["created_at"]))
 
     def due(self, limit: int = 100, event_id: str | None = None) -> list[tuple]:
-        q = "SELECT id, url, type, payload, attempts FROM webhook_outbox WHERE status='pending' AND next_attempt_at <= ?"
+        # 'inflight' rows whose lease has expired belong to a deliverer that died mid-POST: retry them
+        q = ("SELECT id, url, type, payload, attempts FROM webhook_outbox "
+             "WHERE status IN ('pending','inflight') AND next_attempt_at <= ?")
         args: list[Any] = [now_iso()]
         if event_id:
             q += " AND id = ?"
@@ -130,6 +132,17 @@ class Outbox:
         q += " ORDER BY created_at LIMIT ?"
         args.append(limit)
         return self._conn.execute(q, args).fetchall()
+
+    def claim(self, event_id: str, url: str, lease_seconds: float) -> bool:
+        """Atomically take one due row for delivery. Several deliverers (the inline publisher, the background
+        flusher, a worker, another process) may see the same due row; only the one whose UPDATE wins posts it."""
+        lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE webhook_outbox SET status='inflight', next_attempt_at=? "
+                "WHERE id=? AND url=? AND status IN ('pending','inflight') AND next_attempt_at <= ?",
+                (lease, event_id, url, now_iso()))
+            return cur.rowcount == 1
 
     def mark(self, event_id: str, url: str, *, status: str, attempts: int, error: str | None = None,
              retry_in: float | None = None) -> None:
@@ -174,7 +187,10 @@ class Deliverer:
         if not rows:
             return stats
         with httpx.Client(timeout=timeout or self.cfg.webhooks.timeout_seconds, transport=self._transport) as c:
+            lease = 2 * (timeout or self.cfg.webhooks.timeout_seconds) + 30
             for eid, url, etype, payload, attempts in rows:
+                if not self.outbox.claim(eid, url, lease):
+                    continue  # someone else is delivering (or just delivered) this one
                 body = payload.encode("utf-8")
                 attempts += 1
                 try:

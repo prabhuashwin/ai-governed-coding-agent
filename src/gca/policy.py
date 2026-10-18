@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import fnmatch
 import os
-import shlex
 import time
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
+from .cmdline import split_command
 from .config import PolicyConfig
 from .models import Budget, Usage
 
@@ -114,7 +114,7 @@ class PolicyEngine:
             raise PolicyViolation("empty command")
         if len(argv) == 1 and (" " in argv[0]):
             # agent passed a shell string; tokenise safely rather than invoking a shell
-            argv = shlex.split(argv[0])
+            argv = split_command(argv[0])
         if not argv or not argv[0].strip():
             raise PolicyViolation("empty command")
         joined = " ".join(argv)

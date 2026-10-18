@@ -131,11 +131,14 @@ def test_line_endings_are_preserved(calc_repo: Path):
         data = (ws.root / "win.py").read_bytes()
         assert data == crlf.replace("return 2", "return 3").encode()
         assert ws.diff_stat() == (1, 1)
-        # LF files stay LF
+        # calc.py keeps whatever style the checkout gave it (LF on Linux, CRLF with autocrlf on Windows)
         before = (ws.root / "calc.py").read_bytes()
-        assert b"\r\n" not in before
-        ex.execute("edit_file", {"path": "calc.py", "old": CALC_FIX_OLD, "new": CALC_FIX_NEW})
-        assert b"\r\n" not in (ws.root / "calc.py").read_bytes()
+        r = ex.execute("edit_file", {"path": "calc.py", "old": CALC_FIX_OLD, "new": CALC_FIX_NEW})
+        assert not r.is_error, r.content
+        after = (ws.root / "calc.py").read_bytes()
+        assert after != before
+        assert (b"\r\n" in after) == (b"\r\n" in before)
+        assert after.count(b"\n") == before.count(b"\n")
         # overwriting a CRLF file with LF content keeps CRLF
         ex.execute("write_file", {"path": "win.py", "content": "x = 1\ny = 2\n"})
         assert (ws.root / "win.py").read_bytes() == b"x = 1\r\ny = 2\r\n"

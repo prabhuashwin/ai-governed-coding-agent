@@ -5,12 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shlex
 import sys
 from pathlib import Path
 
 from . import __version__
 from .audit import AuditLog, verify_chain
+from .cmdline import split_command
 from .config import Config, load_config
 from .models import JobStatus, WorkItem
 from .queue import JobQueue
@@ -113,7 +113,7 @@ def cmd_submit(args, cfg):
     item = WorkItem(
         title=args.title, description=desc, acceptance_criteria=args.criteria or [],
         repo_path=str(Path(args.repo).resolve()), base_ref=args.base,
-        test_command=shlex.split(args.test_cmd) if args.test_cmd else WorkItem.model_fields["test_command"].default_factory(),
+        test_command=split_command(args.test_cmd) if args.test_cmd else WorkItem.model_fields["test_command"].default_factory(),
         allowed_paths=args.allowed_path or [], requester=args.requester, idempotency_key=args.idempotency_key,
     )
     budget = cfg.budget.model_copy()
@@ -358,7 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("publish", help="push a succeeded job's branch and open a draft pull request"); s.add_argument("job_id"); s.add_argument("--remote", default="origin"); s.add_argument("--base", help="base branch (default: the remote's HEAD)"); s.add_argument("--ready", action="store_true", help="open as ready for review instead of draft"); s.add_argument("--no-pr", action="store_true", help="push only"); s.add_argument("--allow-failed", action="store_true", help="publish a failed job's branch for inspection"); s.set_defaults(fn=cmd_publish)
     s = sub.add_parser("webhook-serve", help="serve signed inbound commands (submit/decision/cancel/kill-switch)"); s.add_argument("--host"); s.add_argument("--port", type=int); s.add_argument("--with-worker", action="store_true", help="also run a worker in this process"); s.add_argument("--poll", type=float, default=2.0); s.add_argument("--flush-every", type=float, default=5.0); s.set_defaults(fn=cmd_webhook_serve)
     s = sub.add_parser("webhook-deliver", help="deliver pending outbound webhook events now"); s.add_argument("--requeue-dead", action="store_true"); s.set_defaults(fn=cmd_webhook_deliver)
-    s = sub.add_parser("webhook-status", help="list outbound webhook deliveries"); s.add_argument("--status", choices=["pending", "delivered", "dead"]); s.add_argument("--limit", type=int, default=50); s.set_defaults(fn=cmd_webhook_status)
+    s = sub.add_parser("webhook-status", help="list outbound webhook deliveries"); s.add_argument("--status", choices=["pending", "inflight", "delivered", "dead"]); s.add_argument("--limit", type=int, default=50); s.set_defaults(fn=cmd_webhook_status)
     s = sub.add_parser("kill", help="global kill switch: stop running agents and claim nothing new"); s.add_argument("state", choices=["on", "off", "status"]); s.add_argument("--reason", default=""); s.add_argument("--by", default="cli"); s.set_defaults(fn=cmd_kill)
     s = sub.add_parser("servicenow-sync", help="poll ServiceNow for approved work items and write status back"); s.add_argument("--once", action="store_true"); s.add_argument("--poll", type=float); s.set_defaults(fn=cmd_servicenow_sync)
     s = sub.add_parser("eval", help="run golden-task evals against the configured provider"); s.add_argument("--tasks-dir", default="evals/tasks"); s.add_argument("--out", default="evals/results"); s.add_argument("--only"); s.add_argument("--repeats", type=int, default=1); s.set_defaults(fn=cmd_eval)

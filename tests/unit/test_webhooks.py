@@ -382,3 +382,63 @@ def test_http_server_end_to_end(hook_cfg, work_item, receiver):
 
 def test_fix_constants(tmp_path: Path):
     assert CALC_FIX_OLD != CALC_FIX_NEW
+
+
+def test_concurrent_deliverers_post_each_event_once(tmp_path, monkeypatch):
+    """Inline publisher, background flusher and worker flush can all see the same due row; only one may post it."""
+    import threading
+    import time as _t
+
+    import httpx
+
+    from gca.config import Config, WebhookConfig
+    from gca.webhooks import Deliverer, Outbox
+
+    monkeypatch.setenv("GCA_WEBHOOK_SECRET", "s")
+    posts: list[str] = []
+    lock = threading.Lock()
+
+    def slow(req: httpx.Request) -> httpx.Response:
+        _t.sleep(0.02)  # widen the race window
+        with lock:
+            posts.append(json.loads(req.content)["id"])
+        return httpx.Response(204)
+
+    cfg = Config(data_dir=str(tmp_path / "d"), webhooks=WebhookConfig(enabled=True, outbound_urls=["https://k/h"]))
+    seed = Outbox(cfg.db_path)
+    for i in range(20):
+        seed.add({"id": f"e{i}", "type": "job.finished", "created_at": "2026-01-01T00:00:00+00:00",
+                  "job_id": "j", "data": {}}, ["https://k/h"])
+    outboxes = [Outbox(cfg.db_path) for _ in range(4)]  # separate connections, like separate processes
+    barrier = threading.Barrier(4)
+
+    def run(ob):
+        barrier.wait()
+        Deliverer(cfg, ob, transport=httpx.MockTransport(slow)).deliver_pending()
+
+    threads = [threading.Thread(target=run, args=(ob,)) for ob in outboxes]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sorted(posts) == sorted(f"e{i}" for i in range(20)), "an event was posted twice or lost"
+    assert len(seed.rows("delivered")) == 20
+
+
+def test_expired_inflight_lease_is_retried(tmp_path, monkeypatch):
+    """A deliverer that died mid-POST leaves an 'inflight' row; once its lease expires another one takes over."""
+    import httpx
+
+    from gca.config import Config, WebhookConfig
+    from gca.webhooks import Deliverer, Outbox
+
+    monkeypatch.setenv("GCA_WEBHOOK_SECRET", "s")
+    cfg = Config(data_dir=str(tmp_path / "d"), webhooks=WebhookConfig(enabled=True, outbound_urls=["https://k/h"]))
+    ob = Outbox(cfg.db_path)
+    ob.add({"id": "e1", "type": "job.finished", "created_at": "2026-01-01T00:00:00+00:00", "job_id": "j", "data": {}},
+           ["https://k/h"])
+    assert ob.claim("e1", "https://k/h", lease_seconds=3600)  # "crashes" holding the lease
+    d = Deliverer(cfg, ob, transport=httpx.MockTransport(lambda r: httpx.Response(204)))
+    assert d.deliver_pending()["delivered"] == 0  # lease still valid
+    ob._conn.execute("UPDATE webhook_outbox SET next_attempt_at='2000-01-01'")  # lease expires
+    assert d.deliver_pending()["delivered"] == 1

@@ -150,3 +150,12 @@ def test_exe_suffix_is_not_implicitly_allowed(engine: PolicyEngine):
         engine.check_command(["python.exe", "-m", "pytest"])
     engine.cfg.allowed_commands.append("python.exe")
     assert engine.check_command(["python.exe", "-m", "pytest"])[0] == "python.exe"
+
+
+def test_split_command_keeps_windows_paths():
+    from gca.cmdline import split_command
+    exe = r"C:\hostedtoolcache\windows\Python\3.12.7\x64\python.exe"
+    assert split_command(f"{exe} -m pytest -q", windows=True) == [exe, "-m", "pytest", "-q"]
+    assert split_command(r'"C:\Program Files\Py\python.exe" -c "print(1)"', windows=True) == \
+        [r"C:\Program Files\Py\python.exe", "-c", "print(1)"]
+    assert split_command("python -m pytest -k 'a and b'", windows=False) == ["python", "-m", "pytest", "-k", "a and b"]
