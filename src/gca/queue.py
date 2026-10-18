@@ -40,6 +40,10 @@ class JobQueue:
                    body TEXT NOT NULL)"""
         )
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS controls (
+                   name TEXT PRIMARY KEY, value TEXT NOT NULL, reason TEXT, set_by TEXT, set_at TEXT NOT NULL)"""
+        )
 
     def close(self) -> None:
         self._conn.close()
@@ -108,7 +112,9 @@ class JobQueue:
         return self.get(job_id).cancel_requested
 
     def claim_next(self, worker_id: str) -> Job | None:
-        """Atomically move one APPROVED job to RUNNING for this worker."""
+        """Atomically move one APPROVED job to RUNNING for this worker. Nothing is claimed while killed."""
+        if self.kill_switch():
+            return None
         cur = self._conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:
@@ -135,6 +141,22 @@ class JobQueue:
         except Exception:
             cur.execute("ROLLBACK")
             raise
+
+    # ------------------------------------------------------------ kill switch
+    def set_kill_switch(self, enabled: bool, *, reason: str = "", actor: str = "unknown") -> None:
+        self._conn.execute(
+            "INSERT INTO controls (name, value, reason, set_by, set_at) VALUES ('kill:global', ?, ?, ?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET value=excluded.value, reason=excluded.reason, "
+            "set_by=excluded.set_by, set_at=excluded.set_at",
+            ("on" if enabled else "off", reason, actor, now_iso()))
+
+    def kill_switch(self) -> dict[str, str] | None:
+        """Return the kill-switch record if engaged, else None."""
+        row = self._conn.execute(
+            "SELECT value, reason, set_by, set_at FROM controls WHERE name='kill:global'").fetchone()
+        if row and row[0] == "on":
+            return {"reason": row[1] or "", "set_by": row[2] or "", "set_at": row[3]}
+        return None
 
     def heartbeat(self, job_id: str) -> None:
         self._conn.execute("UPDATE jobs SET heartbeat_at=? WHERE id=?", (now_iso(), job_id))

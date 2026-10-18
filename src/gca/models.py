@@ -104,6 +104,7 @@ class StopReason(str, Enum):
     CANCELLED = "cancelled"
     PROVIDER_ERROR = "provider_error"
     POLICY_HALT = "policy_halt"  # too many blocked actions
+    KILL_SWITCH = "kill_switch"  # global stop engaged (locally or via inbound webhook)
     INTERNAL_ERROR = "internal_error"
 
 

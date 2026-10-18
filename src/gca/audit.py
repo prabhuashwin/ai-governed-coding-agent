@@ -9,12 +9,23 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from .models import AuditEvent, now_iso
 
 GENESIS = "0" * 64
+
+# Observers notified after every recorded event (e.g. the webhook outbox). Keyed so re-installing replaces.
+_SINKS: dict[str, Callable[[AuditEvent], None]] = {}
+
+
+def set_sink(name: str, fn: Callable[[AuditEvent], None] | None) -> None:
+    if fn is None:
+        _SINKS.pop(name, None)
+    else:
+        _SINKS[name] = fn
 
 
 def _hash(prev_hash: str, payload: dict[str, Any]) -> str:
@@ -64,7 +75,12 @@ class AuditLog:
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(ev.model_dump_json() + "\n")
             self._seq, self._last_hash = seq, h
-            return ev
+        for sink in list(_SINKS.values()):
+            try:
+                sink(ev)
+            except Exception:  # noqa: BLE001 - observers must never break the audit trail
+                pass
+        return ev
 
     def events(self) -> list[AuditEvent]:
         if not self.path.exists():

@@ -64,6 +64,7 @@ class AgentLoop:
         cost_fn: Callable[[int, int], float],
         max_blocked_actions: int = 5,
         cancel_check: Callable[[], bool] | None = None,
+        kill_check: Callable[[], bool] | None = None,
         heartbeat: Callable[[], None] | None = None,
         keep_recent_results: int = 8,
         recent_result_cap: int = 600,
@@ -75,6 +76,7 @@ class AgentLoop:
         self.cost_fn = cost_fn
         self.max_blocked = max_blocked_actions
         self.cancel_check = cancel_check or (lambda: False)
+        self.kill_check = kill_check or (lambda: False)
         self.heartbeat = heartbeat or (lambda: None)
         self.keep_recent = keep_recent_results
         self.result_cap = recent_result_cap
@@ -111,6 +113,8 @@ class AgentLoop:
 
         while True:
             self.heartbeat()
+            if self.kill_check():
+                return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="global kill switch engaged")
             if self.cancel_check():
                 return self._outcome(StopReason.CANCELLED, blocked=blocked)
             limit = self.tracker.exceeded()

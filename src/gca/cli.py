@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -46,6 +47,18 @@ max_tokens = 4096
 # --- Ollama / vLLM (local, no key) ----------------------------------------
 # kind = "openai_compatible"; base_url = "http://localhost:11434/v1"; model = "qwen2.5-coder:14b"
 # api_key_env = ""; require_api_key = false
+
+[approval]
+mode = "local"              # local | webhook (decisions only via signed POST /v1/jobs/<id>/decision)
+
+[webhooks]                  # optional: signed events out, signed commands in (see docs/webhooks.md)
+enabled = false
+outbound_urls = []          # e.g. ["https://koru.example.com/hooks/gca"]
+outbound_secret_env = "GCA_WEBHOOK_SECRET"
+inbound_secret_env = "GCA_INBOUND_SECRET"
+inbound_host = "127.0.0.1"
+inbound_port = 8787
+# events = ["approval.requested", "job.finished"]   # empty = all
 
 [servicenow]                # optional: `gca servicenow-sync` polls this table (approval happens in ServiceNow)
 # instance_url = "https://dev12345.service-now.com"
@@ -120,9 +133,14 @@ def cmd_submit(args, cfg):
 
 
 def cmd_approve(args, cfg):
+    if cfg.approval.mode == "webhook" and not args.override:
+        print("approval.mode is 'webhook': decisions come from the approving platform. "
+              "Use --override (recorded in the audit log) only for break-glass situations.", file=sys.stderr)
+        return 4
     q = _queue(cfg)
     job = q.reject(args.job_id, args.approver, args.note) if args.reject else q.approve(args.job_id, args.approver, args.note)
-    AuditLog(cfg.audit_dir, job.id).record(args.approver, "rejected" if args.reject else "approved", note=args.note)
+    AuditLog(cfg.audit_dir, job.id).record(args.approver, "rejected" if args.reject else "approved", note=args.note,
+                                           override=bool(getattr(args, "override", False)))
     print(f"{job.id} -> {job.status.value}")
     return 0
 
@@ -210,6 +228,87 @@ def cmd_publish(args, cfg):
     return 0
 
 
+def cmd_webhook_serve(args, cfg):
+    import threading as _threading
+
+    from . import webhooks as _wh
+    from .inbound import make_server
+    from .worker import Worker
+    q = _queue(cfg)
+    if not os.environ.get(cfg.webhooks.inbound_secret_env):
+        print(f"refusing to start: set {cfg.webhooks.inbound_secret_env} (shared secret for inbound signatures)",
+              file=sys.stderr)
+        return 2
+    srv = make_server(cfg, q, args.host, args.port)
+    stop = _threading.Event()
+
+    def flusher():
+        while not stop.wait(args.flush_every):
+            try:
+                _wh.flush(cfg)
+            except Exception as e:  # noqa: BLE001
+                print(f"webhook flush error: {e}", file=sys.stderr)
+
+    def worker_loop():
+        w = Worker(cfg, _queue(cfg))
+        while not stop.is_set():
+            if w.run_once() is None:
+                stop.wait(args.poll)
+
+    threads = [_threading.Thread(target=flusher, daemon=True)]
+    if args.with_worker:
+        threads.append(_threading.Thread(target=worker_loop, daemon=True))
+    for t in threads:
+        t.start()
+    host, port = srv.server_address[:2]
+    print(f"gca inbound webhooks listening on http://{host}:{port}  (worker: {'on' if args.with_worker else 'off'})")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        srv.server_close()
+    return 0
+
+
+def cmd_webhook_deliver(args, cfg):
+    from . import webhooks as _wh
+    if args.requeue_dead:
+        n = _wh.Outbox(cfg.db_path).requeue_dead()
+        print(f"requeued {n} dead deliveries")
+    print(json.dumps(_wh.flush(cfg)))
+    return 0
+
+
+def cmd_webhook_status(args, cfg):
+    from . import webhooks as _wh
+    rows = _wh.Outbox(cfg.db_path).rows(args.status)
+    for r in rows[-args.limit:]:
+        print(f"{r['created_at'][:19]}  {r['status']:<9} {r['type']:<22} {r['job_id'] or '-':<18} "
+              f"attempts={r['attempts']} {r['url']}" + (f"  [{r['last_error']}]" if r['last_error'] else ""))
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    print(json.dumps(counts))
+    return 0
+
+
+def cmd_kill(args, cfg):
+    from .inbound import set_kill_switch
+    q = _queue(cfg)
+    if args.state == "status":
+        ks = q.kill_switch()
+        print(json.dumps({"enabled": bool(ks), **(ks or {})}))
+        return 0
+    if args.state == "off" and not args.reason:
+        print("a --reason is required to disengage the kill switch", file=sys.stderr)
+        return 2
+    set_kill_switch(cfg, q, args.state == "on", reason=args.reason or "", actor=args.by, via="cli")
+    print(f"kill switch {args.state}")
+    return 0
+
+
 def cmd_servicenow_sync(args, cfg):
     import time as _time
 
@@ -251,13 +350,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-files", type=int, help="diff may touch at most N files"); s.add_argument("--max-lines", type=int, help="diff may change at most N lines")
     s.set_defaults(fn=cmd_submit)
 
-    s = sub.add_parser("approve", help="approve (or --reject) a job"); s.add_argument("job_id"); s.add_argument("--approver", required=True); s.add_argument("--note", default=""); s.add_argument("--reject", action="store_true"); s.set_defaults(fn=cmd_approve)
+    s = sub.add_parser("approve", help="approve (or --reject) a job"); s.add_argument("job_id"); s.add_argument("--approver", required=True); s.add_argument("--note", default=""); s.add_argument("--reject", action="store_true"); s.add_argument("--override", action="store_true", help="break-glass: approve locally even when approval.mode=webhook"); s.set_defaults(fn=cmd_approve)
     s = sub.add_parser("cancel"); s.add_argument("job_id"); s.add_argument("--by", default="cli"); s.set_defaults(fn=cmd_cancel)
     s = sub.add_parser("run", help="run the worker"); s.add_argument("--once", action="store_true"); s.add_argument("--poll", type=float, default=2.0); s.add_argument("--max-jobs", type=int); s.set_defaults(fn=cmd_run)
     s = sub.add_parser("status"); s.add_argument("job_id", nargs="?"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("report"); s.add_argument("job_id"); s.add_argument("--out"); s.add_argument("--diff", action="store_true"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("audit"); s.add_argument("job_id"); s.add_argument("--verify", action="store_true"); s.set_defaults(fn=cmd_audit)
     s = sub.add_parser("publish", help="push a succeeded job's branch and open a draft pull request"); s.add_argument("job_id"); s.add_argument("--remote", default="origin"); s.add_argument("--base", help="base branch (default: the remote's HEAD)"); s.add_argument("--ready", action="store_true", help="open as ready for review instead of draft"); s.add_argument("--no-pr", action="store_true", help="push only"); s.add_argument("--allow-failed", action="store_true", help="publish a failed job's branch for inspection"); s.set_defaults(fn=cmd_publish)
+    s = sub.add_parser("webhook-serve", help="serve signed inbound commands (submit/decision/cancel/kill-switch)"); s.add_argument("--host"); s.add_argument("--port", type=int); s.add_argument("--with-worker", action="store_true", help="also run a worker in this process"); s.add_argument("--poll", type=float, default=2.0); s.add_argument("--flush-every", type=float, default=5.0); s.set_defaults(fn=cmd_webhook_serve)
+    s = sub.add_parser("webhook-deliver", help="deliver pending outbound webhook events now"); s.add_argument("--requeue-dead", action="store_true"); s.set_defaults(fn=cmd_webhook_deliver)
+    s = sub.add_parser("webhook-status", help="list outbound webhook deliveries"); s.add_argument("--status", choices=["pending", "delivered", "dead"]); s.add_argument("--limit", type=int, default=50); s.set_defaults(fn=cmd_webhook_status)
+    s = sub.add_parser("kill", help="global kill switch: stop running agents and claim nothing new"); s.add_argument("state", choices=["on", "off", "status"]); s.add_argument("--reason", default=""); s.add_argument("--by", default="cli"); s.set_defaults(fn=cmd_kill)
     s = sub.add_parser("servicenow-sync", help="poll ServiceNow for approved work items and write status back"); s.add_argument("--once", action="store_true"); s.add_argument("--poll", type=float); s.set_defaults(fn=cmd_servicenow_sync)
     s = sub.add_parser("eval", help="run golden-task evals against the configured provider"); s.add_argument("--tasks-dir", default="evals/tasks"); s.add_argument("--out", default="evals/results"); s.add_argument("--only"); s.add_argument("--repeats", type=int, default=1); s.set_defaults(fn=cmd_eval)
     return p
@@ -266,6 +369,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     cfg = load_config(args.config)
+    from . import webhooks as _wh
+    _wh.install(cfg)
     return int(args.fn(args, cfg) or 0)
 
 

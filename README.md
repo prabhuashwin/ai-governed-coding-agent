@@ -58,7 +58,14 @@ gca report <job_id> --diff                 # the PR description + diff
 gca audit <job_id> --verify                # hash-chain check of the audit log
 gca publish <job_id>                       # push gca/<job_id> and open a draft PR (GITHUB_TOKEN)
 gca servicenow-sync --once                 # poll a ServiceNow table for approved items, write status back
+gca webhook-serve --with-worker            # signed inbound commands + outbound events (e.g. Koru)
+gca kill on|off|status --reason ...        # global kill switch
 ```
+
+**Platform integration via webhooks** (see **docs/webhooks.md**): gca emits signed lifecycle events
+(`approval.requested`, `job.finished`, …) to an agent-operations platform such as Koru, and accepts signed
+commands back: submit work, approve or reject (`approval.mode = "webhook"`), cancel, and kill switch.
+Delivery is durable and at least once, through an SQLite outbox; inbound commands are idempotent.
 
 Isolation is chosen in `gca.toml`: `[workspace] kind = "worktree"` (default) or `kind = "container"`, which
 runs every agent command *and* the verifier inside a throwaway Docker/Podman container with no network,
@@ -88,6 +95,8 @@ src/gca/
   report.py      PR-style markdown report
   audit.py       hash-chained JSONL audit log
   publish.py     push branch + open GitHub pull request
+  webhooks.py    signed outbound events: outbox, retries, dead letters
+  inbound.py     signed inbound commands: submit / decision / cancel / kill switch (HTTP server)
   providers/     base schema, anthropic, openai_compat, testing (scripted/record/replay)
   sources/       servicenow.py (Table API adapter + sync loop; tested against a mocked API)
   evals.py       golden-task eval runner
@@ -95,7 +104,7 @@ src/gca/
 tests/           unit · loop · safety · e2e
 evals/tasks/     golden tasks (small repos with seeded bugs); results are published to the `eval-results` branch
 scripts/         servicenow_bootstrap.py (create table / seed / verify on a PDI), smoke_script.json
-docs/            architecture + threat model, how-to-test, eval-baseline, sample report and audit
+docs/            architecture + threat model, how-to-test, eval-baseline, webhooks (integration contract), samples
 .github/         ci.yml (fast suite + container tests), evals.yml, evals-local.yml, servicenow-smoke.yml
 ```
 

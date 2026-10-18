@@ -101,8 +101,35 @@ class ServiceNowConfig(BaseModel):
     poll_seconds: float = 30.0
 
 
+class WebhookConfig(BaseModel):
+    """Outbound events (gca -> your platform) and inbound commands (your platform -> gca), HMAC-signed."""
+
+    enabled: bool = False
+    outbound_urls: list[str] = Field(default_factory=list)
+    outbound_secret_env: str = "GCA_WEBHOOK_SECRET"
+    events: list[str] = Field(default_factory=list)  # empty = all event types
+    include_report: bool = True  # include the markdown report in job.finished
+    deliver_inline: bool = True  # try to deliver as soon as an event is recorded (else only on flush)
+    timeout_seconds: float = 5.0
+    max_attempts: int = 8
+    # inbound command server (`gca webhook-serve`)
+    inbound_host: str = "127.0.0.1"
+    inbound_port: int = 8787
+    inbound_secret_env: str = "GCA_INBOUND_SECRET"
+    max_skew_seconds: int = 300  # reject signed requests older/newer than this
+    source_name: str = "gca"  # appears as `source` in every event envelope
+
+
+class ApprovalConfig(BaseModel):
+    # local: `gca approve` (or ServiceNow mirror). webhook: approval comes only from an inbound signed decision.
+    mode: str = "local"
+    allow_self_approval: bool = False  # enforced for webhook decisions
+
+
 class Config(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
+    webhooks: WebhookConfig = Field(default_factory=WebhookConfig)
+    approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     servicenow: ServiceNowConfig = Field(default_factory=ServiceNowConfig)
     budget: Budget = Field(default_factory=Budget)

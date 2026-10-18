@@ -11,6 +11,7 @@ import time
 import traceback
 from collections.abc import Callable
 
+from . import webhooks
 from .agent import AgentLoop
 from .audit import AuditLog
 from .config import Config
@@ -32,12 +33,20 @@ class Worker:
         self.queue = queue
         self.provider_factory = provider_factory or (lambda: build_provider(config.provider))
         self.worker_id = worker_id or config.worker_id
+        webhooks.install(config)
 
     def run_once(self) -> Job | None:
         job = self.queue.claim_next(self.worker_id)
         if job is None:
             return None
-        return self.process(job)
+        try:
+            return self.process(job)
+        finally:
+            if self.cfg.webhooks.enabled:
+                try:
+                    webhooks.flush(self.cfg)
+                except Exception:  # noqa: BLE001 - delivery failures stay in the outbox
+                    pass
 
     def run_forever(self, poll_seconds: float = 2.0, max_jobs: int | None = None) -> int:
         done = 0
@@ -72,6 +81,7 @@ class Worker:
                 cost_fn=lambda i, o: estimate_cost(self.cfg, provider.model, i, o),
                 max_blocked_actions=self.cfg.policy.max_blocked_actions,
                 cancel_check=lambda: self.queue.cancel_requested(job.id),
+                kill_check=lambda: self.queue.kill_switch() is not None,
                 heartbeat=lambda: self.queue.heartbeat(job.id),
             )
             outcome = loop.run(wi)
@@ -81,9 +91,10 @@ class Worker:
             result.diff = ws.diff()
             audit.record(f"worker:{self.worker_id}", "committed", commit=commit, changed_files=ws.changed_files())
 
-            if outcome.stop_reason == StopReason.CANCELLED:
-                job = self.queue.finish(job.id, JobStatus.CANCELLED, result=result, error="cancelled by request")
-                audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value)
+            if outcome.stop_reason in (StopReason.CANCELLED, StopReason.KILL_SWITCH):
+                why = "kill_switch" if outcome.stop_reason == StopReason.KILL_SWITCH else "cancelled by request"
+                job = self.queue.finish(job.id, JobStatus.CANCELLED, result=result, error=why)
+                audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value, error=why)
                 return job
 
             job = self.queue.transition(job.id, JobStatus.VERIFYING)
@@ -116,6 +127,8 @@ class Worker:
                     if result.agent is None:
                         result.agent = None
                     job = self.queue.finish(job.id, JobStatus.FAILED, result=result, error=f"internal_error: {e}")
+                    audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value,
+                                 error=f"internal_error: {e}")
             except Exception:  # pragma: no cover
                 pass
             return job
