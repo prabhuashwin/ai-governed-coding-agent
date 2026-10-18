@@ -2,6 +2,15 @@
 data_dir = ".gca"
 worker_id = "worker-1"
 
+[workspace]
+# kind: worktree (git worktree on this host) | container (each command in a throwaway docker/podman container)
+kind = "worktree"
+runtime = "docker"
+image = "python:3.12-slim"   # must contain the toolchain your test command needs
+network = "none"
+memory = "2g"
+cpus = "2"
+
 [provider]
 # kind: anthropic | openai_compatible | scripted | replay
 kind = "anthropic"
@@ -21,6 +30,24 @@ max_tokens = 4096
 # kind = "openai_compatible"; base_url = "http://localhost:11434/v1"; model = "qwen2.5-coder:14b"
 # api_key_env = ""; require_api_key = false
 
+[approval]
+mode = "local"              # local | webhook (decisions only via signed POST /v1/jobs/<id>/decision)
+
+[webhooks]                  # optional: signed events out, signed commands in (see docs/webhooks.md)
+enabled = false
+outbound_urls = []          # e.g. ["https://koru.example.com/hooks/gca"]
+outbound_secret_env = "GCA_WEBHOOK_SECRET"
+inbound_secret_env = "GCA_INBOUND_SECRET"
+inbound_host = "127.0.0.1"
+inbound_port = 8787
+# events = ["approval.requested", "job.finished"]   # empty = all
+
+[servicenow]                # optional: `gca servicenow-sync` polls this table (approval happens in ServiceNow)
+# instance_url = "https://dev12345.service-now.com"
+# table = "x_gca_work_item"
+# user_env = "SN_USER"
+# password_env = "SN_PASSWORD"
+
 [budget]
 max_turns = 30
 max_tool_calls = 120
@@ -28,6 +55,8 @@ max_input_tokens = 400000
 max_output_tokens = 60000
 max_cost_usd = 2.0
 max_seconds = 900
+max_files_changed = 20     # verifier fails the job if the diff is larger than this
+max_lines_changed = 800
 
 [policy]
 allowed_commands = ["python", "python3", "pytest", "npm", "node", "npx", "ls", "cat", "grep"]
