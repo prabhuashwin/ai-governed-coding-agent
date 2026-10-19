@@ -15,7 +15,7 @@ from gca import webhooks
 from gca.audit import AuditLog, verify_chain
 from gca.cli import main as cli_main
 from gca.config import ApprovalConfig, WebhookConfig
-from gca.inbound import CommandHandler, make_server
+from gca.inbound import CommandHandler, make_server, set_kill_switch
 from gca.models import JobStatus, StopReason
 from gca.providers.testing import ScriptedProvider
 from gca.queue import JobQueue
@@ -585,3 +585,29 @@ def test_spill_drain_survives_a_crash_and_concurrent_appends(hook_cfg, work_item
     webhooks.flush(hook_cfg)
     assert {e["id"] for e in receiver.events} >= {"evt_spilled", "evt_second"}
     assert not list(pub.outbox.db_path.parent.glob("webhook_spill.jsonl*"))
+
+
+# --------------------------------------------------------------------- review round 3 (2026-10-19)
+def test_expired_kill_switch_delivery_cannot_undo_a_newer_stop(hook_cfg, work_item, receiver):
+    """An "off" whose process died after applying the change but before recording its response was taken
+    over 120 s later and re-applied, clearing an "on" that had landed in between."""
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    h = CommandHandler(hook_cfg, q)
+    # the old OFF: applied (control row written with its delivery id), response never recorded, reservation stale
+    set_kill_switch(hook_cfg, q, False, reason="resolved", actor="secops", via="webhook", delivery_id="off-1")
+    h._conn.execute("INSERT INTO inbound_deliveries VALUES (?,?,0,'')", ("off-1", "2026-01-01T00:00:00+00:00"))
+    # a newer ON lands normally
+    hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "reason": "incident"}, delivery_id="on-2")
+    assert h.handle("POST", "/v1/controls/kill-switch", hd, rw)[0] == 200 and q.kill_switch() is not None
+    # the platform retries the old OFF (same valid signature): it must not clear the newer stop
+    hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": False, "actor": "secops", "reason": "resolved"}, delivery_id="off-1")
+    status, resp = h.handle("POST", "/v1/controls/kill-switch", hd, rw)
+    assert status == 409 and "superseded" in resp["error"]
+    assert q.kill_switch() is not None, "a stale delivery cleared an emergency stop"
+    # and a taken-over delivery whose change is still the latest is recognised, not re-applied
+    h._conn.execute("INSERT INTO inbound_deliveries VALUES (?,?,0,'')", ("on-3", "2026-01-01T00:00:00+00:00"))
+    set_kill_switch(hook_cfg, q, True, reason="drill", actor="secops", via="webhook", delivery_id="on-3")
+    hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "reason": "drill"}, delivery_id="on-3")
+    status, resp = h.handle("POST", "/v1/controls/kill-switch", hd, rw)
+    assert status == 200 and resp.get("already_applied") is True

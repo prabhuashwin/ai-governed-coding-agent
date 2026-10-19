@@ -57,6 +57,8 @@ class JobQueue:
             """CREATE TABLE IF NOT EXISTS controls (
                    name TEXT PRIMARY KEY, value TEXT NOT NULL, reason TEXT, set_by TEXT, set_at TEXT NOT NULL)"""
         )
+        if "delivery_id" not in {r[1] for r in self._conn.execute("PRAGMA table_info(controls)")}:
+            self._conn.execute("ALTER TABLE controls ADD COLUMN delivery_id TEXT")  # databases from before 0.1.1
 
     def close(self) -> None:
         self._conn.close()
@@ -190,20 +192,29 @@ class JobQueue:
 
     # ------------------------------------------------------------ kill switch
     @_serialised
-    def set_kill_switch(self, enabled: bool, *, reason: str = "", actor: str = "unknown") -> None:
+    def set_kill_switch(self, enabled: bool, *, reason: str = "", actor: str = "unknown",
+                        delivery_id: str | None = None) -> None:
         self._conn.execute(
-            "INSERT INTO controls (name, value, reason, set_by, set_at) VALUES ('kill:global', ?, ?, ?, ?) "
+            "INSERT INTO controls (name, value, reason, set_by, set_at, delivery_id) VALUES ('kill:global', ?, ?, ?, ?, ?) "
             "ON CONFLICT(name) DO UPDATE SET value=excluded.value, reason=excluded.reason, "
-            "set_by=excluded.set_by, set_at=excluded.set_at",
-            ("on" if enabled else "off", reason, actor, now_iso()))
+            "set_by=excluded.set_by, set_at=excluded.set_at, delivery_id=excluded.delivery_id",
+            ("on" if enabled else "off", reason, actor, now_iso(), delivery_id))
+
+    @_serialised
+    def kill_switch_record(self) -> dict[str, str | None] | None:
+        """The kill-switch control row as last written (engaged or not), or None if never set."""
+        row = self._conn.execute(
+            "SELECT value, reason, set_by, set_at, delivery_id FROM controls WHERE name='kill:global'").fetchone()
+        if not row:
+            return None
+        return {"value": row[0], "reason": row[1] or "", "set_by": row[2] or "", "set_at": row[3], "delivery_id": row[4]}
 
     @_serialised
     def kill_switch(self) -> dict[str, str] | None:
         """Return the kill-switch record if engaged, else None."""
-        row = self._conn.execute(
-            "SELECT value, reason, set_by, set_at FROM controls WHERE name='kill:global'").fetchone()
-        if row and row[0] == "on":
-            return {"reason": row[1] or "", "set_by": row[2] or "", "set_at": row[3]}
+        rec = self.kill_switch_record()
+        if rec and rec["value"] == "on":
+            return {"reason": rec["reason"] or "", "set_by": rec["set_by"] or "", "set_at": rec["set_at"] or ""}
         return None
 
     @_serialised
@@ -214,17 +225,21 @@ class JobQueue:
         return self.transition(job_id, status, result=result, error=error)
 
     def complete(self, job_id: str, status: JobStatus, result: RunResult | None = None,
-                 error: str | None = None) -> Job:
+                 error: str | None = None, render=None) -> Job:
         """Finish a job the worker ran, honouring a cancel request in the same transaction: a cancel that
         arrives before this commits turns a would-be success into `cancelled`, never `succeeded` with the
-        flag still set."""
+        flag still set. `render(job, result)` (the report) runs after that decision, so the persisted report
+        describes the status the job actually ended in."""
         def mutate(job: Job) -> None:
             final, why = status, error
             if job.cancel_requested and status == JobStatus.SUCCEEDED:
                 final, why = JobStatus.CANCELLED, "cancelled during verification"
             if final not in TRANSITIONS[job.status]:
                 raise InvalidTransition(f"{job.status.value} -> {final.value} is not allowed for {job_id}")
-            job.status, job.result, job.error = final, result, why
+            job.status, job.error = final, why
+            if result is not None and render is not None:
+                result.report_markdown = render(job, result)
+            job.result = result
         return self._update(job_id, mutate)
 
     @_serialised

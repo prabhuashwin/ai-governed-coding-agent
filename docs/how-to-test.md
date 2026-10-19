@@ -156,6 +156,15 @@ leftovers, all fixed with tests marked "review round 2 (2026-10-19)":
 | P2 | Jobs without a recorded verified commit still published the branch head | Refused unless `--allow-failed` |
 | P2 | A repository that is itself a linked worktree failed workspace creation | Validated against the common git dir |
 
+A third pass (commit `3a441cd`) found one P1 and two P2 leftovers, fixed with tests marked "review round 3
+(2026-10-19)":
+
+| # | Finding | Fix |
+|---|---|---|
+| P1 | A taken-over kill-switch "off" delivery re-applied after a newer "on" cleared the emergency stop | The control row records the delivery that set it; a taken-over delivery is recognised as already applied, or refused as superseded when the switch changed after it was first received |
+| P2 | Tools earlier in the same response could exhaust `max_seconds` before `finish` was honoured | The clock is re-checked when `finish` is reached |
+| P2 | A job cancelled in the finishing transaction kept a report saying `succeeded` | The report is rendered inside that transaction, after the final status is decided |
+
 The real-model evals in `docs/eval-baseline.md` predate these fixes; re-run them before quoting the numbers.
 
 ## Known gaps

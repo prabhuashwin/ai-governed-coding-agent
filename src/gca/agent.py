@@ -162,6 +162,9 @@ class AgentLoop:
             results: list[Any] = []
             for call in calls:
                 if call.name == "finish":
+                    # Tools earlier in this same response may have used up the clock since the post-charge check.
+                    if "max_seconds" in self.tracker.exceeded_all():
+                        return self._outcome(StopReason.BUDGET_EXHAUSTED, blocked=blocked, detail="max_seconds")
                     summary = str(call.input.get("summary", ""))
                     success = bool(call.input.get("success", False))
                     self.audit.record("agent", "finish_called", summary=summary[:2000], claimed_success=success)

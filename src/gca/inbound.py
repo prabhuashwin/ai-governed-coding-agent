@@ -66,18 +66,20 @@ class CommandHandler:
         if reason:
             return 401, {"error": "unauthorized", "detail": reason}
         delivery_id = {k.lower(): v for k, v in headers.items()}.get("x-gca-delivery-id", "")
+        taken_over_since: str | None = None
         if method == "POST":
             if not delivery_id:
                 return 400, {"error": "X-GCA-Delivery-Id header is required for POST"}
             # Reserve the delivery id *before* doing anything, so two concurrent copies of the same delivery
             # cannot both run the command. The reservation row (status 0) is filled in when the command is done.
-            if not self._reserve(delivery_id):
+            reserved, taken_over_since = self._reserve(delivery_id)
+            if not reserved:
                 return self._replay(delivery_id)
         try:
             payload = json.loads(body or b"{}") if method == "POST" else {}
             if not isinstance(payload, dict):
                 raise CommandError(400, "body must be a JSON object")
-            status, resp = self._route(method, path, payload, delivery_id)
+            status, resp = self._route(method, path, payload, delivery_id, taken_over_since)
         except CommandError as e:
             status, resp = e.status, {"error": e.message}
         except json.JSONDecodeError:
@@ -103,16 +105,23 @@ class CommandHandler:
     # idempotent per delivery id, a second decision is a 409, cancel and the kill switch are idempotent.
     RESERVATION_TTL_SECONDS = 120
 
-    def _reserve(self, delivery_id: str) -> bool:
+    def _reserve(self, delivery_id: str) -> tuple[bool, str | None]:
+        """(reserved, taken_over_since): the second value is the abandoned reservation's original time when this
+        copy took over a delivery whose first copy died mid-command, else None."""
         with self._lock:
             if self._conn.execute("INSERT OR IGNORE INTO inbound_deliveries VALUES (?,?,0,'')",
                                   (delivery_id, now_iso())).rowcount == 1:
-                return True
+                return True, None
             cutoff = (datetime.now(timezone.utc) - timedelta(seconds=self.RESERVATION_TTL_SECONDS)).isoformat()
-            # take over an abandoned reservation (atomic: only one copy wins the UPDATE)
-            return self._conn.execute(
-                "UPDATE inbound_deliveries SET received_at=? WHERE id=? AND status=0 AND received_at<?",
-                (now_iso(), delivery_id, cutoff)).rowcount == 1
+            row = self._conn.execute("SELECT received_at FROM inbound_deliveries WHERE id=? AND status=0 AND received_at<?",
+                                     (delivery_id, cutoff)).fetchone()
+            if row is None:
+                return False, None
+            # take over the abandoned reservation (atomic: only one copy wins the UPDATE)
+            won = self._conn.execute(
+                "UPDATE inbound_deliveries SET received_at=? WHERE id=? AND status=0 AND received_at=?",
+                (now_iso(), delivery_id, row[0])).rowcount == 1
+            return won, (row[0] if won else None)
 
     def _replay(self, delivery_id: str, wait_seconds: float = 5.0) -> tuple[int, dict[str, Any]]:
         """The stored response for a delivery id seen before; waits briefly for one still in progress."""
@@ -129,11 +138,12 @@ class CommandHandler:
                              "retry_after_seconds": self.RESERVATION_TTL_SECONDS}
             time.sleep(0.05)
 
-    def _route(self, method: str, path: str, p: dict[str, Any], delivery_id: str = "") -> tuple[int, dict[str, Any]]:
+    def _route(self, method: str, path: str, p: dict[str, Any], delivery_id: str = "",
+               taken_over_since: str | None = None) -> tuple[int, dict[str, Any]]:
         if method == "POST" and path == "/v1/work-items":
             return self.submit(p, delivery_id)
         if method == "POST" and path == "/v1/controls/kill-switch":
-            return self.kill_switch(p)
+            return self.kill_switch(p, delivery_id, taken_over_since)
         m = re.fullmatch(r"/v1/jobs/([A-Za-z0-9_\-]+)(/decision|/cancel)?", path)
         if m:
             job_id, action = m.group(1), m.group(2)
@@ -198,7 +208,8 @@ class CommandHandler:
         self._audit(job_id).record(str(p.get("by", "webhook")), "cancel_requested", via="webhook")
         return 200, {"job_id": job_id, "status": job.status.value, "cancel_requested": job.cancel_requested}
 
-    def kill_switch(self, p: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    def kill_switch(self, p: dict[str, Any], delivery_id: str = "",
+                    taken_over_since: str | None = None) -> tuple[int, dict[str, Any]]:
         if not isinstance(p.get("enabled"), bool):
             raise CommandError(422, "enabled must be true or false")
         actor, reason = str(p.get("actor", "")).strip(), str(p.get("reason", "")).strip()
@@ -206,7 +217,17 @@ class CommandHandler:
             raise CommandError(422, "actor is required")
         if not p["enabled"] and not reason:
             raise CommandError(422, "a reason is required to disengage the kill switch")
-        set_kill_switch(self.cfg, self.queue, p["enabled"], reason=reason, actor=actor, via="webhook")
+        # The kill switch is the one command whose re-run is not harmless: an old "off" re-applied after a newer
+        # "on" would clear an emergency stop. The control row records which delivery last set it, so a copy that
+        # took over an abandoned reservation can tell whether its change already landed, or was superseded.
+        current = self.queue.kill_switch_record()
+        if current and delivery_id and current["delivery_id"] == delivery_id:
+            return 200, {"enabled": current["value"] == "on", "actor": current["set_by"], "reason": current["reason"],
+                         "already_applied": True}
+        if taken_over_since and current and (current["set_at"] or "") > taken_over_since:
+            raise CommandError(409, "superseded: the kill switch was changed after this delivery was first received")
+        set_kill_switch(self.cfg, self.queue, p["enabled"], reason=reason, actor=actor, via="webhook",
+                        delivery_id=delivery_id or None)
         return 200, {"enabled": p["enabled"], "actor": actor, "reason": reason}
 
     def status(self, job_id: str) -> tuple[int, dict[str, Any]]:
@@ -228,9 +249,10 @@ class CommandHandler:
             raise CommandError(404, f"unknown job {job_id}") from e
 
 
-def set_kill_switch(cfg: Config, queue: JobQueue, enabled: bool, *, reason: str, actor: str, via: str) -> None:
+def set_kill_switch(cfg: Config, queue: JobQueue, enabled: bool, *, reason: str, actor: str, via: str,
+                    delivery_id: str | None = None) -> None:
     """Engage/disengage the global stop and record it in a dedicated audit stream."""
-    queue.set_kill_switch(enabled, reason=reason, actor=actor)
+    queue.set_kill_switch(enabled, reason=reason, actor=actor, delivery_id=delivery_id)
     AuditLog(cfg.audit_dir, "_controls").record(actor, "kill_switch", enabled=enabled, reason=reason, via=via)
 
 

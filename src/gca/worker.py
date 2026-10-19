@@ -129,13 +129,12 @@ class Worker:
             policy_clean = outcome.blocked_actions == 0 or not self.cfg.policy.fail_on_any_blocked_action
             ok = verification.passed and outcome.stop_reason == StopReason.FINISHED and policy_clean
             final = JobStatus.SUCCEEDED if ok else JobStatus.FAILED
-            job.status = final  # for the report
-            result.report_markdown = render_report(job, result)
             err = None if ok else _failure_reason(outcome.stop_reason, verification.passed, verification.flags,
                                                   outcome.blocked_actions if not policy_clean else 0)
-            # complete() decides cancel-versus-success inside one transaction: a cancel requested at any point
-            # up to this commit yields `cancelled`, never a success with the flag still set
-            job = self.queue.complete(job.id, final, result=result, error=err)
+            # complete() decides cancel-versus-success inside one transaction (a cancel requested at any point
+            # up to this commit yields `cancelled`, never a success with the flag still set) and renders the
+            # report after that decision, so the report never says "succeeded" for a cancelled job
+            job = self.queue.complete(job.id, final, result=result, error=err, render=render_report)
             audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value, error=job.error)
             return job
         except Exception as e:  # noqa: BLE001 - anything else is a FAILED job, never a crashed worker

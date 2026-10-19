@@ -361,14 +361,17 @@ def test_rename_out_of_allowed_paths_fails_verification(config, work_item, calc_
 def test_cancel_between_check_and_commit_never_reports_success(config, work_item, monkeypatch):
     """A cancel landing after the worker's cancel check but before finish() used to produce
     succeeded + cancel_requested=true. The decision is now made inside the finishing transaction."""
-    from gca import worker as worker_mod
+    cancelled_job: list[str] = []
+    real_complete = JobQueue.complete
 
-    real_render = worker_mod.render_report
+    def complete_after_late_cancel(self, job_id, status, result=None, error=None, render=None):
+        if not cancelled_job:  # the last possible moment: the worker has decided "succeeded" and is committing
+            cancelled_job.append(job_id)
+            JobQueue(config.db_path).request_cancel(job_id)
+        return real_complete(self, job_id, status, result=result, error=error, render=render)
 
-    def render_then_cancel(job, result):
-        JobQueue(config.db_path).request_cancel(job.id)  # the last possible moment before the commit
-        return real_render(job, result)
-
-    monkeypatch.setattr(worker_mod, "render_report", render_then_cancel)
+    monkeypatch.setattr(JobQueue, "complete", complete_after_late_cancel)
     job, _, _ = run_pipeline(config, work_item, steps_fix_calc())
     assert job.status == JobStatus.CANCELLED and job.error == "cancelled during verification"
+    # round 3: the persisted report describes the final status, not the success the worker had computed
+    assert "status **cancelled**" in job.result.report_markdown and "status **succeeded**" not in job.result.report_markdown
