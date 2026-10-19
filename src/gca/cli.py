@@ -63,6 +63,11 @@ inbound_port = 8787
 # allow_publish = true      # false: the platform cannot ask gca to push/open PRs; use `gca publish`
 # events = ["approval.requested", "job.finished"]   # empty = all
 
+[retention]                 # `gca prune` (run it from cron); audit logs are never pruned by gca
+jobs_days = 90
+outbox_days = 14
+inbound_days = 14
+
 [publish]                   # this instance's (= this tenant's) publishing identity
 remote = "origin"
 draft = true
@@ -312,6 +317,14 @@ def cmd_webhook_deliver(args, cfg):
     return 0
 
 
+def cmd_prune(args, cfg):
+    from .retention import prune
+    removed = prune(cfg, dry_run=args.dry_run)
+    print(json.dumps({"dry_run": args.dry_run, "removed": removed,
+                      "retention_days": cfg.retention.model_dump()}))
+    return 0
+
+
 def cmd_webhook_status(args, cfg):
     from . import webhooks as _wh
     rows = _wh.Outbox(cfg.db_path).rows(args.status)
@@ -390,6 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("publish", help="push a succeeded job's branch and open a draft pull request"); s.add_argument("job_id"); s.add_argument("--remote", help="default: [publish] remote"); s.add_argument("--base", help="base branch (default: [publish] base, else the remote's HEAD)"); s.add_argument("--ready", action="store_true", help="open as ready for review instead of draft"); s.add_argument("--no-pr", action="store_true", help="push only"); s.add_argument("--allow-failed", action="store_true", help="publish a failed job's branch for inspection"); s.set_defaults(fn=cmd_publish)
     s = sub.add_parser("webhook-serve", help="serve signed inbound commands (submit/decision/cancel/kill-switch)"); s.add_argument("--host"); s.add_argument("--port", type=int); s.add_argument("--with-worker", action="store_true", help="also run a worker in this process"); s.add_argument("--poll", type=float, default=2.0); s.add_argument("--flush-every", type=float, default=5.0); s.set_defaults(fn=cmd_webhook_serve)
     s = sub.add_parser("webhook-deliver", help="deliver pending outbound webhook events now"); s.add_argument("--requeue-dead", action="store_true"); s.set_defaults(fn=cmd_webhook_deliver)
+    s = sub.add_parser("prune", help="apply [retention]: drop old terminal jobs, delivered/dead outbound events and inbound idempotency records (audit logs are kept)"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(fn=cmd_prune)
     s = sub.add_parser("webhook-status", help="list outbound webhook deliveries"); s.add_argument("--status", choices=["pending", "inflight", "delivered", "dead"]); s.add_argument("--limit", type=int, default=50); s.set_defaults(fn=cmd_webhook_status)
     s = sub.add_parser("kill", help="global kill switch: stop running agents and claim nothing new"); s.add_argument("state", choices=["on", "off", "status"]); s.add_argument("--reason", default=""); s.add_argument("--by", default="cli"); s.set_defaults(fn=cmd_kill)
     s = sub.add_parser("servicenow-sync", help="poll ServiceNow for approved work items and write status back"); s.add_argument("--once", action="store_true"); s.add_argument("--poll", type=float); s.set_defaults(fn=cmd_servicenow_sync)

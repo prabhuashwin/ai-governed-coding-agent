@@ -136,6 +136,13 @@ class PublishConfig(BaseModel):
     api_base: str = "https://api.github.com"  # GitHub Enterprise: https://ghe.example/api/v3
 
 
+class RetentionConfig(BaseModel):
+    """How long `gca prune` keeps rows in the job store. Audit logs are never pruned by gca."""
+    jobs_days: int = 90      # terminal jobs (work item, result, report) after their last update
+    outbox_days: int = 14    # delivered and dead outbound events
+    inbound_days: int = 14   # inbound idempotency records; must exceed the platform's longest retry horizon
+
+
 class ApprovalConfig(BaseModel):
     # local: `gca approve` (or ServiceNow mirror). webhook: approval comes only from an inbound signed decision.
     mode: str = "local"
@@ -147,6 +154,7 @@ class Config(BaseModel):
     webhooks: WebhookConfig = Field(default_factory=WebhookConfig)
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     publish: PublishConfig = Field(default_factory=PublishConfig)
+    retention: RetentionConfig = Field(default_factory=RetentionConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     servicenow: ServiceNowConfig = Field(default_factory=ServiceNowConfig)
     budget: Budget = Field(default_factory=Budget)

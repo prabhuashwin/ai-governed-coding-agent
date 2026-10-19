@@ -213,6 +213,7 @@ verification report. Without `GITHUB_TOKEN`, it pushes the branch only.
 | `gca publish <job>` | Push the branch and open a draft GitHub PR |
 | `gca webhook-serve [--with-worker]` | Serve signed inbound commands and deliver outbound events |
 | `gca webhook-deliver [--requeue-dead]` / `gca webhook-status` | Flush or inspect outbound deliveries |
+| `gca prune [--dry-run]` | Apply `[retention]`: drop old terminal jobs, delivered/dead events and inbound idempotency records (audit logs are kept) |
 | `gca kill on\|off\|status` | Global kill switch |
 | `gca servicenow-sync [--once]` | Poll ServiceNow for approved work and write results back |
 | `gca eval [--repeats N] [--only name]` | Run the golden-task evals against the configured model |
@@ -223,7 +224,7 @@ Every command accepts `-c path/to/gca.toml` (default `./gca.toml`, or `$GCA_CONF
 
 | Layer | Command | Needs |
 |---|---|---|
-| Unit, loop, safety (red-team), end-to-end: 270 tests | `pytest -q` | nothing; about 2 minutes |
+| Unit, loop, safety (red-team), end-to-end: 272 tests | `pytest -q` | nothing; about 2 minutes |
 | Real containers | `GCA_TEST_RUNTIME=docker GCA_TEST_IMAGE=<image with pytest> pytest tests/unit/test_container_workspace.py` | Docker or Podman |
 | Golden-task evals, real model | `gca eval`, or the **evals (real model)** GitHub workflow | an API key |
 | Local model (no external inference) | **evals (local model, Ollama)** workflow | nothing |
@@ -244,6 +245,8 @@ keys stay in repository secrets, and results are committed to the `eval-results`
 | [`docs/multi-tenancy.md`](docs/multi-tenancy.md) | One instance per tenant: what is per instance, identity trust, TLS placement, operating N instances |
 | [`docs/koru-adapter.md`](docs/koru-adapter.md), [`docs/webhook-contract-samples.json`](docs/webhook-contract-samples.json) | Who owns the Koru-side adapter, what it maps, and real samples of every command and event to build it against |
 | [`docs/pilot-scenarios.md`](docs/pilot-scenarios.md) | The pilot scenario matrix: every scenario mapped to its automated evidence and real-model evidence, the evidence format, and the pilot operating system |
+| [`docs/runbook.md`](docs/runbook.md) | Operator runbook: install, configure, credentials, run, upgrade and migration, recovery, retention, dependencies, troubleshooting |
+| [`docs/security-signoff.md`](docs/security-signoff.md) | Security sign-off for an integrated deployment: claims with evidence, deployment checklist, residual risks, open items |
 | [`docs/sample-report.md`](docs/sample-report.md), [`docs/sample-audit.txt`](docs/sample-audit.txt) | What a finished job produces |
 | [`evals/README.md`](evals/README.md) | How golden tasks work and how to add one |
 
@@ -289,3 +292,9 @@ Limitations to know before relying on it:
   endpoint and shared secrets.
 - **ServiceNow.** Tested against a mocked API; the live round trip needs a developer instance.
 - **Merging.** Merge, release and production actions are deliberately out of scope and stay with humans.
+
+## Licence and release
+
+The code is marked `Proprietary` in `pyproject.toml` until the owners decide otherwise; it is not licensed
+for redistribution. Releases are git tags `v<version>` (`CHANGELOG.md`); the `v0.2.0` tag exists in the
+maintainer's local checkout and must be pushed from there (`git push origin v0.2.0`).
