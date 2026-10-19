@@ -63,8 +63,11 @@ def publish_job(cfg: Config, queue: JobQueue, job_id: str, *, remote: str = "ori
             raise ValueError(f"{branch} is at {head[:12]} but the verified commit is {verified[:12]}; the branch "
                              f"changed after verification. Re-run the job, or pass --allow-failed to push it unverified")
         _git(repo, "push", "--force-with-lease", remote, f"{verified}:refs/heads/{branch}")
-    else:  # a job from before verification recorded its commit
+    elif allow_failed:  # explicit override only: a job from before verification recorded its commit
         _git(repo, "push", "--force-with-lease", remote, f"{branch}:{branch}")
+    else:
+        raise ValueError(f"{job_id} has no verified commit on record (it predates commit pinning); re-run the job, "
+                         f"or pass --allow-failed to push the branch head unverified")
     audit.record("publisher", "branch_pushed", remote=remote_url, branch=branch, commit=verified)
     result = PublishResult(job_id=job.id, branch=branch, pushed_to=remote_url)
 

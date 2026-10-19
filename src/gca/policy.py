@@ -53,6 +53,16 @@ class BudgetTracker:
             return "max_tool_calls"
         return None
 
+    def exceeded_all(self) -> list[str]:
+        """Every exhausted limit, not only the first: a cap must not be masked by another one hit at the same time."""
+        u, b = self.usage, self.budget
+        u.seconds = time.monotonic() - self.started_at
+        checks = [("max_turns", u.turns >= b.max_turns), ("max_input_tokens", u.input_tokens >= b.max_input_tokens),
+                  ("max_output_tokens", u.output_tokens >= b.max_output_tokens),
+                  ("max_cost_usd", u.cost_usd >= b.max_cost_usd), ("max_seconds", u.seconds >= b.max_seconds),
+                  ("max_tool_calls", u.tool_calls >= b.max_tool_calls)]
+        return [name for name, hit in checks if hit]
+
     def remaining_seconds(self) -> float:
         return max(0.0, self.budget.max_seconds - (time.monotonic() - self.started_at))
 

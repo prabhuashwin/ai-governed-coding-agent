@@ -336,3 +336,39 @@ def test_cancel_during_verification_never_reports_success(config, work_item, mon
     assert job.status == JobStatus.CANCELLED and job.error == "cancelled during verification"
     assert job.result.verification is not None  # the evidence is kept for the record
     assert audit.events()[-1].data["status"] == "cancelled"
+
+
+# --------------------------------------------------------------- review round 2 (2026-10-19)
+def test_rename_out_of_allowed_paths_fails_verification(config, work_item, calc_repo):
+    """git reports a rename as `old => new`; checking that display string as one path let a file moved out of
+    the allowed scope pass. Both ends of a rename are now checked."""
+    work_item.allowed_paths = ["allowed"]
+    (calc_repo / "allowed").mkdir()
+    (calc_repo / "allowed" / "calc.py").write_text(CALC_SRC.replace(CALC_FIX_OLD, CALC_FIX_NEW))
+    git(calc_repo, "add", "-A")
+    git(calc_repo, "commit", "-q", "-m", "fixed copy inside the allowed dir")
+    steps = [
+        {"tool_calls": [{"name": "run_command", "arguments": {"argv": [
+            sys.executable, "-c", "import os; os.replace('allowed/calc.py', 'calc.py')"]}}]},
+        {"tool_calls": [{"name": "run_tests", "arguments": {}}]},
+        {"tool_calls": [{"name": "finish", "arguments": {"summary": "moved the fix into place", "success": True}}]},
+    ]
+    job, _, _ = run_pipeline(config, work_item, steps)
+    assert job.status == JobStatus.FAILED
+    assert any(f.startswith("write_outside_policy:calc.py") for f in job.result.verification.flags), job.result.verification.flags
+
+
+def test_cancel_between_check_and_commit_never_reports_success(config, work_item, monkeypatch):
+    """A cancel landing after the worker's cancel check but before finish() used to produce
+    succeeded + cancel_requested=true. The decision is now made inside the finishing transaction."""
+    from gca import worker as worker_mod
+
+    real_render = worker_mod.render_report
+
+    def render_then_cancel(job, result):
+        JobQueue(config.db_path).request_cancel(job.id)  # the last possible moment before the commit
+        return real_render(job, result)
+
+    monkeypatch.setattr(worker_mod, "render_report", render_then_cancel)
+    job, _, _ = run_pipeline(config, work_item, steps_fix_calc())
+    assert job.status == JobStatus.CANCELLED and job.error == "cancelled during verification"

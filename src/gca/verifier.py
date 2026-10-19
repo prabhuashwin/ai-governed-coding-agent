@@ -111,6 +111,32 @@ def _show(repo: Path, rev: str, path: str) -> str:
     return cp.stdout if cp.returncode == 0 else ""
 
 
+def _numstat(repo: Path, base: str, branch: str) -> tuple[int, int, list[str]]:
+    """Insertions, deletions and every path the diff touches, with both ends of a rename listed separately.
+
+    Uses NUL-delimited output: the plain form prints a rename as one display string (`old => new`), which is
+    not a path and would let a file moved out of the allowed scope pass as if it were still inside it.
+    """
+    raw = subprocess.run(["git", "diff", "--numstat", "-z", f"{base}..{branch}"], cwd=str(repo),
+                         capture_output=True, check=True).stdout.decode("utf-8", errors="surrogateescape")
+    fields = raw.split("\0")
+    ins = dels = 0
+    files: list[str] = []
+    i = 0
+    while i < len(fields) and fields[i] != "":
+        a, b, path = fields[i].split("\t", 2)
+        if a.isdigit() and b.isdigit():
+            ins += int(a)
+            dels += int(b)
+        if path == "":  # rename or copy: the two paths follow as their own fields
+            files.extend([fields[i + 1], fields[i + 2]])
+            i += 3
+        else:
+            files.append(path)
+            i += 1
+    return ins, dels, files
+
+
 def _count_tests(path: str, text: str) -> int:
     if path.endswith(".py"):
         return len(PY_TEST_FUNC.findall(text))
@@ -216,16 +242,7 @@ class Verifier:
             canaries = policy.find_canaries(diff)
             if canaries:
                 flags.append("secret_canary_in_diff")
-            numstat = _git(self.repo, "diff", "--numstat", f"{self.base}..{self.branch}")
-            ins = dels = 0
-            files: list[str] = []
-            for line in numstat.splitlines():
-                p = line.split("\t")
-                if len(p) >= 3:
-                    files.append(p[2])
-                    if p[0].isdigit() and p[1].isdigit():
-                        ins += int(p[0])
-                        dels += int(p[1])
+            ins, dels, files = _numstat(self.repo, self.base, self.branch)
             if self.max_files_changed is not None and len(files) > self.max_files_changed:
                 flags.append(f"diff_too_large:files:{len(files)}>{self.max_files_changed}")
             if self.max_lines_changed is not None and ins + dels > self.max_lines_changed:

@@ -126,12 +126,6 @@ class Worker:
             audit.record("verifier", "verified", passed=verification.passed, flags=verification.flags,
                          exit_code=verification.exit_code, files_changed=verification.files_changed)
 
-            if self.queue.cancel_requested(job.id):  # asked to stop while verifying: never report success
-                job = self.queue.finish(job.id, JobStatus.CANCELLED, result=result, error="cancelled during verification")
-                audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value,
-                             error="cancelled during verification")
-                return job
-
             policy_clean = outcome.blocked_actions == 0 or not self.cfg.policy.fail_on_any_blocked_action
             ok = verification.passed and outcome.stop_reason == StopReason.FINISHED and policy_clean
             final = JobStatus.SUCCEEDED if ok else JobStatus.FAILED
@@ -139,8 +133,10 @@ class Worker:
             result.report_markdown = render_report(job, result)
             err = None if ok else _failure_reason(outcome.stop_reason, verification.passed, verification.flags,
                                                   outcome.blocked_actions if not policy_clean else 0)
-            job = self.queue.finish(job.id, final, result=result, error=err)
-            audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value, error=err)
+            # complete() decides cancel-versus-success inside one transaction: a cancel requested at any point
+            # up to this commit yields `cancelled`, never a success with the flag still set
+            job = self.queue.complete(job.id, final, result=result, error=err)
+            audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value, error=job.error)
             return job
         except Exception as e:  # noqa: BLE001 - anything else is a FAILED job, never a crashed worker
             tb = traceback.format_exc()[-3000:]

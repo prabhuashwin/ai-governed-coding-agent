@@ -19,6 +19,7 @@ import os
 import re
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -70,10 +71,7 @@ class CommandHandler:
                 return 400, {"error": "X-GCA-Delivery-Id header is required for POST"}
             # Reserve the delivery id *before* doing anything, so two concurrent copies of the same delivery
             # cannot both run the command. The reservation row (status 0) is filled in when the command is done.
-            with self._lock:
-                reserved = self._conn.execute("INSERT OR IGNORE INTO inbound_deliveries VALUES (?,?,0,'')",
-                                              (delivery_id, now_iso())).rowcount == 1
-            if not reserved:
+            if not self._reserve(delivery_id):
                 return self._replay(delivery_id)
         try:
             payload = json.loads(body or b"{}") if method == "POST" else {}
@@ -100,6 +98,22 @@ class CommandHandler:
                     self._conn.execute("DELETE FROM inbound_deliveries WHERE id=?", (delivery_id,))
         return status, resp
 
+    # A reservation (status 0) older than this belongs to a process that died mid-command: it is taken over by
+    # the next copy of the delivery, which re-runs the command. Every command is safe to re-run: submit is
+    # idempotent per delivery id, a second decision is a 409, cancel and the kill switch are idempotent.
+    RESERVATION_TTL_SECONDS = 120
+
+    def _reserve(self, delivery_id: str) -> bool:
+        with self._lock:
+            if self._conn.execute("INSERT OR IGNORE INTO inbound_deliveries VALUES (?,?,0,'')",
+                                  (delivery_id, now_iso())).rowcount == 1:
+                return True
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=self.RESERVATION_TTL_SECONDS)).isoformat()
+            # take over an abandoned reservation (atomic: only one copy wins the UPDATE)
+            return self._conn.execute(
+                "UPDATE inbound_deliveries SET received_at=? WHERE id=? AND status=0 AND received_at<?",
+                (now_iso(), delivery_id, cutoff)).rowcount == 1
+
     def _replay(self, delivery_id: str, wait_seconds: float = 5.0) -> tuple[int, dict[str, Any]]:
         """The stored response for a delivery id seen before; waits briefly for one still in progress."""
         deadline = time.monotonic() + wait_seconds
@@ -111,7 +125,8 @@ class CommandHandler:
             if int(row[0]) != 0:
                 return int(row[0]), {**json.loads(row[1]), "replayed": True}
             if time.monotonic() >= deadline:
-                return 409, {"error": "delivery in progress", "delivery_id": delivery_id}
+                return 409, {"error": "delivery in progress", "delivery_id": delivery_id,
+                             "retry_after_seconds": self.RESERVATION_TTL_SECONDS}
             time.sleep(0.05)
 
     def _route(self, method: str, path: str, p: dict[str, Any], delivery_id: str = "") -> tuple[int, dict[str, Any]]:

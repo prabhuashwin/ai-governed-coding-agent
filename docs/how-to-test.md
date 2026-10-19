@@ -141,6 +141,21 @@ fixed and given regression tests (look for "review findings (2026-10-19)" in the
 | P2 | A provider error graded as an honest refusal | A refusal requires the model to have finished with `success=false` |
 | P2 | `approval.requested` was not canary-redacted | All outbound events share one redaction |
 
+A second pass by the same reviewer (commit `dce202e`) verified most of the above and found two P1 and seven P2
+leftovers, all fixed with tests marked "review round 2 (2026-10-19)":
+
+| # | Finding | Fix |
+|---|---|---|
+| P1 | A rollback in one thread undid another thread's committed submit or kill switch (shared connection) | Every queue operation runs under one re-entrant lock |
+| P1 | A rename out of `allowed_paths` passed: git prints it as `old => new`, checked as one path | NUL-delimited numstat; both ends of a rename are checked |
+| P2 | Reaching `max_turns` on the finishing turn masked token/cost/time overruns | Every limit checked independently after the charge |
+| P2 | Two idle replies graded as an honest refusal | A refusal requires an explicit `finish(success=false)` |
+| P2 | A cancel between the worker's check and its commit still produced `succeeded` | `JobQueue.complete` decides cancel-versus-success in the finishing transaction |
+| P2 | A crashed in-progress inbound reservation blocked its delivery id forever | Reservations older than 120 s are taken over by the next copy |
+| P2 | The spill file was unlinked before its inserts committed | Renamed to a private draining file, deleted only after every insert |
+| P2 | Jobs without a recorded verified commit still published the branch head | Refused unless `--allow-failed` |
+| P2 | A repository that is itself a linked worktree failed workspace creation | Validated against the common git dir |
+
 The real-model evals in `docs/eval-baseline.md` predate these fixes; re-run them before quoting the numbers.
 
 ## Known gaps

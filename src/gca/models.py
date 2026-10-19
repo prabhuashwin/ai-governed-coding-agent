@@ -128,6 +128,7 @@ class AgentOutcome(BaseModel):
     usage: Usage = Field(default_factory=Usage)
     blocked_actions: int = 0
     detail: str = ""
+    explicit_finish: bool = False  # the model called finish(); False when the loop ended for any other reason
 
 
 class VerificationResult(BaseModel):

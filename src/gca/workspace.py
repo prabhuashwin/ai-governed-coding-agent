@@ -108,7 +108,12 @@ class GitWorktreeWorkspace:
         # Resolve the worktree's git dir once, now, before the agent has run anything; every later host git
         # command is pinned to it (see PinnedGit).
         git_dir = Path(_git(self.root, "rev-parse", "--absolute-git-dir").stdout.strip()).resolve()
-        git_dir.relative_to(self.repo)  # must live under the main repository, never under the worktree
+        # It must live under the repository's *common* git dir (which, when the repository is itself a linked
+        # worktree, is elsewhere than `<repo>/.git`), and never under the agent's worktree.
+        common = Path(_git(self.repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()).resolve()
+        git_dir.relative_to(common)
+        if git_dir == self.root or self.root in git_dir.parents:
+            raise RuntimeError(f"worktree git dir {git_dir} is inside the agent's worktree")
         self.git = PinnedGit(git_dir, self.root, self._tmp / "nohooks")
 
     # ----------------------------------------------------------------- exec

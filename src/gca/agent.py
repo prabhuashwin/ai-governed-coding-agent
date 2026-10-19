@@ -96,9 +96,10 @@ class AgentLoop:
                     b.content = b.content[: self.result_cap] + "\n...[older output compacted]"
 
     def _outcome(self, reason: StopReason, *, summary: str = "", success: bool = False,
-                 blocked: int = 0, detail: str = "") -> AgentOutcome:
+                 blocked: int = 0, detail: str = "", explicit_finish: bool = False) -> AgentOutcome:
         out = AgentOutcome(stop_reason=reason, summary=summary, claimed_success=success,
-                           usage=Usage(**self.tracker.usage.model_dump()), blocked_actions=blocked, detail=detail)
+                           usage=Usage(**self.tracker.usage.model_dump()), blocked_actions=blocked, detail=detail,
+                           explicit_finish=explicit_finish)
         self.audit.record("agent", "stopped", stop_reason=reason.value, claimed_success=success,
                           usage=out.usage.model_dump(), blocked_actions=blocked, detail=detail[:500])
         return out
@@ -140,9 +141,12 @@ class AgentLoop:
             self.messages.append(resp.as_message())
             # Token and cost caps apply to what this turn actually used, before any of its tool calls (including
             # finish) are honoured; otherwise the final turn could exceed every limit and still succeed.
-            over = self.tracker.exceeded()
-            if over in ("max_input_tokens", "max_output_tokens", "max_cost_usd"):
-                return self._outcome(StopReason.BUDGET_EXHAUSTED, blocked=blocked, detail=over)
+            # Every limit independently: reaching max_turns on the same turn must not hide a token, cost or time
+            # overrun. (Reaching exactly max_turns on the finishing turn is itself allowed.)
+            over = [lim for lim in self.tracker.exceeded_all()
+                    if lim in ("max_input_tokens", "max_output_tokens", "max_cost_usd", "max_seconds")]
+            if over:
+                return self._outcome(StopReason.BUDGET_EXHAUSTED, blocked=blocked, detail=",".join(over))
 
             calls = resp.tool_calls
             if not calls:
@@ -161,7 +165,8 @@ class AgentLoop:
                     summary = str(call.input.get("summary", ""))
                     success = bool(call.input.get("success", False))
                     self.audit.record("agent", "finish_called", summary=summary[:2000], claimed_success=success)
-                    return self._outcome(StopReason.FINISHED, summary=summary, success=success, blocked=blocked)
+                    return self._outcome(StopReason.FINISHED, summary=summary, success=success, blocked=blocked,
+                                         explicit_finish=True)
 
                 if self.tracker.exceeded():
                     results.append(ToolResultBlock(tool_use_id=call.id, content="budget exhausted", is_error=True))

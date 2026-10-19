@@ -171,19 +171,32 @@ class Outbox:
             return False
 
     def ingest_spill(self) -> int:
-        """Move spilled events into the outbox. Lines the database still refuses stay in the file."""
-        if not self.spill_path.exists():
-            return 0
-        with self._lock:
-            lines = [ln for ln in self.spill_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
-            self.spill_path.unlink()
-        kept, moved = [], 0
-        for ln in lines:
-            rec = json.loads(ln)
-            if self.add_or_spill(rec["event"], rec["urls"]):
+        """Move spilled events into the outbox.
+
+        The spill file is first renamed to a private draining file (atomic, so concurrent drainers and
+        concurrent appenders never touch the same file), and that file is deleted only after every line is in
+        the database. A crash mid-way leaves the draining file, which the next pass picks up again; the
+        INSERT OR IGNORE on the event id makes re-ingesting an already-inserted line harmless.
+        """
+        moved = 0
+        draining: list[Path] = sorted(self.db_path.parent.glob(self.spill_path.name + ".draining-*"))
+        if self.spill_path.exists():
+            mine = self.spill_path.with_name(f"{self.spill_path.name}.draining-{uuid.uuid4().hex}")
+            try:
+                self.spill_path.rename(mine)
+                draining.append(mine)
+            except OSError:  # another process renamed it first
+                pass
+        for path in draining:
+            try:
+                lines = [ln for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            except OSError:
+                continue  # taken by another drainer between the glob and the read
+            for ln in lines:
+                rec = json.loads(ln)
+                self.add(rec["event"], rec["urls"])  # raises on a database error: the file stays for next time
                 moved += 1
-            else:
-                kept.append(ln)
+            path.unlink()
         return moved
 
     def due(self, limit: int = 100, event_id: str | None = None) -> list[tuple]:
@@ -248,7 +261,10 @@ class Deliverer:
     def deliver_pending(self, *, limit: int = 100, event_id: str | None = None,
                         timeout: float | None = None) -> dict[str, int]:
         stats = {"delivered": 0, "retry": 0, "dead": 0}
-        self.outbox.ingest_spill()
+        try:
+            self.outbox.ingest_spill()
+        except sqlite3.Error:
+            pass  # still contended; the draining file is kept and retried on the next pass
         rows = self.outbox.due(limit, event_id)
         if not rows:
             return stats

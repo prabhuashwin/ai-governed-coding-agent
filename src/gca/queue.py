@@ -21,12 +21,24 @@ class InvalidTransition(Exception):
     pass
 
 
+def _serialised(fn):
+    """Run a JobQueue method under the queue's connection lock (re-entrant, so locked methods may nest)."""
+    def wrapper(self, *a, **kw):
+        with self._txn:
+            return fn(self, *a, **kw)
+    wrapper.__name__, wrapper.__doc__ = fn.__name__, fn.__doc__
+    return wrapper
+
+
 class JobQueue:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = open_db(self, str(self.db_path))
-        self._txn = threading.Lock()  # one transaction at a time per connection (threads share it)
+        # Threads share this connection. SQLite runs a statement issued while another thread's BEGIN IMMEDIATE is
+        # open *inside* that transaction, so a later ROLLBACK would undo it. Every operation therefore takes
+        # this re-entrant lock, not only the explicit transactions.
+        self._txn = threading.RLock()
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
@@ -57,12 +69,14 @@ class JobQueue:
             (job.status.value, job.updated_at, job.heartbeat_at, job.worker_id, job.model_dump_json(), job.id),
         )
 
+    @_serialised
     def get(self, job_id: str) -> Job:
         row = self._conn.execute("SELECT body FROM jobs WHERE id=?", (job_id,)).fetchone()
         if not row:
             raise KeyError(job_id)
         return Job.model_validate_json(row[0])
 
+    @_serialised
     def list(self, status: JobStatus | None = None) -> builtins.list[Job]:
         if status:
             rows = self._conn.execute("SELECT body FROM jobs WHERE status=? ORDER BY created_at", (status.value,))
@@ -71,6 +85,7 @@ class JobQueue:
         return [Job.model_validate_json(r[0]) for r in rows]
 
     # ------------------------------------------------------------ lifecycle
+    @_serialised
     def submit(self, item: WorkItem, budget: Budget | None = None) -> Job:
         if item.idempotency_key:
             row = self._conn.execute(
@@ -174,6 +189,7 @@ class JobQueue:
             raise
 
     # ------------------------------------------------------------ kill switch
+    @_serialised
     def set_kill_switch(self, enabled: bool, *, reason: str = "", actor: str = "unknown") -> None:
         self._conn.execute(
             "INSERT INTO controls (name, value, reason, set_by, set_at) VALUES ('kill:global', ?, ?, ?, ?) "
@@ -181,6 +197,7 @@ class JobQueue:
             "set_by=excluded.set_by, set_at=excluded.set_at",
             ("on" if enabled else "off", reason, actor, now_iso()))
 
+    @_serialised
     def kill_switch(self) -> dict[str, str] | None:
         """Return the kill-switch record if engaged, else None."""
         row = self._conn.execute(
@@ -189,12 +206,28 @@ class JobQueue:
             return {"reason": row[1] or "", "set_by": row[2] or "", "set_at": row[3]}
         return None
 
+    @_serialised
     def heartbeat(self, job_id: str) -> None:
         self._conn.execute("UPDATE jobs SET heartbeat_at=? WHERE id=?", (now_iso(), job_id))
 
     def finish(self, job_id: str, status: JobStatus, result: RunResult | None = None, error: str | None = None) -> Job:
         return self.transition(job_id, status, result=result, error=error)
 
+    def complete(self, job_id: str, status: JobStatus, result: RunResult | None = None,
+                 error: str | None = None) -> Job:
+        """Finish a job the worker ran, honouring a cancel request in the same transaction: a cancel that
+        arrives before this commits turns a would-be success into `cancelled`, never `succeeded` with the
+        flag still set."""
+        def mutate(job: Job) -> None:
+            final, why = status, error
+            if job.cancel_requested and status == JobStatus.SUCCEEDED:
+                final, why = JobStatus.CANCELLED, "cancelled during verification"
+            if final not in TRANSITIONS[job.status]:
+                raise InvalidTransition(f"{job.status.value} -> {final.value} is not allowed for {job_id}")
+            job.status, job.result, job.error = final, result, why
+        return self._update(job_id, mutate)
+
+    @_serialised
     def recover_stale(self, stale_after_seconds: int) -> builtins.list[Job]:
         """Mark RUNNING/VERIFYING jobs whose worker stopped heartbeating as FAILED."""
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_after_seconds)).isoformat()
