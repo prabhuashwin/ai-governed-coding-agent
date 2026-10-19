@@ -43,6 +43,7 @@ A **malicious or gullible model** obeys injected instructions. They answer: *do 
 - Blocked-action limit halts the run (`policy_halt`).
 - Canary secret: withheld from tool output, flagged in the diff (`secret_canary_in_diff`), redacted from the audit log.
 - Verifier catches: deleted test file, reduced test count, newly skipped tests, test-config tampering, claimed success with failing tests, no-op runs, and diffs larger than the job's `max_files_changed` / `max_lines_changed` budget.
+- Worker controls (`test_worker_controls.py`): approval restrictions that widen are refused; narrowed paths and commands are enforced by the file tools, the command policy and the verifier (the job fails with blocked actions); a cancel kills a 20-second command within a few seconds; a kill switch engaged during the verifier's test run ends the job `cancelled`/`kill_switch` with verification flagged `interrupted`.
 
 Add a new attack by adding a scripted step list; if the harness lets it through, the test fails.
 

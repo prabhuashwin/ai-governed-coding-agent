@@ -117,6 +117,7 @@ class WebhookConfig(BaseModel):
     inbound_host: str = "127.0.0.1"
     inbound_port: int = 8787
     inbound_secret_env: str = "GCA_INBOUND_SECRET"
+    allow_publish: bool = True  # accept POST /v1/jobs/{id}/publish (push the verified commit, open a draft PR)
     max_skew_seconds: int = 300  # reject signed requests older/newer than this
     source_name: str = "gca"  # appears as `source` in every event envelope
 

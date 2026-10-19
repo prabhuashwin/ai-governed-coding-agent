@@ -42,7 +42,7 @@ from .models import AuditEvent, Job, now_iso, open_db
 
 EVENT_TYPES = (
     "job.submitted", "approval.requested", "approval.decided", "job.started", "job.blocked_action",
-    "job.verified", "job.finished", "job.cancel_requested", "control.kill_switch",
+    "job.verified", "job.finished", "job.cancel_requested", "job.published", "control.kill_switch",
 )
 
 # audit event name -> public event type
@@ -56,6 +56,8 @@ _AUDIT_MAP = {
     "finished": "job.finished",
     "cancel_requested": "job.cancel_requested",
     "kill_switch": "control.kill_switch",
+    "branch_pushed": "job.published",
+    "pull_request_opened": "job.published",
 }
 
 RETRYABLE = {408, 425, 429}
@@ -321,7 +323,8 @@ def build_event(cfg: Config, ev: AuditEvent) -> dict[str, Any] | None:
                 "budget": d.get("budget")}
     elif etype == "approval.decided":
         data = {"decision": "approve" if ev.event == "approved" else "reject", "approver": ev.actor,
-                "note": d.get("note", ""), "conditions": d.get("conditions", [])}
+                "note": d.get("note", ""), "conditions": d.get("conditions", []),
+                "restrictions": d.get("restrictions")}
     elif etype == "job.started":
         job = _load_job(cfg, ev.job_id)
         data = {"worker": ev.actor.removeprefix("worker:"), "attempt": d.get("attempt"),
@@ -348,10 +351,14 @@ def build_event(cfg: Config, ev: AuditEvent) -> dict[str, Any] | None:
             })
             if cfg.webhooks.include_report:
                 data["report_markdown"] = (r.report_markdown or "")[:60000]
+    elif etype == "job.published":
+        data = {"step": ev.event, "actor": ev.actor, "branch": d.get("branch"), "remote": d.get("remote"),
+                "commit": d.get("commit"), "url": d.get("url"), "base": d.get("base"), "draft": d.get("draft")}
     elif etype == "control.kill_switch":
-        data = {"enabled": d.get("enabled"), "reason": d.get("reason", ""), "actor": ev.actor}
+        data = {"enabled": d.get("enabled"), "reason": d.get("reason", ""), "actor": ev.actor,
+                "scope": d.get("scope", "global")}
     else:  # job.cancel_requested
-        data = {"by": ev.actor}
+        data = {"by": ev.actor, "scope": d.get("scope", "job"), "reason": d.get("reason", "")}
     event = {"id": f"evt_{uuid.uuid4().hex}", "type": etype, "created_at": now_iso(), "source": cfg.webhooks.source_name,
              "job_id": ev.job_id if not ev.job_id.startswith("_") else None, "audit_seq": ev.seq, "data": data}
     return redact_event(cfg, event)
@@ -377,7 +384,9 @@ def approval_requested_event(cfg: Config, job: Job) -> dict[str, Any]:
                  "requester": wi.requester, "repo_path": wi.repo_path, "allowed_paths": wi.allowed_paths,
                  "budget": job.budget.model_dump(), "source": wi.source, "source_ref": wi.source_ref,
                  "decide": {"method": "POST", "path": f"/v1/jobs/{job.id}/decision",
-                            "body": {"decision": "approve|reject", "approver": "<user>", "note": "", "conditions": []}}}})
+                            "body": {"decision": "approve|reject", "approver": "<user>", "note": "", "conditions": [],
+                                     "restrictions": {"allowed_paths": None, "allowed_commands": None,
+                                                      "budget": {}}}}}})
 
 
 # ----------------------------------------------------------------------------- wiring

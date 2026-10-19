@@ -15,6 +15,18 @@ def render_report(job: Job, result: RunResult) -> str:
     lines.append(f"Job `{job.id}` · branch `{result.branch or '-'}` · status **{job.status.value}**")
     lines.append(f"Requested by {wi.requester}; approved by {job.approval.approver if job.approval else '—'}; "
                  f"provider {result.provider}/{result.model}")
+    if job.approval and job.approval.conditions:
+        lines.append(f"Approval conditions (advisory): {'; '.join(job.approval.conditions)}")
+    if job.approval and job.approval.restrictions:
+        r = job.approval.restrictions
+        parts = []
+        if r.allowed_paths is not None:
+            parts.append(f"writes limited to {r.allowed_paths}")
+        if r.allowed_commands is not None:
+            parts.append(f"commands limited to {r.allowed_commands}")
+        if r.budget:
+            parts.append("budget lowered: " + ", ".join(f"{k}={v}" for k, v in r.budget.items()))
+        lines.append("Approval restrictions (enforced): " + "; ".join(parts))
     lines.append("")
     lines.append("## Verdict")
     if v is None:

@@ -184,3 +184,26 @@ def test_cli_status_and_report_without_result(tmp_path, work_item, capsys):
     assert "no audit log" in capsys.readouterr().out
     cli_main(["-c", str(cfg), "status", jid])
     assert json.loads(capsys.readouterr().out)["status"] == "submitted"
+
+
+def test_cli_approve_restrictions(tmp_path, work_item, capsys):
+    """`gca approve` can narrow paths, commands and budget; widening exits 2 and leaves the job undecided."""
+    cfg = _toml(tmp_path, "")
+    assert cli_main(["-c", str(cfg), "submit", "--title", "t", "--description", "d", "--repo", work_item.repo_path,
+                     "--test-cmd", "pytest", "--allowed-path", "src"]) == 0
+    job_id = capsys.readouterr().out.strip().split()[-1]
+    assert cli_main(["-c", str(cfg), "approve", job_id, "--approver", "lead", "--allow-path", "tests"]) == 2
+    assert "restrictions rejected" in capsys.readouterr().err
+    assert cli_main(["-c", str(cfg), "approve", job_id, "--approver", "lead", "--max-cost", "99999"]) == 2
+    assert cli_main(["-c", str(cfg), "approve", job_id, "--approver", "lead", "--allow-command", "curl"]) == 2
+    capsys.readouterr()
+    assert cli_main(["-c", str(cfg), "approve", job_id, "--approver", "lead", "--allow-path", "src/calc",
+                     "--allow-command", "python", "--max-turns", "3"]) == 0
+    assert capsys.readouterr().out.strip() == f"{job_id} -> approved"
+    q = JobQueue(tmp_path / "d" / "jobs.sqlite3")
+    job = q.get(job_id)
+    q.close()
+    assert job.work_item.allowed_paths == ["src/calc"] and job.budget.max_turns == 3
+    ev = [e for e in AuditLog(tmp_path / "d" / "audit", job_id).events() if e.event == "approved"][-1]
+    assert ev.data["restrictions"] == {"allowed_paths": ["src/calc"], "allowed_commands": ["python"],
+                                       "budget": {"max_turns": 3}}

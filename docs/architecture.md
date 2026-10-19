@@ -61,7 +61,9 @@ dies leaves a stale heartbeat; `recover_stale` moves the job to `failed` with a 
 | Host git never trusts the worktree's `.git` pointer: pinned git dir, empty hooks path, nested repos excluded | `workspace.PinnedGit` | unit |
 | Diff-size budget (files / lines changed) | `Verifier.verify` from `Budget` | safety |
 | Container isolation (no network, dropped caps, limits) for agent and verifier | `ContainerWorkspace`, `make_runner` | unit (fake runtime), real daemon when present |
-| Publishing is explicit and human-invoked; PRs open as drafts; only the verified commit is pushed | `publish.py` | unit |
+| Publishing is explicit and human-attributed (CLI or signed webhook with `actor`); PRs open as drafts; only the verified commit is pushed | `publish.py`, `inbound.publish` | unit |
+| Approval restrictions can only narrow (paths, commands, budget), applied in the approval transaction and enforced by policy, loop and verifier | `Restrictions.apply`, `JobQueue.approve` | unit, safety |
+| Cancel and kill switch interrupt a command or verifier run in flight (≤ 0.25 s poll); the job ends `cancelled`, never `succeeded`, with verification flagged `interrupted` | `workspace.run_until_stopped`, `Verifier`, `Worker` | safety |
 | Webhook signatures bind method, path, delivery id and body; inbound delivery ids reserved before execution | `webhooks.sign`, `inbound.handle` | unit, fuzz |
 | Independent test run from clean checkout | `Verifier.verify` | safety, e2e |
 | Hash-chained audit log, appended under a cross-process lock | `AuditLog`, `verify_chain` | unit, e2e |

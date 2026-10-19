@@ -11,6 +11,8 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -23,17 +25,60 @@ class CommandResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    interrupted: bool = False  # stopped early because a cancel or kill-switch request arrived while it ran
 
     @property
     def output(self) -> str:
         return (self.stdout or "") + (("\n[stderr]\n" + self.stderr) if self.stderr else "")
 
 
+StopCheck = Callable[[], bool]
+STOP_POLL_SECONDS = 0.25
+
+
+def run_until_stopped(cmd: list[str], *, cwd: str | None, env: dict[str, str] | None, timeout: int,
+                      stop_check: StopCheck | None, on_stop: Callable[[subprocess.Popen], None] | None = None,
+                      argv_for_result: list[str] | None = None) -> CommandResult:
+    """Run `cmd`, polling `stop_check` while it runs. A stop request ends the process at once (via `on_stop`
+    when given, else SIGKILL/TerminateProcess) and returns a CommandResult marked `interrupted`, so a cancel or
+    kill switch takes effect mid-command rather than at the next agent turn."""
+    shown = argv_for_result if argv_for_result is not None else cmd
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL)
+    except FileNotFoundError as e:
+        return CommandResult(shown, 127, "", f"command not found: {e.filename}")
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            out_b, err_b = proc.communicate(timeout=STOP_POLL_SECONDS)
+            return CommandResult(shown, proc.returncode, out_b.decode(errors="replace"), err_b.decode(errors="replace"))
+        except subprocess.TimeoutExpired:
+            pass
+        if stop_check is not None and stop_check():
+            if on_stop is not None:
+                on_stop(proc)
+            else:
+                proc.kill()
+            out_b, err_b = proc.communicate()
+            return CommandResult(shown, -1, out_b.decode(errors="replace"),
+                                 err_b.decode(errors="replace") + "\n[interrupted: stop requested]", interrupted=True)
+        if time.monotonic() >= deadline:
+            if on_stop is not None:
+                on_stop(proc)
+            else:
+                proc.kill()
+            out_b, err_b = proc.communicate()
+            return CommandResult(shown, -1, out_b.decode(errors="replace"),
+                                 err_b.decode(errors="replace") + f"\n[timed out after {timeout}s]", timed_out=True)
+
+
 class Workspace(Protocol):
     root: Path
     branch: str
 
-    def run(self, argv: list[str], *, env: dict[str, str], timeout: int) -> CommandResult: ...
+    def run(self, argv: list[str], *, env: dict[str, str], timeout: int,
+            stop_check: StopCheck | None = None) -> CommandResult: ...
     def diff(self) -> str: ...
     def changed_files(self) -> list[str]: ...
     def diff_stat(self) -> tuple[int, int]: ...
@@ -117,19 +162,9 @@ class GitWorktreeWorkspace:
         self.git = PinnedGit(git_dir, self.root, self._tmp / "nohooks")
 
     # ----------------------------------------------------------------- exec
-    def run(self, argv: list[str], *, env: dict[str, str], timeout: int) -> CommandResult:
-        try:
-            cp = subprocess.run(
-                argv, cwd=str(self.root), env=env, capture_output=True, text=True, timeout=timeout,
-                stdin=subprocess.DEVNULL, errors="replace",
-            )
-            return CommandResult(argv, cp.returncode, cp.stdout, cp.stderr)
-        except subprocess.TimeoutExpired as e:
-            out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-            err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
-            return CommandResult(argv, -1, out, err + f"\n[timed out after {timeout}s]", timed_out=True)
-        except FileNotFoundError as e:
-            return CommandResult(argv, 127, "", f"command not found: {e.filename}")
+    def run(self, argv: list[str], *, env: dict[str, str], timeout: int,
+            stop_check: StopCheck | None = None) -> CommandResult:
+        return run_until_stopped(argv, cwd=str(self.root), env=env, timeout=timeout, stop_check=stop_check)
 
     # ------------------------------------------------------------------ git
     def diff(self) -> str:
@@ -233,22 +268,24 @@ def detect_runtime(preferred: str = "docker") -> str | None:
 
 def run_in_container(*, runtime: str, image: str, host_dir: Path, argv: list[str], env: dict[str, str], timeout: int,
                      name: str, network: str = "none", memory: str = "2g", cpus: str = "2", pids_limit: int = 256,
-                     user: str | None = None, extra_args: list[str] | None = None) -> CommandResult:
+                     user: str | None = None, extra_args: list[str] | None = None,
+                     stop_check: StopCheck | None = None) -> CommandResult:
     cmd = container_run_argv(runtime=runtime, image=image, host_dir=host_dir, argv=argv, env=env, name=name,
                              network=network, memory=memory, cpus=cpus, pids_limit=pids_limit, user=user,
                              extra_args=extra_args)
     (Path(host_dir) / ".gca-home").mkdir(exist_ok=True)
-    try:
-        cp = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
-                            errors="replace")
-        return CommandResult(argv, cp.returncode, cp.stdout, cp.stderr)
-    except subprocess.TimeoutExpired as e:
+
+    def kill_container(proc: subprocess.Popen) -> None:
         subprocess.run([runtime, "kill", name], capture_output=True)
-        out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
-        err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
-        return CommandResult(argv, -1, out, err + f"\n[timed out after {timeout}s; container killed]", timed_out=True)
-    except FileNotFoundError as e:
-        return CommandResult(argv, 127, "", f"container runtime not found: {e.filename}")
+        proc.kill()
+
+    res = run_until_stopped(cmd, cwd=None, env=None, timeout=timeout, stop_check=stop_check, on_stop=kill_container,
+                            argv_for_result=argv)
+    if res.exit_code == 127 and "command not found" in res.stderr:
+        return CommandResult(argv, 127, "", f"container runtime not found: {runtime}")
+    if res.timed_out:
+        res.stderr = res.stderr.replace("[timed out", "[container killed; timed out", 1)
+    return res
 
 
 def host_user() -> str | None:
@@ -280,12 +317,13 @@ class ContainerWorkspace(GitWorktreeWorkspace):
         self._n = 0
         self._job_id = job_id
 
-    def run(self, argv: list[str], *, env: dict[str, str], timeout: int) -> CommandResult:
+    def run(self, argv: list[str], *, env: dict[str, str], timeout: int,
+            stop_check: StopCheck | None = None) -> CommandResult:
         self._n += 1
         return run_in_container(runtime=self.runtime, image=self.image, host_dir=self.root, argv=argv, env=env,
                                 timeout=timeout, name=f"gca-{self._job_id}-{self._n}", network=self.network,
                                 memory=self.memory, cpus=self.cpus, pids_limit=self.pids_limit, user=self.user,
-                                extra_args=self.extra_args)
+                                extra_args=self.extra_args, stop_check=stop_check)
 
     def changed_files(self) -> list[str]:
         return [f for f in super().changed_files() if not f.startswith(".gca-home/")]
@@ -313,19 +351,12 @@ def make_workspace(ws_cfg, repo_path: str | Path, job_id: str, base_ref: str = "
     raise ValueError(f"unknown workspace kind: {ws_cfg.kind}")
 
 
-def make_runner(ws_cfg, job_id: str):
+def make_runner(ws_cfg, job_id: str, stop_check: StopCheck | None = None):
     """A (argv, cwd, env, timeout) -> CommandResult callable matching the workspace kind; used by the verifier
-    so verification happens under the same isolation as the agent run."""
+    so verification happens under the same isolation as the agent run. `stop_check` makes a run interruptible."""
     if ws_cfg.kind != "container":
         def host_run(argv: list[str], cwd: Path, env: dict[str, str], timeout: int) -> CommandResult:
-            try:
-                cp = subprocess.run(argv, cwd=str(cwd), env=env, capture_output=True, text=True, timeout=timeout,
-                                    stdin=subprocess.DEVNULL, errors="replace")
-                return CommandResult(argv, cp.returncode, cp.stdout, cp.stderr)
-            except subprocess.TimeoutExpired:
-                return CommandResult(argv, -1, "", f"[timed out after {timeout}s]", timed_out=True)
-            except FileNotFoundError as e:
-                return CommandResult(argv, 127, "", f"command not found: {e.filename}")
+            return run_until_stopped(argv, cwd=str(cwd), env=env, timeout=timeout, stop_check=stop_check)
         return host_run
 
     runtime = detect_runtime(ws_cfg.runtime)
@@ -338,5 +369,6 @@ def make_runner(ws_cfg, job_id: str):
         return run_in_container(runtime=runtime, image=ws_cfg.image, host_dir=Path(cwd), argv=argv, env=env,
                                 timeout=timeout, name=f"gca-verify-{job_id}-{counter['n']}", network=ws_cfg.network,
                                 memory=ws_cfg.memory, cpus=ws_cfg.cpus, pids_limit=ws_cfg.pids_limit,
-                                user=host_user() if ws_cfg.run_as_host_user else None, extra_args=ws_cfg.extra_args)
+                                user=host_user() if ws_cfg.run_as_host_user else None, extra_args=ws_cfg.extra_args,
+                                stop_check=stop_check)
     return container_run
