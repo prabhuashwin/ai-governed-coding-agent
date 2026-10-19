@@ -6,16 +6,54 @@ log is detectable with `verify_chain`.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
+import os
+import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 from .models import AuditEvent, now_iso
 
 GENESIS = "0" * 64
+
+if sys.platform == "win32":  # pragma: no cover - exercised by the Windows CI job
+    import msvcrt
+
+    def _lock(f: IO[bytes]) -> None:
+        f.seek(0)
+        while True:
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)  # blocks up to ~10 s, then raises
+                return
+            except OSError:
+                continue
+
+    def _unlock(f: IO[bytes]) -> None:
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _lock(f: IO[bytes]) -> None:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+
+    def _unlock(f: IO[bytes]) -> None:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _exclusive(lock_path: Path) -> Iterator[None]:
+    """A cross-process exclusive lock (one per audit file), held while an event is appended."""
+    with lock_path.open("ab") as f:
+        _lock(f)
+        try:
+            yield
+        finally:
+            _unlock(f)
 
 # Observers notified after every recorded event (e.g. the webhook outbox). Keyed so re-installing replaces.
 _SINKS: dict[str, Callable[[AuditEvent], None]] = {}
@@ -43,16 +81,24 @@ class AuditLog:
         self._seq, self._last_hash = self._tail()
 
     def _tail(self) -> tuple[int, str]:
+        """(seq, hash) of the last event on disk: read from the end of the file, so it stays cheap as logs grow."""
         if not self.path.exists():
             return 0, GENESIS
-        last: dict[str, Any] | None = None
-        with self.path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    last = json.loads(line)
-        if not last:
+        with self.path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            chunk = b""
+            while size > 0:
+                step = min(65536, size)
+                size -= step
+                f.seek(size)
+                chunk = f.read(step) + chunk
+                if b"\n" in chunk.rstrip(b"\n"):  # a line boundary before the last line: it is complete
+                    break
+        lines = [ln for ln in chunk.split(b"\n") if ln.strip()]
+        if not lines:
             return 0, GENESIS
+        last = json.loads(lines[-1].decode("utf-8"))
         return int(last["seq"]), str(last["hash"])
 
     def _redact(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -65,7 +111,10 @@ class AuditLog:
 
     def record(self, actor: str, event: str, **data: Any) -> AuditEvent:
         data = self._redact(data)
-        with self._lock:
+        # Several processes append to one job's log (the worker, `gca cancel`, the inbound server). The chain
+        # is only valid if each event follows the one *on disk*, so the tail is re-read under a file lock.
+        with self._lock, _exclusive(self.path.with_suffix(".lock")):
+            self._seq, self._last_hash = self._tail()
             seq = self._seq + 1
             payload: dict[str, Any] = {"seq": seq, "ts": now_iso(), "job_id": self.job_id, "actor": actor,
                                        "event": event, "data": data}
@@ -74,6 +123,7 @@ class AuditLog:
                             prev_hash=self._last_hash, hash=h)
             with self.path.open("a", encoding="utf-8") as f:
                 f.write(ev.model_dump_json() + "\n")
+                f.flush()
             self._seq, self._last_hash = seq, h
         for sink in list(_SINKS.values()):
             try:

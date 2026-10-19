@@ -10,6 +10,7 @@ Guarantees tested:
 from __future__ import annotations
 
 import builtins
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -25,6 +26,7 @@ class JobQueue:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = open_db(self, str(self.db_path))
+        self._txn = threading.Lock()  # one transaction at a time per connection (threads share it)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
@@ -82,15 +84,37 @@ class JobQueue:
         )
         return job
 
+    def _update(self, job_id: str, mutate) -> Job:
+        """Read-modify-write one job inside a write transaction, so concurrent writers (a worker finishing a job,
+        a `gca cancel` from another process) serialise instead of overwriting each other's row."""
+        with self._txn:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN IMMEDIATE")
+            try:
+                row = cur.execute("SELECT body FROM jobs WHERE id=?", (job_id,)).fetchone()
+                if not row:
+                    raise KeyError(job_id)
+                job = Job.model_validate_json(row[0])
+                mutate(job)
+                job.updated_at = now_iso()
+                cur.execute(
+                    "UPDATE jobs SET status=?, updated_at=?, heartbeat_at=?, worker_id=?, body=? WHERE id=?",
+                    (job.status.value, job.updated_at, job.heartbeat_at, job.worker_id, job.model_dump_json(), job.id),
+                )
+                cur.execute("COMMIT")
+                return job
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
     def transition(self, job_id: str, to: JobStatus, **updates) -> Job:
-        job = self.get(job_id)
-        if to not in TRANSITIONS[job.status]:
-            raise InvalidTransition(f"{job.status.value} -> {to.value} is not allowed for {job_id}")
-        job.status = to
-        for k, v in updates.items():
-            setattr(job, k, v)
-        self._save(job)
-        return job
+        def mutate(job: Job) -> None:
+            if to not in TRANSITIONS[job.status]:
+                raise InvalidTransition(f"{job.status.value} -> {to.value} is not allowed for {job_id}")
+            job.status = to
+            for k, v in updates.items():
+                setattr(job, k, v)
+        return self._update(job_id, mutate)
 
     def approve(self, job_id: str, approver: str, note: str = "") -> Job:
         return self.transition(job_id, JobStatus.APPROVED, approval=Approval(approver=approver, note=note))
@@ -99,13 +123,17 @@ class JobQueue:
         return self.transition(job_id, JobStatus.REJECTED, approval=Approval(approver=approver, note=note))
 
     def request_cancel(self, job_id: str) -> Job:
-        """Cancel immediately if not running; otherwise flag it and let the worker stop."""
-        job = self.get(job_id)
-        if job.status in (JobStatus.SUBMITTED, JobStatus.APPROVED):
-            return self.transition(job_id, JobStatus.CANCELLED)
-        job.cancel_requested = True
-        self._save(job)
-        return job
+        """Cancel immediately if not running; otherwise flag it and let the worker stop.
+
+        Done under the write lock against the row as it is *now*: a job that finished since the caller last
+        looked is left finished, never written back to its earlier state."""
+        def mutate(job: Job) -> None:
+            if job.status in (JobStatus.SUBMITTED, JobStatus.APPROVED):
+                job.status = JobStatus.CANCELLED
+            elif job.status in (JobStatus.RUNNING, JobStatus.VERIFYING):
+                job.cancel_requested = True
+            # terminal states: nothing to do
+        return self._update(job_id, mutate)
 
     def cancel_requested(self, job_id: str) -> bool:
         return self.get(job_id).cancel_requested
@@ -114,6 +142,10 @@ class JobQueue:
         """Atomically move one APPROVED job to RUNNING for this worker. Nothing is claimed while killed."""
         if self.kill_switch():
             return None
+        with self._txn:
+            return self._claim(worker_id)
+
+    def _claim(self, worker_id: str) -> Job | None:
         cur = self._conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:

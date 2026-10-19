@@ -126,6 +126,12 @@ class Worker:
             audit.record("verifier", "verified", passed=verification.passed, flags=verification.flags,
                          exit_code=verification.exit_code, files_changed=verification.files_changed)
 
+            if self.queue.cancel_requested(job.id):  # asked to stop while verifying: never report success
+                job = self.queue.finish(job.id, JobStatus.CANCELLED, result=result, error="cancelled during verification")
+                audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value,
+                             error="cancelled during verification")
+                return job
+
             policy_clean = outcome.blocked_actions == 0 or not self.cfg.policy.fail_on_any_blocked_action
             ok = verification.passed and outcome.stop_reason == StopReason.FINISHED and policy_clean
             final = JobStatus.SUCCEEDED if ok else JobStatus.FAILED

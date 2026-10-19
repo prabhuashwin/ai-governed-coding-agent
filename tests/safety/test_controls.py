@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 
 import pytest
-from conftest import CALC_FIX_NEW, CALC_FIX_OLD, CALC_SRC, git
+from conftest import CALC_FIX_NEW, CALC_FIX_OLD, CALC_SRC, git, steps_fix_calc
 
 from gca.audit import AuditLog, verify_chain
 from gca.models import JobStatus, StopReason
@@ -317,3 +317,22 @@ def test_command_writes_to_protected_file_fail_verification(config, work_item):
     job, _, _ = run_pipeline(config, work_item, steps)
     assert job.status == JobStatus.FAILED
     assert any(f.startswith("write_outside_policy:.env") for f in job.result.verification.flags)
+
+
+def test_cancel_during_verification_never_reports_success(config, work_item, monkeypatch):
+    """A cancel that lands while the verifier runs used to be ignored: the job finished `succeeded` with
+    cancel_requested=true. It must finish `cancelled`."""
+    from gca import worker as worker_mod
+
+    real_verify = worker_mod.Verifier.verify
+
+    def verify_then_cancel(self):
+        res = real_verify(self)
+        JobQueue(config.db_path).request_cancel(self.branch.split("/", 1)[1])  # another process cancels now
+        return res
+
+    monkeypatch.setattr(worker_mod.Verifier, "verify", verify_then_cancel)
+    job, _, audit = run_pipeline(config, work_item, steps_fix_calc())
+    assert job.status == JobStatus.CANCELLED and job.error == "cancelled during verification"
+    assert job.result.verification is not None  # the evidence is kept for the record
+    assert audit.events()[-1].data["status"] == "cancelled"
