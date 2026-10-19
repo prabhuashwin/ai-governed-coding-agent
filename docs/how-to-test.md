@@ -183,7 +183,22 @@ A fourth pass (commit `11487c0`) found three P1 and one P2, all in the kill-swit
 | P1 | An audit failure after the control change deleted the reservation, so a retry ran as a fresh delivery | The delivery outcome is recorded in the same transaction as the change; failed commands expire the lease instead of deleting the row |
 | P2 | Concurrent startup could fail on `duplicate column name` | Migrations run in a write transaction and tolerate the benign duplicate |
 
-The real-model evals in `docs/eval-baseline.md` predate these fixes; re-run them before quoting the numbers.
+A fifth pass (commit `e05ad46`, after work packages 2–6) found two P1 and six P2, mostly in the new
+interruption, retention and publishing code; fixed with `tests/unit/test_review_round5.py`:
+
+| # | Finding | Fix |
+|---|---|---|
+| P1 | `gca prune` aged inbound deliveries by the lease column, so a released (failed) reservation with its 1970 lease was pruned at once and a stale kill-switch OFF retried later could undo a newer ON | Prune by the immutable `first_received_at` |
+| P1 | A stop killed only the command's parent process: children kept running and writing, and draining their inherited pipes could hang | Commands start as their own process group/session; `kill_tree` kills the whole tree (`killpg` / `taskkill /T`); draining is bounded to 5 s |
+| P2 | A stop that landed while a short command ran (between two polls) was missed; a job could finish `succeeded` with the kill switch engaged | `run_until_stopped` checks before and after the command; `JobQueue.complete` re-reads the kill switch inside the success transaction and ends the job `cancelled`/`kill_switch` |
+| P2 | A superseded kill-switch delivery recorded an empty response, so its replay raised `JSONDecodeError` | Every outcome stores a valid JSON body; the replay returns the 409 |
+| P2 | `"NaN"`/`inf` budget values were accepted (they compare false against every limit), serialised as `null` and made the job unreadable — stalling claims for later jobs too | `Budget` rejects non-finite values (`allow_inf_nan=False`); `Restrictions.budget` requires finite, non-negative numbers; both inbound paths answer 422 |
+| P2 | Narrowing `allowed_commands` in an approval could block `run_tests` (the interpreter of the approved test command) and fail an otherwise verified job | `run_tests` is checked against the operator's policy, not the narrowed list; ad-hoc commands still are |
+| P2 | GitHub status or transport errors after the branch push escaped the handler and dropped the connection | `publish_job` turns them into `RuntimeError` (→ 502); the HTTP server answers 500 for anything unexpected instead of closing the socket |
+| P2 | Only `github.com` remotes were recognised, so an Enterprise remote returned 200 with no pull request | `github_slug` also recognises the host that the configured `api_base` serves |
+
+Real-model runs `real-openai-9`/`-10` predate this round; the fixes change no agent-facing behaviour except
+the `run_tests` restriction case.
 
 ## Known gaps
 
@@ -191,6 +206,8 @@ The real-model evals in `docs/eval-baseline.md` predate these fixes; re-run them
   Use `kind = "container"` outside a trusted developer machine.
 - The ServiceNow adapter is tested against a mocked Table API; the live round-trip is the manual
   `servicenow smoke test` workflow (needs a PDI).
+- The development suite needs Python ≥ 3.10.2: on 3.10.0/3.10.1 Hypothesis fails in its own dataclass handling
+  (not repository code), which is why the dev lock pins a Hypothesis release that declares that floor.
 - Windows path *rules* are tested; the worker itself has only been run on Linux (WSL on the pilot machine).
   The pilot host is Linux; see `docs/pilot-scenarios.md` § Pilot operating system.
 - Real-model eval baselines are produced by the manual eval workflows; commit the resulting `evals/results/*.md`

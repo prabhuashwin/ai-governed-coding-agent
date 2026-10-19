@@ -4,6 +4,19 @@ Versions are git tags `v<version>`. Review rounds are summarised in `docs/how-to
 
 ## 0.3.0 — unreleased
 
+Fifth external review (of `e05ad46`): eight findings, all fixed with regression tests
+(`tests/unit/test_review_round5.py`; table in `docs/how-to-test.md`).
+
+- Stops now kill the whole process tree of a running command and never hang draining its pipes; a stop that
+  lands while a short command runs still counts, and a job can no longer end `succeeded` with the kill switch
+  engaged (`complete()` re-checks it in the success transaction).
+- `gca prune` ages inbound deliveries by their immutable first-received time, not the lease.
+- Superseded kill-switch deliveries replay their 409 instead of failing.
+- Non-finite budget values are rejected at every boundary (`Budget`, `Restrictions`, inbound submit/decision).
+- An approval that narrows `allowed_commands` no longer blocks `run_tests`.
+- Publishing: GitHub errors after the push return 502 (never a dropped connection); GitHub Enterprise remotes
+  matching the configured `api_base` host get their pull request.
+
 Work package 2 of the Koru pilot plan: the worker controls the platform needs.
 
 - **Enforced approval restrictions.** A decision (webhook or `gca approve`) may carry `restrictions`

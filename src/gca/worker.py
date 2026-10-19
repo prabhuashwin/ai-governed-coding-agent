@@ -93,12 +93,14 @@ class Worker:
                 policy_cfg = policy_cfg.model_copy(update={"allowed_commands": [
                     c for c in policy_cfg.allowed_commands if c in restr.allowed_commands]})
             policy = PolicyEngine(policy_cfg, ws.root, wi.allowed_paths)
+            # the approved test command answers to the operator's policy, not to the narrowed one
+            test_policy = PolicyEngine(self.cfg.policy, ws.root, wi.allowed_paths) if policy_cfg is not self.cfg.policy else policy
             tracker = BudgetTracker(job.budget)
 
             def stop_requested() -> bool:  # polled while commands run: a cancel or kill switch ends them at once
                 return self.queue.kill_switch() is not None or self.queue.cancel_requested(job.id)
 
-            executor = ToolExecutor(ws, policy, wi.test_command, stop_check=stop_requested)
+            executor = ToolExecutor(ws, policy, wi.test_command, stop_check=stop_requested, test_policy=test_policy)
             provider = self.provider_factory()
             result.provider, result.model = provider.name, provider.model
 

@@ -6,8 +6,8 @@ tenancy model in `docs/multi-tenancy.md`; the webhook contract in `docs/webhooks
 
 ## 1. Install
 
-Pilot host: Linux (Ubuntu 22.04+ or WSL2), Python 3.10–3.12, git, and Docker or Podman for the container
-workspace. One OS user per tenant instance.
+Pilot host: Linux (Ubuntu 22.04+ or WSL2), Python 3.10–3.12 (the test suite needs ≥ 3.10.2), git, and Docker
+or Podman for the container workspace. One OS user per tenant instance.
 
 ```bash
 python -m venv /opt/gca/tenant-a/venv && . /opt/gca/tenant-a/venv/bin/activate

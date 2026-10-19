@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 from collections.abc import Callable
@@ -36,41 +38,99 @@ StopCheck = Callable[[], bool]
 STOP_POLL_SECONDS = 0.25
 
 
+KILL_DRAIN_SECONDS = 5.0  # how long to wait for output after killing a process tree before giving up on it
+
+
+def _popen_tree(cmd: list[str], *, cwd: str | None, env: dict[str, str] | None) -> subprocess.Popen:
+    """Start `cmd` as the leader of its own process group / session so the whole tree can be killed at once."""
+    kw: dict = {}
+    if sys.platform == "win32":
+        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        kw["start_new_session"] = True
+    return subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            stdin=subprocess.DEVNULL, **kw)
+
+
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Kill the process and every descendant. Killing only the parent leaves children (a test runner's workers,
+    a script's subprocesses) running — and writing to the worktree — after a cancel, and keeps the output pipes
+    open so draining them never finishes."""
+    if proc.poll() is not None:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=10)
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError, subprocess.SubprocessError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _drain(proc: subprocess.Popen) -> tuple[str, str]:
+    """Collect what the (killed) process wrote, with a bound: a grandchild that survived and still holds the
+    pipes must not hang the worker. Whatever was not read is lost, which is fine for a stopped command."""
+    try:
+        out_b, err_b = proc.communicate(timeout=KILL_DRAIN_SECONDS)
+    except subprocess.TimeoutExpired:
+        for stream in (proc.stdout, proc.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except OSError:
+                pass
+        try:
+            proc.wait(timeout=1)  # the leader itself is dead; reap it so nothing lingers as a zombie
+        except subprocess.TimeoutExpired:
+            pass
+        return "", "[output not drained: a child process kept the pipes open]"
+    return out_b.decode(errors="replace"), err_b.decode(errors="replace")
+
+
 def run_until_stopped(cmd: list[str], *, cwd: str | None, env: dict[str, str] | None, timeout: int,
                       stop_check: StopCheck | None, on_stop: Callable[[subprocess.Popen], None] | None = None,
                       argv_for_result: list[str] | None = None) -> CommandResult:
-    """Run `cmd`, polling `stop_check` while it runs. A stop request ends the process at once (via `on_stop`
-    when given, else SIGKILL/TerminateProcess) and returns a CommandResult marked `interrupted`, so a cancel or
-    kill switch takes effect mid-command rather than at the next agent turn."""
+    """Run `cmd`, polling `stop_check` while it runs. A stop request ends the whole process tree at once (via
+    `on_stop` when given, else `kill_tree`) and returns a CommandResult marked `interrupted`, so a cancel or kill
+    switch takes effect mid-command rather than at the next agent turn.
+
+    The stop check is also applied before the command starts and after it finishes: a stop that lands while a
+    short command runs (between two polls) must still count, or a job could finish `succeeded` with the kill
+    switch engaged."""
     shown = argv_for_result if argv_for_result is not None else cmd
+    if stop_check is not None and stop_check():
+        return CommandResult(shown, -1, "", "[interrupted: stop requested before the command started]", interrupted=True)
     try:
-        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                stdin=subprocess.DEVNULL)
+        proc = _popen_tree(cmd, cwd=cwd, env=env)
     except FileNotFoundError as e:
         return CommandResult(shown, 127, "", f"command not found: {e.filename}")
+
+    def stop(note: str, **flags) -> CommandResult:
+        if on_stop is not None:
+            on_stop(proc)
+        kill_tree(proc)
+        out, err = _drain(proc)
+        return CommandResult(shown, -1, out, err + "\n" + note, **flags)
+
     deadline = time.monotonic() + timeout
     while True:
         try:
             out_b, err_b = proc.communicate(timeout=STOP_POLL_SECONDS)
-            return CommandResult(shown, proc.returncode, out_b.decode(errors="replace"), err_b.decode(errors="replace"))
         except subprocess.TimeoutExpired:
             pass
+        else:
+            out, err = out_b.decode(errors="replace"), err_b.decode(errors="replace")
+            if stop_check is not None and stop_check():  # it arrived while the command ran: the result is void
+                return CommandResult(shown, -1, out, err + "\n[interrupted: stop requested]", interrupted=True)
+            return CommandResult(shown, proc.returncode, out, err)
         if stop_check is not None and stop_check():
-            if on_stop is not None:
-                on_stop(proc)
-            else:
-                proc.kill()
-            out_b, err_b = proc.communicate()
-            return CommandResult(shown, -1, out_b.decode(errors="replace"),
-                                 err_b.decode(errors="replace") + "\n[interrupted: stop requested]", interrupted=True)
+            return stop("[interrupted: stop requested]", interrupted=True)
         if time.monotonic() >= deadline:
-            if on_stop is not None:
-                on_stop(proc)
-            else:
-                proc.kill()
-            out_b, err_b = proc.communicate()
-            return CommandResult(shown, -1, out_b.decode(errors="replace"),
-                                 err_b.decode(errors="replace") + f"\n[timed out after {timeout}s]", timed_out=True)
+            return stop(f"[timed out after {timeout}s]", timed_out=True)
 
 
 class Workspace(Protocol):

@@ -10,6 +10,7 @@ import os
 import re
 import subprocess
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -28,10 +29,24 @@ class PublishResult:
     note: str = ""
 
 
-def github_slug(remote_url: str) -> str | None:
-    """'owner/repo' from https://github.com/o/r(.git), git@github.com:o/r(.git), ssh://git@github.com/o/r."""
-    m = re.search(r"github\.com[:/]+([^/]+)/([^/]+?)(?:\.git)?/?$", remote_url.strip())
-    return f"{m.group(1)}/{m.group(2)}" if m else None
+def api_host(api_base: str) -> str | None:
+    """The git host an API base serves: api.github.com -> github.com; https://ghe.example/api/v3 -> ghe.example."""
+    host = (urlsplit(api_base).hostname or "").lower()
+    if not host:
+        return None
+    return "github.com" if host in ("api.github.com", "github.com") else host
+
+
+def github_slug(remote_url: str, host: str | None = None) -> str | None:
+    """'owner/repo' from https://<host>/o/r(.git), git@<host>:o/r(.git), ssh://git@<host>/o/r. `host` is github.com
+    or, for GitHub Enterprise, the host the configured `api_base` serves (otherwise an Enterprise remote would be
+    taken for "not GitHub" and the pull request silently skipped)."""
+    hosts = {"github.com"} | ({host.lower()} if host else set())
+    for h in hosts:
+        m = re.search(rf"(?:^|[@/.]){re.escape(h)}[:/]+([^/]+)/([^/]+?)(?:\.git)?/?$", remote_url.strip(), re.I)
+        if m:
+            return f"{m.group(1)}/{m.group(2)}"
+    return None
 
 
 def _git(repo: str, *args: str) -> str:
@@ -74,7 +89,7 @@ def publish_job(cfg: Config, queue: JobQueue, job_id: str, *, remote: str = "ori
     if not create_pr:
         result.note = "branch pushed; PR creation skipped"
         return result
-    slug = github_slug(remote_url)
+    slug = github_slug(remote_url, api_host(api_base))
     token = os.environ.get(token_env) or os.environ.get("GH_TOKEN")
     if not slug:
         result.note = "branch pushed; remote is not GitHub, open the merge request manually"
@@ -92,19 +107,27 @@ def publish_job(cfg: Config, queue: JobQueue, job_id: str, *, remote: str = "ori
         "\n\n---\n_Opened by gca. This change was produced by a coding agent under policy and independently "
         "verified; it still requires human review before merge._")
     title = f"[gca] {job.work_item.title}"[:250]
-    with httpx.Client(timeout=30, transport=transport,
-                      headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
-                               "X-GitHub-Api-Version": "2022-11-28"}) as c:
-        r = c.post(f"{api_base}/repos/{slug}/pulls",
-                   json={"title": title, "head": branch, "base": base, "body": body[:60000], "draft": draft})
-        if r.status_code == 422 and "already exists" in r.text:
-            existing = c.get(f"{api_base}/repos/{slug}/pulls", params={"head": f"{slug.split('/')[0]}:{branch}", "state": "open"})
-            existing.raise_for_status()
-            items = existing.json()
-            result.pr_url = items[0]["html_url"] if items else None
-            result.note = "pull request already existed"
-        else:
-            r.raise_for_status()
-            result.pr_url = r.json().get("html_url")
+    try:
+        with httpx.Client(timeout=30, transport=transport,
+                          headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                                   "X-GitHub-Api-Version": "2022-11-28"}) as c:
+            r = c.post(f"{api_base}/repos/{slug}/pulls",
+                       json={"title": title, "head": branch, "base": base, "body": body[:60000], "draft": draft})
+            if r.status_code == 422 and "already exists" in r.text:
+                existing = c.get(f"{api_base}/repos/{slug}/pulls",
+                                 params={"head": f"{slug.split('/')[0]}:{branch}", "state": "open"})
+                if existing.status_code >= 400:
+                    raise RuntimeError(f"GitHub {existing.status_code} listing pull requests: {existing.text[:300]}")
+                items = existing.json()
+                result.pr_url = items[0]["html_url"] if items else None
+                result.note = "pull request already existed"
+            elif r.status_code >= 400:
+                raise RuntimeError(f"GitHub {r.status_code} creating the pull request: {r.text[:300]}")
+            else:
+                result.pr_url = r.json().get("html_url")
+    except httpx.HTTPError as e:  # transport failure (DNS, TLS, timeout): the branch is pushed, the PR is not
+        raise RuntimeError(f"GitHub unreachable ({type(e).__name__}: {e}); branch {branch} was pushed") from e
+    except ValueError as e:  # non-JSON body
+        raise RuntimeError(f"GitHub returned an unreadable response: {e}") from e
     audit.record(actor, "pull_request_opened", url=result.pr_url, base=base, draft=draft)
     return result
