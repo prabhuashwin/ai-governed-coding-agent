@@ -203,3 +203,58 @@ def test_concurrent_cancel_and_finish_serialise(q: JobQueue):
     for t in ts:
         t.join()
     assert q.get(job.id).status == JobStatus.SUCCEEDED
+
+
+# --------------------------------------------------------------- review round 2 (2026-10-19)
+def test_rollback_in_one_thread_cannot_undo_another_threads_commit(q: JobQueue):
+    """Threads share one connection. An invalid transition's ROLLBACK used to also undo a submit or a kill
+    switch another thread had just been told succeeded."""
+    import threading
+
+    done = q.submit(wi())
+    q.approve(done.id, "a")
+    q.claim_next("w")
+    q.transition(done.id, JobStatus.VERIFYING)
+    q.finish(done.id, JobStatus.SUCCEEDED)  # terminal: approving it again is invalid
+    go = threading.Barrier(3)
+    submitted: list[str] = []
+
+    def bad_approve():
+        go.wait()
+        for _ in range(50):
+            with pytest.raises(InvalidTransition):
+                q.approve(done.id, "x")
+
+    def submits():
+        go.wait()
+        for _ in range(50):
+            submitted.append(q.submit(wi()).id)
+
+    def kill():
+        go.wait()
+        for _ in range(50):
+            q.set_kill_switch(True, reason="drill", actor="t")
+
+    ts = [threading.Thread(target=f) for f in (bad_approve, submits, kill)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    ids = {j.id for j in q.list()}
+    assert all(s in ids for s in submitted), "a returned submission was rolled back"
+    assert q.kill_switch() is not None, "an acknowledged kill switch was rolled back"
+
+
+def test_complete_turns_a_late_cancel_into_cancelled(q: JobQueue):
+    job = q.submit(wi())
+    q.approve(job.id, "a")
+    q.claim_next("w")
+    q.transition(job.id, JobStatus.VERIFYING)
+    q.request_cancel(job.id)  # lands after the worker's own cancel check, before it commits success
+    final = q.complete(job.id, JobStatus.SUCCEEDED)
+    assert final.status == JobStatus.CANCELLED and final.error == "cancelled during verification"
+    other = q.submit(wi())
+    q.approve(other.id, "a")
+    q.claim_next("w")
+    q.transition(other.id, JobStatus.VERIFYING)
+    assert q.complete(other.id, JobStatus.SUCCEEDED).status == JobStatus.SUCCEEDED

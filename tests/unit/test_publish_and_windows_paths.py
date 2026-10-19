@@ -184,3 +184,16 @@ def test_publish_pushes_the_verified_commit_not_a_moved_branch(config, succeeded
     assert res.pushed_to
     remote_head = git(job.work_item.repo_path, "ls-remote", "--heads", "origin", job.result.branch).split()[0]
     assert remote_head == verified  # the verified commit, never the moved head
+
+
+def test_publish_refuses_jobs_without_a_verified_commit_unless_forced(config, succeeded_job, monkeypatch):
+    """Jobs persisted before commit pinning have no verified SHA. They no longer silently take the
+    mutable-branch path; an explicit override is required."""
+    q, job, bare = succeeded_job
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    job.result.verification.commit = None
+    q.finish  # noqa: B018 - keep the queue referenced
+    q._update(job.id, lambda j: setattr(j.result.verification, "commit", None))
+    with pytest.raises(ValueError, match="no verified commit"):
+        publish_job(config, q, job.id, create_pr=False)
+    assert publish_job(config, q, job.id, create_pr=False, allow_failed=True).pushed_to

@@ -538,3 +538,50 @@ def test_outbox_insert_failure_spills_and_is_recovered(hook_cfg, work_item, rece
     assert not receiver.of("job.submitted")
     webhooks.flush(hook_cfg)
     assert calls["n"] == 3 and receiver.of("job.submitted") and not pub.outbox.spill_path.exists()
+
+
+# --------------------------------------------------------------------- review round 2 (2026-10-19)
+def test_abandoned_reservation_is_taken_over_by_a_retry(hook_cfg, work_item, receiver, monkeypatch):
+    """A process that died after reserving a delivery id left a status-0 row that answered every retry with
+    409 forever. A retry after the TTL takes the reservation over and runs the command."""
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    h = CommandHandler(hook_cfg, q)
+    hdrs, raw = signed("POST", "/v1/work-items", _wi_body(work_item), delivery_id="crash-1")
+    # simulate the crash: the reservation exists, nothing else happened
+    h._conn.execute("INSERT INTO inbound_deliveries VALUES (?,?,0,'')", ("crash-1", "2026-01-01T00:00:00+00:00"))
+    status, resp = h.handle("POST", "/v1/work-items", hdrs, raw)
+    assert status == 201 and not resp.get("replayed")
+    assert len(q.list()) == 1
+    # and a fresh (recent) reservation is still respected
+    h._conn.execute("INSERT INTO inbound_deliveries VALUES (?,?,0,'')", ("live-1", webhooks.now_iso()))
+    hdrs, raw = signed("POST", "/v1/work-items", _wi_body(work_item), delivery_id="live-1")
+    assert h._replay("live-1", wait_seconds=0.1)[0] == 409
+
+
+def test_spill_drain_survives_a_crash_and_concurrent_appends(hook_cfg, work_item, receiver, monkeypatch):
+    """The spill file was unlinked before its lines were inserted. It is now renamed to a private draining file
+    that is removed only after every line is in the database; a leftover draining file is picked up next time."""
+    import sqlite3
+
+    from gca.webhooks import Outbox
+
+    pub = webhooks.install(hook_cfg)
+    ev = {"id": "evt_spilled", "type": "job.finished", "created_at": webhooks.now_iso(), "job_id": "job_x", "data": {}}
+    pub.outbox.spill_path.write_text(json.dumps({"event": ev, "urls": hook_cfg.webhooks.outbound_urls}) + "\n")
+    real_add = Outbox.add
+
+    def crash_add(self, event, urls):
+        raise sqlite3.OperationalError("database is locked")  # the crash / contention happens mid-drain
+
+    monkeypatch.setattr(Outbox, "add", crash_add)
+    webhooks.flush(hook_cfg)
+    leftovers = list(pub.outbox.db_path.parent.glob("webhook_spill.jsonl.draining-*"))
+    assert leftovers and not pub.outbox.spill_path.exists(), "the draining file must survive a failed insert"
+    # an event spilled while draining was in progress lands in a fresh spill file, not the draining one
+    pub.outbox.add_or_spill({**ev, "id": "evt_second"}, hook_cfg.webhooks.outbound_urls)
+    assert pub.outbox.spill_path.exists()
+    monkeypatch.setattr(Outbox, "add", real_add)
+    webhooks.flush(hook_cfg)
+    assert {e["id"] for e in receiver.events} >= {"evt_spilled", "evt_second"}
+    assert not list(pub.outbox.db_path.parent.glob("webhook_spill.jsonl*"))

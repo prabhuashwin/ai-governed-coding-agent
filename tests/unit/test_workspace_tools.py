@@ -182,3 +182,17 @@ def test_rewritten_git_pointer_cannot_run_hooks_on_the_host(calc_repo: Path, tmp
         assert "calc.py" in git(calc_repo, "show", "--stat", "--format=", "gca/job_t1")
     finally:
         ws.cleanup()
+
+
+def test_repository_that_is_itself_a_linked_worktree(calc_repo: Path, tmp_path: Path):
+    """The pinned-git check required the worktree's git dir to be under <repo>/.git, which rejected a
+    repository that is itself a linked worktree (its metadata lives in the common git dir elsewhere)."""
+    linked = tmp_path / "linked"
+    git(calc_repo, "worktree", "add", "-q", "-b", "feature", str(linked), "main")
+    assert (linked / ".git").is_file()  # a pointer file, like any linked worktree
+    ws = GitWorktreeWorkspace(linked, "job_lw", "HEAD")
+    try:
+        (ws.root / "calc.py").write_text(ws.root.joinpath("calc.py").read_text().replace(CALC_FIX_OLD, CALC_FIX_NEW))
+        assert ws.commit_all("fix") and "calc.py" in ws.changed_files()
+    finally:
+        ws.cleanup()

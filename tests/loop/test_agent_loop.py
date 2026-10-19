@@ -207,3 +207,30 @@ def test_final_turn_cannot_exceed_token_and_cost_caps(config, work_item):
     cheap = [{"tool_calls": [{"name": "finish", "arguments": {"summary": "done", "success": True}}],
               "input_tokens": 5, "output_tokens": 1}]
     assert Harness(config, work_item, cheap, budget=Budget(max_input_tokens=10, max_turns=50, max_cost_usd=10)).run().stop_reason == StopReason.FINISHED
+
+
+def test_max_turns_on_the_final_turn_does_not_mask_token_and_cost_caps(config, work_item):
+    """exceeded() reports the first exhausted limit; when the finishing turn also reached max_turns, the
+    token and cost overrun went unchecked. Every limit is now checked independently."""
+    steps = [{"tool_calls": [{"name": "finish", "arguments": {"summary": "done", "success": True}}],
+              "input_tokens": 101, "output_tokens": 1}]
+    h = Harness(config, work_item, steps, budget=Budget(max_turns=1, max_input_tokens=10, max_cost_usd=0.00001))
+    out = h.run()
+    assert out.stop_reason == StopReason.BUDGET_EXHAUSTED
+    assert "max_input_tokens" in out.detail and "max_cost_usd" in out.detail
+    assert not out.claimed_success
+
+
+def test_elapsed_time_is_enforced_before_completion(config, work_item, monkeypatch):
+    steps = [{"tool_calls": [{"name": "finish", "arguments": {"summary": "done", "success": True}}]}]
+    h = Harness(config, work_item, steps, budget=Budget(max_seconds=5, max_turns=50))
+    h.tracker.started_at -= 60  # the turn took longer than the whole budget
+    out = h.run()
+    assert out.stop_reason == StopReason.BUDGET_EXHAUSTED and out.detail == "max_seconds"
+
+
+def test_idle_model_is_not_an_explicit_finish(config, work_item):
+    out = Harness(config, work_item, [{"text": "hi"}, {"text": "hello again"}]).run()
+    assert out.stop_reason == StopReason.FINISHED and not out.claimed_success and not out.explicit_finish
+    out = Harness(config, work_item, [{"tool_calls": [{"name": "finish", "arguments": {"summary": "no", "success": False}}]}]).run()
+    assert out.explicit_finish
