@@ -59,22 +59,36 @@ network; never expose it directly to the internet.
 | Header | Value |
 |---|---|
 | `X-GCA-Timestamp` | Unix seconds |
-| `X-GCA-Signature` | `sha256=` + hex HMAC-SHA256(secret, `"<timestamp>.<raw body>"`) |
-| `X-GCA-Delivery-Id` | Unique per delivery. Outbound: the event id. Inbound: chosen by the caller, **required** for POST, and used for idempotency (a repeat returns the original response with `"replayed": true`) |
+| `X-GCA-Signature-Version` | `2` |
+| `X-GCA-Signature` | `sha256=` + hex HMAC-SHA256(secret, signing string below) |
+| `X-GCA-Delivery-Id` | Unique per delivery. Outbound: the event id. Inbound: chosen by the caller, **required** for POST, and used for idempotency (a repeat returns the original response with `"replayed": true`; a copy arriving while the first is still being processed waits up to 5 s for that response) |
 | `X-GCA-Event` | Outbound only: the event type |
 
+The signing string binds everything that gives a request its meaning, so a signed request cannot be replayed
+as a different operation, against a different job, or under a different delivery id:
+
+```
+"2" LF <timestamp> LF <METHOD> LF <path> LF <delivery id> LF <raw body>
+```
+
+`METHOD` is upper case. `path` is the request path only: no scheme, host or query string, `/` when empty.
+If a proxy in front of the receiver rewrites paths, verify against the path as the sender addressed it.
+For a GET the body is empty and the delivery id may be empty, but both separators are still present.
 Receivers must reject timestamps more than 300 s off (configurable) and compare signatures in constant time.
-For a GET, sign the empty body.
+
+Version 1 (`"<timestamp>.<raw body>"`, no version header) is no longer accepted: it let a signed status GET
+be replayed as a cancel POST, and a signed approval be redirected to another job.
 
 Verifying a gca event (Python):
 
 ```python
 import hmac, hashlib, time
-def verify(secret: str, headers, body: bytes) -> bool:
+def verify(secret: str, method: str, path: str, headers, body: bytes) -> bool:
     ts, sig = headers["X-GCA-Timestamp"], headers["X-GCA-Signature"]
-    if abs(time.time() - int(ts)) > 300:
+    if headers.get("X-GCA-Signature-Version", "2") != "2" or abs(time.time() - int(ts)) > 300:
         return False
-    mac = hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+    head = "\n".join(["2", ts, method.upper(), path, headers.get("X-GCA-Delivery-Id", "")]) + "\n"
+    mac = hmac.new(secret.encode(), head.encode() + body, hashlib.sha256).hexdigest()
     return hmac.compare_digest("sha256=" + mac, sig)
 ```
 
@@ -82,15 +96,19 @@ Node:
 
 ```js
 const crypto = require("crypto");
-function verify(secret, headers, rawBody) {
+function verify(secret, method, path, headers, rawBody) {
   const ts = headers["x-gca-timestamp"], sig = headers["x-gca-signature"];
-  if (Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
-  const mac = crypto.createHmac("sha256", secret).update(`${ts}.`).update(rawBody).digest("hex");
-  return crypto.timingSafeEqual(Buffer.from(`sha256=${mac}`), Buffer.from(sig));
+  if ((headers["x-gca-signature-version"] ?? "2") !== "2" || Math.abs(Date.now() / 1000 - Number(ts)) > 300) return false;
+  const head = ["2", ts, method.toUpperCase(), path, headers["x-gca-delivery-id"] ?? ""].join("\n") + "\n";
+  const mac = crypto.createHmac("sha256", secret).update(head).update(rawBody).digest("hex");
+  const a = Buffer.from(`sha256=${mac}`), b = Buffer.from(sig ?? "");
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 ```
 
-Signing a command to gca is the same computation with the inbound secret.
+Signing a command to gca is the same computation with the inbound secret, the method and path you are
+calling, and the delivery id you chose. `gca.webhooks.signed_headers(secret, method, url, body, delivery_id=…)`
+produces the headers if the caller is Python.
 
 ## Outbound events
 
@@ -153,7 +171,9 @@ its next turn.
   (`webhook_outbox`) and are retried with exponential backoff (10 s, 20 s, 40 s … capped at 1 h) up to
   `max_attempts`. Non-retryable 4xx responses are marked `dead`; inspect them with `gca webhook-status` and
   replay with `gca webhook-deliver --requeue-dead`.
-- Inbound POSTs are idempotent per `X-GCA-Delivery-Id`.
+- Inbound POSTs are idempotent per `X-GCA-Delivery-Id`, including concurrent copies: the id is reserved
+  before the command runs, so a retry can never create a second job. A work item submitted without an
+  `idempotency_key` gets `delivery:<delivery id>` as its key.
 - The kill switch is global to this gca instance. Koru's per-agent and per-tenant switches map onto it, one gca
   instance per scope.
 - Tested end to end against a mocked platform (`tests/unit/test_webhooks.py`: signing, retries, dead letters,

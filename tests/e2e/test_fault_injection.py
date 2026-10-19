@@ -180,7 +180,7 @@ class _Flaky(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802
         body = self.rfile.read(int(self.headers["Content-Length"]))
-        if verify_signature(self.secret, dict(self.headers), body) is not None:
+        if verify_signature(self.secret, "POST", self.path, dict(self.headers), body) is not None:
             self.send_response(401)
             self.end_headers()
             return

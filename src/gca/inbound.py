@@ -18,6 +18,7 @@ import json
 import os
 import re
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
@@ -59,37 +60,63 @@ class CommandHandler:
     def handle(self, method: str, path: str, headers: dict[str, str], body: bytes) -> tuple[int, dict[str, Any]]:
         if method == "GET" and path == "/healthz":
             return 200, {"ok": True, "kill_switch": bool(self.queue.kill_switch())}
-        reason = verify_signature(self.secret, headers, body, max_skew_seconds=self.cfg.webhooks.max_skew_seconds)
+        reason = verify_signature(self.secret, method, path, headers, body,
+                                  max_skew_seconds=self.cfg.webhooks.max_skew_seconds)
         if reason:
             return 401, {"error": "unauthorized", "detail": reason}
         delivery_id = {k.lower(): v for k, v in headers.items()}.get("x-gca-delivery-id", "")
         if method == "POST":
             if not delivery_id:
                 return 400, {"error": "X-GCA-Delivery-Id header is required for POST"}
-            prior = self._conn.execute("SELECT status, response FROM inbound_deliveries WHERE id=?",
-                                       (delivery_id,)).fetchone()
-            if prior:
-                return int(prior[0]), {**json.loads(prior[1]), "replayed": True}
+            # Reserve the delivery id *before* doing anything, so two concurrent copies of the same delivery
+            # cannot both run the command. The reservation row (status 0) is filled in when the command is done.
+            with self._lock:
+                reserved = self._conn.execute("INSERT OR IGNORE INTO inbound_deliveries VALUES (?,?,0,'')",
+                                              (delivery_id, now_iso())).rowcount == 1
+            if not reserved:
+                return self._replay(delivery_id)
         try:
             payload = json.loads(body or b"{}") if method == "POST" else {}
             if not isinstance(payload, dict):
                 raise CommandError(400, "body must be a JSON object")
-            status, resp = self._route(method, path, payload)
+            status, resp = self._route(method, path, payload, delivery_id)
         except CommandError as e:
             status, resp = e.status, {"error": e.message}
         except json.JSONDecodeError:
             status, resp = 400, {"error": "invalid JSON"}
         except ValidationError as e:
             status, resp = 422, {"error": "validation failed", "detail": json.loads(e.json())[:10]}
-        if method == "POST" and status < 500:
+        except Exception:
+            if method == "POST":
+                with self._lock:  # nothing was recorded for this delivery; let a retry run it
+                    self._conn.execute("DELETE FROM inbound_deliveries WHERE id=? AND status=0", (delivery_id,))
+            raise
+        if method == "POST":
             with self._lock:
-                self._conn.execute("INSERT OR IGNORE INTO inbound_deliveries VALUES (?,?,?,?)",
-                                   (delivery_id, now_iso(), status, json.dumps(resp, default=str)))
+                if status < 500:
+                    self._conn.execute("UPDATE inbound_deliveries SET status=?, response=? WHERE id=?",
+                                       (status, json.dumps(resp, default=str), delivery_id))
+                else:
+                    self._conn.execute("DELETE FROM inbound_deliveries WHERE id=?", (delivery_id,))
         return status, resp
 
-    def _route(self, method: str, path: str, p: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    def _replay(self, delivery_id: str, wait_seconds: float = 5.0) -> tuple[int, dict[str, Any]]:
+        """The stored response for a delivery id seen before; waits briefly for one still in progress."""
+        deadline = time.monotonic() + wait_seconds
+        while True:
+            row = self._conn.execute("SELECT status, response FROM inbound_deliveries WHERE id=?",
+                                     (delivery_id,)).fetchone()
+            if row is None:  # the first copy failed with a 5xx and released the id: this copy may run it
+                return 409, {"error": "delivery is being retried", "delivery_id": delivery_id}
+            if int(row[0]) != 0:
+                return int(row[0]), {**json.loads(row[1]), "replayed": True}
+            if time.monotonic() >= deadline:
+                return 409, {"error": "delivery in progress", "delivery_id": delivery_id}
+            time.sleep(0.05)
+
+    def _route(self, method: str, path: str, p: dict[str, Any], delivery_id: str = "") -> tuple[int, dict[str, Any]]:
         if method == "POST" and path == "/v1/work-items":
-            return self.submit(p)
+            return self.submit(p, delivery_id)
         if method == "POST" and path == "/v1/controls/kill-switch":
             return self.kill_switch(p)
         m = re.fullmatch(r"/v1/jobs/([A-Za-z0-9_\-]+)(/decision|/cancel)?", path)
@@ -104,9 +131,11 @@ class CommandHandler:
         raise CommandError(404, f"no route for {method} {path}")
 
     # ------------------------------------------------------------- commands
-    def submit(self, p: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+    def submit(self, p: dict[str, Any], delivery_id: str = "") -> tuple[int, dict[str, Any]]:
         budget_in = p.pop("budget", None)
         p.setdefault("source", "webhook")
+        if delivery_id and not p.get("idempotency_key"):
+            p["idempotency_key"] = f"delivery:{delivery_id}"  # a retried delivery can never create a second job
         item = WorkItem.model_validate(p)
         budget = self.cfg.budget.model_copy(update=Budget.model_validate(budget_in).model_dump(exclude_unset=True)) \
             if budget_in else self.cfg.budget

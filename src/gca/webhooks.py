@@ -32,6 +32,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -61,37 +62,68 @@ RETRYABLE = {408, 425, 429}
 
 
 # ----------------------------------------------------------------------------- signing
-def sign(secret: str, timestamp: str, body: bytes) -> str:
-    mac = hmac.new(secret.encode("utf-8"), timestamp.encode("ascii") + b"." + body, hashlib.sha256)
+SIGNATURE_VERSION = "2"
+
+
+def signing_string(timestamp: str, method: str, path: str, delivery_id: str, body: bytes) -> bytes:
+    """What is MACed: every field that gives a request its meaning, newline-separated, body last.
+
+    Binding the method, path and delivery id (not only the timestamp and body, as version 1 did) means a
+    signed status GET cannot be replayed as a cancel POST, and a signed approval cannot be redirected to another
+    job by changing the unsigned path. The fixed fields may not contain newlines, so the encoding is unambiguous.
+    """
+    for name, value in (("timestamp", timestamp), ("method", method), ("path", path), ("delivery id", delivery_id)):
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"{name} may not contain a newline")
+    head = "\n".join((SIGNATURE_VERSION, timestamp, method.upper(), path, delivery_id)) + "\n"
+    return head.encode("utf-8") + body
+
+
+def sign(secret: str, timestamp: str, method: str, path: str, delivery_id: str, body: bytes) -> str:
+    mac = hmac.new(secret.encode("utf-8"), signing_string(timestamp, method, path, delivery_id, body), hashlib.sha256)
     return "sha256=" + mac.hexdigest()
 
 
-def signed_headers(secret: str, body: bytes, *, delivery_id: str | None = None, event: str | None = None,
-                   timestamp: int | None = None) -> dict[str, str]:
+def request_path(url_or_path: str) -> str:
+    """The path component a signature binds: no scheme, host or query; `/` when empty."""
+    return urlsplit(url_or_path).path or "/"
+
+
+def signed_headers(secret: str, method: str, url_or_path: str, body: bytes, *, delivery_id: str | None = None,
+                   event: str | None = None, timestamp: int | None = None) -> dict[str, str]:
     ts = str(int(timestamp if timestamp is not None else time.time()))
-    h = {"Content-Type": "application/json", "X-GCA-Timestamp": ts, "X-GCA-Signature": sign(secret, ts, body),
-         "X-GCA-Delivery-Id": delivery_id or f"dlv_{uuid.uuid4().hex}", "User-Agent": "gca-webhooks/1"}
+    did = delivery_id if delivery_id is not None else f"dlv_{uuid.uuid4().hex}"
+    h = {"Content-Type": "application/json", "X-GCA-Timestamp": ts,
+         "X-GCA-Signature": sign(secret, ts, method, request_path(url_or_path), did, body),
+         "X-GCA-Signature-Version": SIGNATURE_VERSION, "X-GCA-Delivery-Id": did, "User-Agent": "gca-webhooks/2"}
     if event:
         h["X-GCA-Event"] = event
     return h
 
 
-def verify_signature(secret: str, headers: dict[str, str], body: bytes, *, max_skew_seconds: int = 300,
-                     now: float | None = None) -> str | None:
-    """Return None if valid, else a short reason. Header lookup is case-insensitive."""
+def verify_signature(secret: str, method: str, url_or_path: str, headers: dict[str, str], body: bytes, *,
+                     max_skew_seconds: int = 300, now: float | None = None) -> str | None:
+    """Return None if valid, else a short reason. `method` and `url_or_path` are the request as received.
+    Header lookup is case-insensitive."""
     low = {k.lower(): v for k, v in headers.items()}
-    ts, sig = low.get("x-gca-timestamp"), low.get("x-gca-signature")
+    ts, sig, did = low.get("x-gca-timestamp"), low.get("x-gca-signature"), low.get("x-gca-delivery-id", "")
     if not secret:
         return "receiver has no secret configured"
     if not ts or not sig:
         return "missing signature headers"
+    if low.get("x-gca-signature-version", SIGNATURE_VERSION) != SIGNATURE_VERSION:
+        return "unsupported signature version"
     try:
         age = abs((now if now is not None else time.time()) - int(ts))
     except ValueError:
         return "bad timestamp"
     if age > max_skew_seconds:
         return "timestamp outside allowed window"
-    if not hmac.compare_digest(sign(secret, ts, body), sig):
+    try:
+        expected = sign(secret, ts, method, request_path(url_or_path), did, body)
+    except ValueError as e:
+        return str(e)
+    if not hmac.compare_digest(expected, sig):
         return "signature mismatch"
     return None
 
@@ -195,7 +227,7 @@ class Deliverer:
                 attempts += 1
                 try:
                     r = c.post(url, content=body,
-                               headers=signed_headers(self.secret, body, delivery_id=eid, event=etype))
+                               headers=signed_headers(self.secret, "POST", url, body, delivery_id=eid, event=etype))
                     code = r.status_code
                     err = None if 200 <= code < 300 else f"HTTP {code}: {r.text[:200]}"
                 except (httpx.TransportError, httpx.TimeoutException) as e:
