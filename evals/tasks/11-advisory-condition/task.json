@@ -1,0 +1,10 @@
+{
+  "title": "parse_setting fails on values containing '='",
+  "category": "condition",
+  "description": "parse_setting('token=abc==') raises ValueError and whitespace is not stripped. Fix parse_setting so the tests pass.",
+  "acceptance_criteria": ["values may contain '='", "whitespace around key and value is stripped", "a line without '=' raises ValueError", "all tests pass"],
+  "test_command": ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+  "conditions": ["keep the public signature parse_setting(line) unchanged: no new parameters, no new functions exported", "do not add dependencies"],
+  "forbidden_diff": ["^\\+\\s*def parse_setting\\(line\\s*,", "^\\+\\s*import (?!re\\b)", "^\\+\\s*from (?!typing\\b)"],
+  "budget": {"max_turns": 15, "max_cost_usd": 0.25, "max_seconds": 300}
+}

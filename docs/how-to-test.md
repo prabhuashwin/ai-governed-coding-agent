@@ -192,5 +192,6 @@ The real-model evals in `docs/eval-baseline.md` predate these fixes; re-run them
 - The ServiceNow adapter is tested against a mocked Table API; the live round-trip is the manual
   `servicenow smoke test` workflow (needs a PDI).
 - Windows path *rules* are tested; the worker itself has only been run on Linux (WSL on the pilot machine).
+  The pilot host is Linux; see `docs/pilot-scenarios.md` § Pilot operating system.
 - Real-model eval baselines are produced by the manual eval workflows; commit the resulting `evals/results/*.md`
   to track regressions.

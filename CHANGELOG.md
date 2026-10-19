@@ -40,6 +40,15 @@ Work package 4: the Koru adapter (`docs/koru-adapter.md`).
   instance- and job-scope stops) and writes `webhook-e2e.contract.json`; the committed snapshot is
   `docs/webhook-contract-samples.json`, and CI fails if event shapes drift from it.
 
+Work package 5: validation (`docs/pilot-scenarios.md`).
+
+- **Scenario matrix** mapping twenty pilot scenarios (including advisory conditions violated and stale
+  kill-switch retries) to their automated and real-model evidence; **evidence format** for eval runs and the
+  sign-off pack; **pilot OS**: Linux host (WSL2 acceptable), Windows as a tested client only.
+- **Eval tasks 10 and 11** with runner support for approval `restrictions` and `conditions`:
+  `within_restrictions` / `restriction_attempts` measure whether a model tries to write outside an enforced
+  scope; `forbidden_diff` / `conditions_respected` measure whether it honours an advisory condition.
+
 ## 0.2.0 — 2026-10-19
 
 The release that closes four rounds of external security and correctness review of 0.1.0 (31 findings:
