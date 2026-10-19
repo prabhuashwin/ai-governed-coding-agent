@@ -234,3 +234,17 @@ def test_idle_model_is_not_an_explicit_finish(config, work_item):
     assert out.stop_reason == StopReason.FINISHED and not out.claimed_success and not out.explicit_finish
     out = Harness(config, work_item, [{"tool_calls": [{"name": "finish", "arguments": {"summary": "no", "success": False}}]}]).run()
     assert out.explicit_finish
+
+
+def test_tools_before_finish_in_the_same_response_cannot_outrun_the_clock(config, work_item):
+    """One response holding an edit, a slow command and finish(true): the post-charge check passed before the
+    command ran, so the job finished successfully past max_seconds. The clock is re-checked at finish."""
+    steps = [{"tool_calls": [
+        {"name": "edit_file", "arguments": {"path": "calc.py", "old": "    return a + b", "new": "    return a + b  # touched"}},
+        {"name": "run_command", "arguments": {"argv": [sys.executable, "-c", "import time; time.sleep(1.3)"]}},
+        {"name": "finish", "arguments": {"summary": "done", "success": True}},
+    ]}]
+    h = Harness(config, work_item, steps, budget=Budget(max_seconds=1, max_turns=50))
+    out = h.run()
+    assert out.stop_reason == StopReason.BUDGET_EXHAUSTED and out.detail == "max_seconds"
+    assert not out.claimed_success
