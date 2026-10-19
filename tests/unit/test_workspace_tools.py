@@ -147,3 +147,31 @@ def test_line_endings_are_preserved(calc_repo: Path):
         assert (ws.root / "new.py").read_bytes() == b"a\nb\n"
     finally:
         ws.cleanup(keep_branch=False)
+
+
+def test_rewritten_git_pointer_cannot_run_hooks_on_the_host(calc_repo: Path, tmp_path: Path):
+    """Review finding 1: the worktree's `.git` file is agent-writable. Point it at attacker metadata with a
+    hook; the next host commit must neither run the hook nor use that metadata."""
+    ws, _, ex = make(calc_repo)
+    try:
+        marker = tmp_path / "hook-ran"
+        evil = ws.root / "evilgit"
+        git(ws.root, "init", "-q", str(evil))  # a complete .git directory under the worktree
+        (evil / "x").write_text("x")
+        git(evil, "add", "-A")
+        git(evil, "commit", "-q", "-m", "attacker metadata")
+        hooks = evil / ".git" / "hooks"
+        hook = hooks / "pre-commit"
+        hook.write_text(f"#!/bin/sh\necho pwned > '{marker}'\n")
+        hook.chmod(0o755)
+        (ws.root / ".git").write_text("gitdir: evilgit/.git\n")  # what the agent (or its code) would do
+        ex.execute("edit_file", {"path": "calc.py", "old": CALC_FIX_OLD, "new": CALC_FIX_NEW})
+        sha = ws.commit_all("fix")
+        assert not marker.exists(), "hook from agent-controlled git metadata ran on the host"
+        assert sha, "the real fix must still be committed"
+        assert "evilgit" not in git(calc_repo, "show", "--stat", "--format=", "gca/job_t1")
+        # the commit landed in the real repository, on the job branch
+        assert sha in git(calc_repo, "rev-parse", "gca/job_t1")
+        assert "calc.py" in git(calc_repo, "show", "--stat", "--format=", "gca/job_t1")
+    finally:
+        ws.cleanup()
