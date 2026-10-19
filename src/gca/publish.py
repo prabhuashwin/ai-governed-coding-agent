@@ -55,8 +55,17 @@ def publish_job(cfg: Config, queue: JobQueue, job_id: str, *, remote: str = "ori
     audit = AuditLog(cfg.audit_dir, job.id, redactions=cfg.policy.canary_strings)
 
     remote_url = _git(repo, "remote", "get-url", remote)
-    _git(repo, "push", "--force-with-lease", remote, f"{branch}:{branch}")
-    audit.record("publisher", "branch_pushed", remote=remote_url, branch=branch)
+    verified = job.result.verification.commit if job.result.verification else None
+    if verified:
+        # The report describes exactly one commit. If the branch has moved since, the evidence no longer applies.
+        head = _git(repo, "rev-parse", "--verify", f"{branch}^{{commit}}")
+        if head != verified and not allow_failed:
+            raise ValueError(f"{branch} is at {head[:12]} but the verified commit is {verified[:12]}; the branch "
+                             f"changed after verification. Re-run the job, or pass --allow-failed to push it unverified")
+        _git(repo, "push", "--force-with-lease", remote, f"{verified}:refs/heads/{branch}")
+    else:  # a job from before verification recorded its commit
+        _git(repo, "push", "--force-with-lease", remote, f"{branch}:{branch}")
+    audit.record("publisher", "branch_pushed", remote=remote_url, branch=branch, commit=verified)
     result = PublishResult(job_id=job.id, branch=branch, pushed_to=remote_url)
 
     if not create_pr:

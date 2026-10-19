@@ -12,7 +12,7 @@ Expected table (scoped app `x_gca_work_item` with field_prefix "" — or a globa
 State contract:
     requested  -> engineer created it (ignored by gca)
     approved   -> approver set it in ServiceNow; gca picks it up, records the approval locally and queues it
-    running / succeeded / failed / cancelled -> written back by gca
+    running / verifying / succeeded / failed / cancelled -> written back by gca
 Approval never happens in gca; it only mirrors ServiceNow's decision.
 """
 
@@ -66,7 +66,7 @@ class ServiceNowSource:
             return r.json().get("result", [])
 
     def fetch_in_flight(self, limit: int = 100) -> list[dict[str, Any]]:
-        params = {"sysparm_query": f"{self.f('gca_job_id')}ISNOTEMPTY^{self.f('state')}INapproved,running",
+        params = {"sysparm_query": f"{self.f('gca_job_id')}ISNOTEMPTY^{self.f('state')}INapproved,running,verifying",
                   "sysparm_limit": str(limit),
                   "sysparm_fields": ",".join(["sys_id", self.f("number"), self.f("gca_job_id"), self.f("state")])}
         with self._client() as c:

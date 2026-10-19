@@ -137,7 +137,7 @@ def test_full_pipeline_with_container_workspace(config, work_item, fake_docker: 
     assert job.status == JobStatus.SUCCEEDED, job.error
     invocations = fake_docker.read_text().splitlines()
     runs = [x for x in invocations if '"run"' in x]
-    assert len(runs) == 3  # two agent run_tests + one verifier run
+    assert len(runs) == 4  # two agent run_tests + the verifier's branch run + its base-commit baseline run
     assert any("gca-verify-" in x for x in runs)
     assert all("--network=none" in x for x in runs)
     assert job.result.verification.passed and ".gca-home" not in job.result.diff

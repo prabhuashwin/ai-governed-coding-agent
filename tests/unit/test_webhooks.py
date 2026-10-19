@@ -36,7 +36,7 @@ class Receiver:
         self.fail_with: list[int] = []  # status codes to return, consumed in order
 
     def handler(self, req: httpx.Request) -> httpx.Response:
-        if verify_signature(self.secret, dict(req.headers), req.content) is not None:
+        if verify_signature(self.secret, req.method, req.url.path, dict(req.headers), req.content) is not None:
             self.bad_sigs += 1
             return httpx.Response(401)
         if self.fail_with:
@@ -70,24 +70,31 @@ def wh_config(config):
     return config
 
 
-def signed(body: dict | None, *, secret: str = IN_SECRET, delivery_id: str | None = None, ts: int | None = None):
+def signed(method: str, path: str, body: dict | None, *, secret: str = IN_SECRET, delivery_id: str | None = None,
+           ts: int | None = None):
     raw = json.dumps(body).encode() if body is not None else b""
-    return signed_headers(secret, raw, delivery_id=delivery_id, timestamp=ts), raw
+    return signed_headers(secret, method, path, raw, delivery_id=delivery_id, timestamp=ts), raw
 
 
 # --------------------------------------------------------------------- signing
 def test_sign_and_verify():
     body = b'{"a":1}'
-    h = signed_headers("s3cret", body)
-    assert verify_signature("s3cret", h, body) is None
-    assert verify_signature("s3cret", {k.upper(): v for k, v in h.items()}, body) is None  # case-insensitive
-    assert verify_signature("s3cret", h, b'{"a":2}') == "signature mismatch"
-    assert verify_signature("other", h, body) == "signature mismatch"
-    assert verify_signature("s3cret", {}, body) == "missing signature headers"
-    assert verify_signature("", h, body) == "receiver has no secret configured"
-    old = signed_headers("s3cret", body, timestamp=int(time.time()) - 3600)
-    assert verify_signature("s3cret", old, body) == "timestamp outside allowed window"
-    assert h["X-GCA-Signature"] == sign("s3cret", h["X-GCA-Timestamp"], body)
+    h = signed_headers("s3cret", "POST", "https://koru.example/hooks/gca?x=1", body)
+    v = lambda *a, **k: verify_signature("s3cret", "POST", "/hooks/gca", *a, **k)  # noqa: E731
+    assert v(h, body) is None
+    assert v({k.upper(): val for k, val in h.items()}, body) is None  # case-insensitive
+    assert v(h, b'{"a":2}') == "signature mismatch"
+    assert verify_signature("other", "POST", "/hooks/gca", h, body) == "signature mismatch"
+    assert v({}, body) == "missing signature headers"
+    assert verify_signature("", "POST", "/hooks/gca", h, body) == "receiver has no secret configured"
+    old = signed_headers("s3cret", "POST", "/hooks/gca", body, timestamp=int(time.time()) - 3600)
+    assert v(old, body) == "timestamp outside allowed window"
+    assert h["X-GCA-Signature"] == sign("s3cret", h["X-GCA-Timestamp"], "POST", "/hooks/gca", h["X-GCA-Delivery-Id"], body)
+    # the signature binds the method, the path and the delivery id, not only the timestamp and body
+    assert verify_signature("s3cret", "GET", "/hooks/gca", h, body) == "signature mismatch"
+    assert verify_signature("s3cret", "POST", "/hooks/other", h, body) == "signature mismatch"
+    assert v({**h, "X-GCA-Delivery-Id": "dlv_other"}, body) == "signature mismatch"
+    assert v({**h, "X-GCA-Signature-Version": "1"}, body) == "unsupported signature version"
 
 
 # --------------------------------------------------------------------- outbound delivery
@@ -219,9 +226,9 @@ def test_inbound_requires_valid_signature(hook_cfg, receiver):
     h = CommandHandler(hook_cfg, JobQueue(hook_cfg.db_path))
     assert h.handle("GET", "/healthz", {}, b"")[0] == 200
     assert h.handle("POST", "/v1/work-items", {}, b"{}")[0] == 401
-    hdrs, raw = signed({"x": 1}, secret="wrong")
+    hdrs, raw = signed("POST", "/v1/work-items", {"x": 1}, secret="wrong")
     assert h.handle("POST", "/v1/work-items", hdrs, raw) == (401, {"error": "unauthorized", "detail": "signature mismatch"})
-    hdrs, raw = signed({"x": 1}, ts=int(time.time()) - 10_000)
+    hdrs, raw = signed("POST", "/v1/work-items", {"x": 1}, ts=int(time.time()) - 10_000)
     assert h.handle("POST", "/v1/work-items", hdrs, raw)[1]["detail"] == "timestamp outside allowed window"
 
 
@@ -229,7 +236,7 @@ def test_webhook_approval_flow(hook_cfg, work_item, receiver):
     q = JobQueue(hook_cfg.db_path)
     webhooks.install(hook_cfg)
     h = CommandHandler(hook_cfg, q)
-    hdrs, raw = signed(_wi_body(work_item, idempotency_key="koru:req-1"), delivery_id="d-1")
+    hdrs, raw = signed("POST", "/v1/work-items", _wi_body(work_item, idempotency_key="koru:req-1"), delivery_id="d-1")
     status, resp = h.handle("POST", "/v1/work-items", hdrs, raw)
     assert status == 201 and resp["approval"] == "pending_webhook_decision"
     job_id = resp["job_id"]
@@ -240,25 +247,29 @@ def test_webhook_approval_flow(hook_cfg, work_item, receiver):
     assert h.handle("POST", "/v1/work-items", hdrs, raw)[1] == {**resp, "replayed": True}
     assert len(q.list()) == 1
     # self-approval refused, bad input refused, worker cannot claim before approval
-    hd, rw = signed({"decision": "approve", "approver": "dev-alice"}, delivery_id="d-2")
+    hd, rw = signed("POST", f"/v1/jobs/{job_id}/decision", {"decision": "approve", "approver": "dev-alice"}, delivery_id="d-2")
     assert h.handle("POST", f"/v1/jobs/{job_id}/decision", hd, rw)[0] == 403
-    hd, rw = signed({"decision": "maybe", "approver": "lead"}, delivery_id="d-3")
+    hd, rw = signed("POST", f"/v1/jobs/{job_id}/decision", {"decision": "maybe", "approver": "lead"}, delivery_id="d-3")
     assert h.handle("POST", f"/v1/jobs/{job_id}/decision", hd, rw)[0] == 422
     assert q.claim_next("w") is None
     # approval with conditions
-    hd, rw = signed({"decision": "approve", "approver": "lead-bob", "note": "ok",
+    hd, rw = signed("POST", f"/v1/jobs/{job_id}/decision", {"decision": "approve", "approver": "lead-bob", "note": "ok",
                      "conditions": ["touch only stats code"]}, delivery_id="d-4")
     assert h.handle("POST", f"/v1/jobs/{job_id}/decision", hd, rw) == (200, {"job_id": job_id, "status": "approved"})
     job = q.get(job_id)
     assert job.approval.approver == "lead-bob" and "touch only stats code" in job.approval.note
     assert [e.actor for e in AuditLog(hook_cfg.audit_dir, job_id).events()] == ["dev-alice", "lead-bob"]
     # deciding twice is a conflict
-    hd, rw = signed({"decision": "reject", "approver": "lead-bob"}, delivery_id="d-5")
+    hd, rw = signed("POST", f"/v1/jobs/{job_id}/decision", {"decision": "reject", "approver": "lead-bob"}, delivery_id="d-5")
     assert h.handle("POST", f"/v1/jobs/{job_id}/decision", hd, rw)[0] == 409
     # status endpoint
-    hd, _ = signed(None)
+    hd, _ = signed("GET", f"/v1/jobs/{job_id}", None)
     s, st = h.handle("GET", f"/v1/jobs/{job_id}", hd, b"")
     assert s == 200 and st["status"] == "approved" and st["approver"] == "lead-bob"
+    # a signed status GET is not a cancel, and is not a status GET for another job
+    assert h.handle("POST", f"/v1/jobs/{job_id}/cancel", hd, b"")[0] == 401
+    assert h.handle("GET", "/v1/jobs/job_nope", hd, b"")[0] == 401
+    hd, _ = signed("GET", "/v1/jobs/job_nope", None)
     assert h.handle("GET", "/v1/jobs/job_nope", hd, b"")[0] == 404
 
 
@@ -267,7 +278,7 @@ def test_decision_refused_in_local_mode_and_cli_refuses_in_webhook_mode(wh_confi
     wh_config.approval = ApprovalConfig(mode="local")
     q = JobQueue(wh_config.db_path)
     job = q.submit(work_item)
-    hd, rw = signed({"decision": "approve", "approver": "lead"}, delivery_id="x-1")
+    hd, rw = signed("POST", f"/v1/jobs/{job.id}/decision", {"decision": "approve", "approver": "lead"}, delivery_id="x-1")
     assert CommandHandler(wh_config, q).handle("POST", f"/v1/jobs/{job.id}/decision", hd, rw)[0] == 409
 
     toml = tmp_path / "gca.toml"
@@ -282,7 +293,7 @@ def test_decision_refused_in_local_mode_and_cli_refuses_in_webhook_mode(wh_confi
 
 def test_caller_cannot_raise_budget_above_operator_limits(hook_cfg, work_item, receiver):
     h = CommandHandler(hook_cfg, JobQueue(hook_cfg.db_path))
-    hdrs, raw = signed(_wi_body(work_item, budget={"max_cost_usd": 999, "max_turns": 3}), delivery_id="b-1")
+    hdrs, raw = signed("POST", "/v1/work-items", _wi_body(work_item, budget={"max_cost_usd": 999, "max_turns": 3}), delivery_id="b-1")
     status, resp = h.handle("POST", "/v1/work-items", hdrs, raw)
     job = JobQueue(hook_cfg.db_path).get(resp["job_id"])
     assert job.budget.max_cost_usd == hook_cfg.budget.max_cost_usd and job.budget.max_turns == 3
@@ -290,10 +301,12 @@ def test_caller_cannot_raise_budget_above_operator_limits(hook_cfg, work_item, r
 
 def test_invalid_work_item_is_422(hook_cfg, receiver):
     h = CommandHandler(hook_cfg, JobQueue(hook_cfg.db_path))
-    hdrs, raw = signed({"title": "missing fields"}, delivery_id="v-1")
+    hdrs, raw = signed("POST", "/v1/work-items", {"title": "missing fields"}, delivery_id="v-1")
     assert h.handle("POST", "/v1/work-items", hdrs, raw)[0] == 422
-    hdrs, raw = signed({"title": "x"})
+    hdrs, raw = signed("POST", "/v1/work-items", {"title": "x"})
     hdrs.pop("X-GCA-Delivery-Id")
+    assert h.handle("POST", "/v1/work-items", hdrs, raw)[0] == 401  # delivery id is signed, so it cannot be dropped
+    hdrs, raw = signed("POST", "/v1/work-items", {"title": "x"}, delivery_id="")
     assert h.handle("POST", "/v1/work-items", hdrs, raw)[0] == 400  # delivery id mandatory
 
 
@@ -302,16 +315,16 @@ def test_kill_switch_blocks_claims_and_stops_running_agent(hook_cfg, work_item, 
     q = JobQueue(hook_cfg.db_path)
     webhooks.install(hook_cfg)
     h = CommandHandler(hook_cfg, q)
-    hd, rw = signed({"enabled": False, "actor": "sec-ops"}, delivery_id="k-0")
+    hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": False, "actor": "sec-ops"}, delivery_id="k-0")
     assert h.handle("POST", "/v1/controls/kill-switch", hd, rw)[0] == 422  # disengage needs a reason
 
     job = q.submit(work_item)
     q.approve(job.id, "lead")
-    hd, rw = signed({"enabled": True, "actor": "sec-ops", "reason": "incident 42"}, delivery_id="k-1")
+    hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "sec-ops", "reason": "incident 42"}, delivery_id="k-1")
     assert h.handle("POST", "/v1/controls/kill-switch", hd, rw)[0] == 200
     assert receiver.of("control.kill_switch")[0]["data"] == {"enabled": True, "reason": "incident 42", "actor": "sec-ops"}
     assert Worker(hook_cfg, q).run_once() is None  # nothing is claimed while killed
-    hd, rw = signed({"enabled": False, "actor": "sec-ops", "reason": "resolved"}, delivery_id="k-2")
+    hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": False, "actor": "sec-ops", "reason": "resolved"}, delivery_id="k-2")
     h.handle("POST", "/v1/controls/kill-switch", hd, rw)
 
     # mid-run: the platform pulls the switch while the agent is working
@@ -332,7 +345,7 @@ def test_cancel_via_inbound(hook_cfg, work_item, receiver):
     q = JobQueue(hook_cfg.db_path)
     webhooks.install(hook_cfg)
     job = q.submit(work_item)
-    hd, rw = signed({"by": "koru-user"}, delivery_id="c-1")
+    hd, rw = signed("POST", f"/v1/jobs/{job.id}/cancel", {"by": "koru-user"}, delivery_id="c-1")
     s, r = CommandHandler(hook_cfg, q).handle("POST", f"/v1/jobs/{job.id}/cancel", hd, rw)
     assert s == 200 and r["status"] == "cancelled"
     assert receiver.of("job.cancel_requested")[0]["data"] == {"by": "koru-user"}
@@ -362,14 +375,14 @@ def test_http_server_end_to_end(hook_cfg, work_item, receiver):
     try:
         with httpx.Client(timeout=10) as c:
             assert c.get(f"{base}/healthz").json() == {"ok": True, "kill_switch": False}
-            hdrs, raw = signed(_wi_body(work_item), delivery_id="h-1")
+            hdrs, raw = signed("POST", "/v1/work-items", _wi_body(work_item), delivery_id="h-1")
             r = c.post(f"{base}/v1/work-items", content=raw, headers=hdrs)
             assert r.status_code == 201
             jid = r.json()["job_id"]
-            hd, rw = signed({"decision": "approve", "approver": "lead"}, delivery_id="h-2")
+            hd, rw = signed("POST", f"/v1/jobs/{jid}/decision", {"decision": "approve", "approver": "lead"}, delivery_id="h-2")
             assert c.post(f"{base}/v1/jobs/{jid}/decision", content=rw, headers=hd).json()["status"] == "approved"
             assert c.post(f"{base}/v1/work-items", content=b"{}").status_code == 401
-            hd, _ = signed(None)
+            hd, _ = signed("GET", "/v1/nope", None)
             assert c.get(f"{base}/v1/nope", headers=hd).status_code == 404
         # the approved job now runs to completion through a worker
         job = Worker(hook_cfg, q, provider_factory=lambda: ScriptedProvider(steps_fix_calc())).run_once()
@@ -442,3 +455,86 @@ def test_expired_inflight_lease_is_retried(tmp_path, monkeypatch):
     assert d.deliver_pending()["delivered"] == 0  # lease still valid
     ob._conn.execute("UPDATE webhook_outbox SET next_attempt_at='2000-01-01'")  # lease expires
     assert d.deliver_pending()["delivered"] == 1
+
+
+# --------------------------------------------------------------------- review findings (2026-10-19)
+def test_concurrent_duplicate_deliveries_create_one_job(hook_cfg, work_item, receiver):
+    """Finding 6: two copies of the same delivery arriving at once (a platform retrying before the first
+    response lands) must produce one job and the same response, not two jobs and one ledger row."""
+    import threading
+
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    hdrs, raw = signed("POST", "/v1/work-items", _wi_body(work_item), delivery_id="dup-1")
+    results: list[tuple[int, dict]] = []
+    go = threading.Barrier(8)
+
+    def worker():
+        h = CommandHandler(hook_cfg, q)
+        go.wait()
+        results.append(h.handle("POST", "/v1/work-items", hdrs, raw))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(q.list()) == 1
+    assert sorted(r[0] for r in results) == [201] * 8
+    assert len({r[1]["job_id"] for r in results}) == 1
+    assert sum(1 for r in results if not r[1].get("replayed")) == 1
+
+
+def test_retried_submit_without_idempotency_key_reuses_the_job(hook_cfg, work_item, receiver):
+    """A platform that supplies no idempotency key still gets one job per delivery id, even across handler
+    instances (the delivery id becomes the work item's idempotency key)."""
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    hdrs, raw = signed("POST", "/v1/work-items", _wi_body(work_item), delivery_id="dup-2")
+    a = CommandHandler(hook_cfg, q).handle("POST", "/v1/work-items", hdrs, raw)
+    b = CommandHandler(hook_cfg, q).handle("POST", "/v1/work-items", hdrs, raw)
+    assert a[0] == b[0] == 201 and a[1]["job_id"] == b[1]["job_id"] and b[1]["replayed"]
+    assert q.get(a[1]["job_id"]).work_item.idempotency_key == "delivery:dup-2"
+
+
+def test_approval_requested_event_is_redacted(hook_cfg, work_item, receiver):
+    """A canary in the work item was redacted in job.submitted but sent verbatim in approval.requested."""
+    canary = hook_cfg.policy.canary_strings[0]
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    h = CommandHandler(hook_cfg, q)
+    body = _wi_body(work_item, description=f"please use token {canary} to log in")
+    hdrs, raw = signed("POST", "/v1/work-items", body, delivery_id="r-1")
+    assert h.handle("POST", "/v1/work-items", hdrs, raw)[0] == 201
+    for ev in receiver.events:
+        assert canary not in json.dumps(ev), ev["type"]
+    assert "[REDACTED]" in receiver.of("approval.requested")[0]["data"]["description"]
+
+
+def test_outbox_insert_failure_spills_and_is_recovered(hook_cfg, work_item, receiver, monkeypatch):
+    """An outbox insert that fails on database contention was swallowed after the audit append, losing the
+    event for good. It is now spilled to a file and queued on the next delivery pass."""
+    import sqlite3
+
+    from gca.webhooks import Outbox
+
+    q = JobQueue(hook_cfg.db_path)
+    pub = webhooks.install(hook_cfg)
+    real_add = Outbox.add
+    calls = {"n": 0}
+
+    def flaky_add(self, event, urls):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_add(self, event, urls)
+
+    monkeypatch.setattr(Outbox, "add", flaky_add)
+    hook_cfg.webhooks.deliver_inline = False  # so the spill is visible before a delivery pass picks it up
+    job = q.submit(work_item)
+    AuditLog(hook_cfg.audit_dir, job.id).record("alice", "submitted", work_item=work_item.model_dump())
+    # job.submitted (the failing insert) was spilled; approval.requested (the next insert) was queued normally
+    assert calls["n"] == 2 and pub.outbox.spill_path.exists()
+    assert not receiver.of("job.submitted")
+    webhooks.flush(hook_cfg)
+    assert calls["n"] == 3 and receiver.of("job.submitted") and not pub.outbox.spill_path.exists()

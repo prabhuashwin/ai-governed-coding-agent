@@ -138,6 +138,11 @@ class AgentLoop:
                               cost_usd=round(cost, 6), text=resp.text[:400],
                               tool_calls=[{"name": c.name} for c in resp.tool_calls])
             self.messages.append(resp.as_message())
+            # Token and cost caps apply to what this turn actually used, before any of its tool calls (including
+            # finish) are honoured; otherwise the final turn could exceed every limit and still succeed.
+            over = self.tracker.exceeded()
+            if over in ("max_input_tokens", "max_output_tokens", "max_cost_usd"):
+                return self._outcome(StopReason.BUDGET_EXHAUSTED, blocked=blocked, detail=over)
 
             calls = resp.tool_calls
             if not calls:

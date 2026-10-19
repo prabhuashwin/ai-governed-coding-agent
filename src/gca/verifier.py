@@ -15,7 +15,7 @@ from pathlib import Path
 
 from .config import PolicyConfig, WorkspaceConfig
 from .models import VerificationResult
-from .policy import PolicyEngine
+from .policy import PolicyEngine, PolicyViolation
 from .workspace import make_runner
 
 TEST_FILE_PATTERNS = [
@@ -72,6 +72,33 @@ def is_test_file(path: str) -> bool:
     return any(re.search(p, path) for p in TEST_FILE_PATTERNS)
 
 
+# How many tests a runner actually executed, from its summary line. Collection-time deselection (a planted
+# conftest.py, a changed pytest.ini) leaves test files untouched, so static counts miss it; the runner's own
+# count does not. Skipped/deselected tests are not counted as ran.
+_RAN_PATTERNS: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(?m)^(?:=+ )?((?:\d+ (?:passed|failed|errors?|xfailed|xpassed)(?:, )?)+)"), "pytest"),
+    (re.compile(r"(?m)^# tests (\d+)"), "node"),
+    (re.compile(r"(?m)^\s*Tests:\s+.*?(\d+) total"), "jest"),
+    (re.compile(r"(?m)^\s*(\d+ (?:passing|failing))\b"), "mocha"),
+]
+
+
+def tests_ran(output: str) -> int | None:
+    """Number of tests the runner executed, or None when the output has no recognisable summary."""
+    for rx, kind in _RAN_PATTERNS:
+        matches = rx.findall(output)
+        if not matches:
+            continue
+        if kind in ("node", "jest"):
+            return int(matches[-1])
+        counted = matches[-1:] if kind == "pytest" else matches
+        return sum(int(n) for m in counted
+                   for n in re.findall(r"(\d+) (?:passed|failed|errors?|xfailed|xpassed|passing|failing)", m))
+    if re.search(r"(?m)^no tests ran\b", output):
+        return 0
+    return None
+
+
 def _git(repo: Path, *args: str) -> str:
     cp = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True)
     if cp.returncode != 0:
@@ -95,7 +122,8 @@ def _count_tests(path: str, text: str) -> int:
 class Verifier:
     def __init__(self, repo_path: str | Path, base_commit: str, branch: str, test_command: list[str],
                  policy_cfg: PolicyConfig, *, timeout: int | None = None, run_fn: Callable | None = None,
-                 max_files_changed: int | None = None, max_lines_changed: int | None = None):
+                 max_files_changed: int | None = None, max_lines_changed: int | None = None,
+                 allowed_paths: list[str] | None = None, baseline_count: bool = True):
         self.repo = Path(repo_path).resolve()
         self.base = base_commit
         self.branch = branch
@@ -104,6 +132,11 @@ class Verifier:
         self.timeout = timeout or policy_cfg.command_timeout_seconds
         self.max_files_changed = max_files_changed
         self.max_lines_changed = max_lines_changed
+        # The work item's allowed write paths: the agent's file tools enforce them, but a command the agent runs
+        # can write anywhere in the worktree, so the diff is checked against them here as well.
+        self.allowed_paths = list(allowed_paths or [])
+        # Also run the test command at the base commit and require the branch to execute at least as many tests.
+        self.baseline_count = baseline_count
         # (argv, cwd, env, timeout) -> CommandResult; defaults to a host subprocess
         self.run_fn = run_fn or make_runner(WorkspaceConfig(), "verify")
 
@@ -131,6 +164,11 @@ class Verifier:
                     flags.append(f"tests_skipped:{path}:+{sa - sb}")
             if name in TEST_CONFIG_FILES and code.startswith(("M", "D")):
                 flags.append(f"test_config_modified:{path}")
+            elif name in TEST_CONFIG_FILES and code.startswith(("A", "C")):
+                # A new conftest.py / pytest.ini / jest.config.* can deselect tests without touching a test file.
+                flags.append(f"test_config_added:{path}")
+            elif name in TEST_CONFIG_FILES and code.startswith("R"):
+                flags.append(f"test_config_added:{parts[1]}->{path}")
         diff = _git(self.repo, "diff", "--no-color", f"{self.base}..{self.branch}")
         for path, added in _added_lines_by_file(diff).items():
             if not is_test_file(path) and Path(path).name not in TEST_CONFIG_FILES:
@@ -146,17 +184,33 @@ class Verifier:
                 notes.append(f"test file modified: {parts[-1]} (not weakened, but check the change)")
         return notes
 
+    def _run_at(self, rev: str, tmp: Path, name: str) -> tuple[int, str, PolicyEngine]:
+        """Check `rev` out fresh under `tmp` and run the test command there."""
+        wt = tmp / name
+        _git(self.repo, "worktree", "add", "--detach", str(wt), rev)
+        policy = PolicyEngine(self.policy_cfg, wt, self.allowed_paths)
+        res = self.run_fn(self.test_command, wt, policy.subprocess_env(), self.timeout)
+        shutil.rmtree(wt / ".gca-home", ignore_errors=True)
+        return res.exit_code, res.output, policy
+
     def verify(self) -> VerificationResult:
         flags = self.tamper_flags()
         notes = self.review_notes()
+        commit = _git(self.repo, "rev-parse", "--verify", f"{self.branch}^{{commit}}").strip()
         tmp = Path(tempfile.mkdtemp(prefix="gca-verify-"))
-        wt = tmp / "wt"
         try:
-            _git(self.repo, "worktree", "add", "--detach", str(wt), self.branch)
-            policy = PolicyEngine(self.policy_cfg, wt)
-            res = self.run_fn(self.test_command, wt, policy.subprocess_env(), self.timeout)
-            exit_code, out, ran = res.exit_code, res.output, res.exit_code != 127
-            shutil.rmtree(wt / ".gca-home", ignore_errors=True)
+            exit_code, out, policy = self._run_at(commit, tmp, "wt")
+            ran = exit_code != 127
+
+            if self.baseline_count and ran:
+                # The base commit is the trusted baseline for how many tests exist. If the branch executes fewer,
+                # tests were removed, skipped or deselected, however that was done.
+                _, base_out, _ = self._run_at(self.base, tmp, "base")
+                n_base, n_branch = tests_ran(base_out), tests_ran(out)
+                if n_base is not None and n_branch is not None and n_branch < n_base:
+                    flags.append(f"tests_ran_decreased:{n_base}->{n_branch}")
+                elif n_base is None or n_branch is None:
+                    notes.append("test runner output has no recognisable summary line; test count not compared")
 
             diff = _git(self.repo, "diff", "--no-color", f"{self.base}..{self.branch}")
             canaries = policy.find_canaries(diff)
@@ -176,11 +230,20 @@ class Verifier:
                 flags.append(f"diff_too_large:files:{len(files)}>{self.max_files_changed}")
             if self.max_lines_changed is not None and ins + dels > self.max_lines_changed:
                 flags.append(f"diff_too_large:lines:{ins + dels}>{self.max_lines_changed}")
+            # Every file the branch touches must be one the agent was allowed to write, whichever tool wrote it.
+            for path in files:
+                try:
+                    policy.resolve_path(path, for_write=True)
+                except PolicyViolation as e:
+                    flags.append(f"write_outside_policy:{path}:{e}")
             passed = ran and exit_code == 0 and not flags and bool(files)
             return VerificationResult(passed=passed, tests_ran=ran, exit_code=exit_code,
                                       output_tail=out[-4000:], flags=flags, files_changed=files,
-                                      insertions=ins, deletions=dels, notes=notes)
+                                      insertions=ins, deletions=dels, notes=notes, commit=commit)
         finally:
-            subprocess.run(["git", "worktree", "remove", "--force", str(wt)], cwd=str(self.repo), capture_output=True)
+            for name in ("wt", "base"):
+                if (tmp / name).exists():
+                    subprocess.run(["git", "worktree", "remove", "--force", str(tmp / name)], cwd=str(self.repo),
+                                   capture_output=True)
             shutil.rmtree(tmp, ignore_errors=True)
             subprocess.run(["git", "worktree", "prune"], cwd=str(self.repo), capture_output=True)

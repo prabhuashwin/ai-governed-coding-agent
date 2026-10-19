@@ -32,7 +32,8 @@ class FakeTableAPI:
             if f"{p}state=approved^{p}gca_job_idISEMPTY" in q:
                 rows = [r for r in rows if r[f"{p}state"] == "approved" and not r.get(f"{p}gca_job_id")]
             elif f"{p}gca_job_idISNOTEMPTY" in q:
-                rows = [r for r in rows if r.get(f"{p}gca_job_id") and r[f"{p}state"] in ("approved", "running")]
+                states = q.split(f"{p}stateIN", 1)[1].split("^", 1)[0].split(",")  # honour the states the query names
+                rows = [r for r in rows if r.get(f"{p}gca_job_id") and r[f"{p}state"] in states]
             return httpx.Response(200, json={"result": rows})
         if req.method == "PATCH":
             sys_id = req.url.path.rsplit("/", 1)[-1]
@@ -164,3 +165,22 @@ def test_field_prefix_for_global_custom_table(env, config):
     # query used the prefixed field names
     get = next(r for r in api.requests if r.method == "GET")
     assert "u_state=approved^u_gca_job_idISEMPTY" in parse_qs(get.url.query.decode())["sysparm_query"][0]
+
+
+# --------------------------------------------------------------- review findings (2026-10-19)
+def test_record_at_verifying_still_receives_the_final_status(env, config):
+    """`verifying` is written to ServiceNow but was not polled afterwards, so the final status, report and
+    audit hash never arrived for a record that was last seen verifying."""
+    api = FakeTableAPI([REC])
+    src = make_source(api)
+    q = JobQueue(config.db_path)
+    sync_once(config, q, src)
+    job = q.list()[0]
+    q.claim_next("w1")
+    q.transition(job.id, JobStatus.VERIFYING)
+    assert sync_once(config, q, src)["updated"] == ["WI0001001:verifying"]
+    assert api.records["abc123"]["state"] == "verifying"
+    q.finish(job.id, JobStatus.SUCCEEDED, result=RunResult(job_id=job.id, branch=f"gca/{job.id}", report_markdown="# ok"))
+    rep = sync_once(config, q, src)
+    assert rep["updated"] == ["WI0001001:succeeded"]
+    assert api.records["abc123"]["state"] == "succeeded" and len(api.patches[-1][1]["gca_audit_hash"]) == 64

@@ -114,29 +114,35 @@ def test_accepted_commands_are_safe(ws: Path, argv: list[str]):
 # ------------------------------------------------------------------ signatures
 @FUZZ
 @given(secret=st.text(min_size=1, max_size=30), body=st.binary(max_size=200), flip=st.integers(min_value=0, max_value=10_000),
-       which=st.sampled_from(["body", "sig", "ts", "secret"]))
+       which=st.sampled_from(["body", "sig", "ts", "secret", "method", "path", "delivery"]))
 def test_any_tampering_breaks_the_signature(secret: str, body: bytes, flip: int, which: str):
-    h = signed_headers(secret, body)
-    assert verify_signature(secret, h, body) is None
+    h = signed_headers(secret, "POST", "/hooks/gca", body)
+    assert verify_signature(secret, "POST", "/hooks/gca", h, body) is None
     if which == "body":
         if not body:
             body2 = b"x"
         else:
             i = flip % len(body)
             body2 = body[:i] + bytes([body[i] ^ 0x01]) + body[i + 1:]
-        assert verify_signature(secret, h, body2) is not None
+        assert verify_signature(secret, "POST", "/hooks/gca", h, body2) is not None
     elif which == "sig":
         sig = h["X-GCA-Signature"]
         i = 7 + flip % (len(sig) - 7)
         c = "0" if sig[i] != "0" else "1"
         h2 = {**h, "X-GCA-Signature": sig[:i] + c + sig[i + 1:]}
-        assert verify_signature(secret, h2, body) is not None
+        assert verify_signature(secret, "POST", "/hooks/gca", h2, body) is not None
     elif which == "ts":
         ts = str(int(h["X-GCA-Timestamp"]) + 1 + flip % 200)
         h2 = {**h, "X-GCA-Timestamp": ts}  # still inside the window, but the MAC covers the timestamp
-        assert verify_signature(secret, h2, body) is not None
+        assert verify_signature(secret, "POST", "/hooks/gca", h2, body) is not None
+    elif which == "method":
+        assert verify_signature(secret, "GET", "/hooks/gca", h, body) is not None
+    elif which == "path":
+        assert verify_signature(secret, "POST", "/hooks/gca/" + str(flip), h, body) is not None
+    elif which == "delivery":
+        assert verify_signature(secret, "POST", "/hooks/gca", {**h, "X-GCA-Delivery-Id": "dlv_" + str(flip)}, body) is not None
     else:
-        assert verify_signature(secret + "x", h, body) is not None
+        assert verify_signature(secret + "x", "POST", "/hooks/gca", h, body) is not None
 
 
 @FUZZ
@@ -145,8 +151,8 @@ def test_replay_window(skew: int):
     now = 1_800_000_000
     body = b"{}"
     ts = str(now + skew)
-    h = {"X-GCA-Timestamp": ts, "X-GCA-Signature": sign("k", ts, body)}
-    ok = verify_signature("k", h, body, max_skew_seconds=300, now=now) is None
+    h = {"X-GCA-Timestamp": ts, "X-GCA-Signature": sign("k", ts, "POST", "/h", "d1", body), "X-GCA-Delivery-Id": "d1"}
+    ok = verify_signature("k", "POST", "/h", h, body, max_skew_seconds=300, now=now) is None
     assert ok == (abs(skew) <= 300)
 
 

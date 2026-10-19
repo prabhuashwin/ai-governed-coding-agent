@@ -32,6 +32,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -61,37 +62,68 @@ RETRYABLE = {408, 425, 429}
 
 
 # ----------------------------------------------------------------------------- signing
-def sign(secret: str, timestamp: str, body: bytes) -> str:
-    mac = hmac.new(secret.encode("utf-8"), timestamp.encode("ascii") + b"." + body, hashlib.sha256)
+SIGNATURE_VERSION = "2"
+
+
+def signing_string(timestamp: str, method: str, path: str, delivery_id: str, body: bytes) -> bytes:
+    """What is MACed: every field that gives a request its meaning, newline-separated, body last.
+
+    Binding the method, path and delivery id (not only the timestamp and body, as version 1 did) means a
+    signed status GET cannot be replayed as a cancel POST, and a signed approval cannot be redirected to another
+    job by changing the unsigned path. The fixed fields may not contain newlines, so the encoding is unambiguous.
+    """
+    for name, value in (("timestamp", timestamp), ("method", method), ("path", path), ("delivery id", delivery_id)):
+        if "\n" in value or "\r" in value:
+            raise ValueError(f"{name} may not contain a newline")
+    head = "\n".join((SIGNATURE_VERSION, timestamp, method.upper(), path, delivery_id)) + "\n"
+    return head.encode("utf-8") + body
+
+
+def sign(secret: str, timestamp: str, method: str, path: str, delivery_id: str, body: bytes) -> str:
+    mac = hmac.new(secret.encode("utf-8"), signing_string(timestamp, method, path, delivery_id, body), hashlib.sha256)
     return "sha256=" + mac.hexdigest()
 
 
-def signed_headers(secret: str, body: bytes, *, delivery_id: str | None = None, event: str | None = None,
-                   timestamp: int | None = None) -> dict[str, str]:
+def request_path(url_or_path: str) -> str:
+    """The path component a signature binds: no scheme, host or query; `/` when empty."""
+    return urlsplit(url_or_path).path or "/"
+
+
+def signed_headers(secret: str, method: str, url_or_path: str, body: bytes, *, delivery_id: str | None = None,
+                   event: str | None = None, timestamp: int | None = None) -> dict[str, str]:
     ts = str(int(timestamp if timestamp is not None else time.time()))
-    h = {"Content-Type": "application/json", "X-GCA-Timestamp": ts, "X-GCA-Signature": sign(secret, ts, body),
-         "X-GCA-Delivery-Id": delivery_id or f"dlv_{uuid.uuid4().hex}", "User-Agent": "gca-webhooks/1"}
+    did = delivery_id if delivery_id is not None else f"dlv_{uuid.uuid4().hex}"
+    h = {"Content-Type": "application/json", "X-GCA-Timestamp": ts,
+         "X-GCA-Signature": sign(secret, ts, method, request_path(url_or_path), did, body),
+         "X-GCA-Signature-Version": SIGNATURE_VERSION, "X-GCA-Delivery-Id": did, "User-Agent": "gca-webhooks/2"}
     if event:
         h["X-GCA-Event"] = event
     return h
 
 
-def verify_signature(secret: str, headers: dict[str, str], body: bytes, *, max_skew_seconds: int = 300,
-                     now: float | None = None) -> str | None:
-    """Return None if valid, else a short reason. Header lookup is case-insensitive."""
+def verify_signature(secret: str, method: str, url_or_path: str, headers: dict[str, str], body: bytes, *,
+                     max_skew_seconds: int = 300, now: float | None = None) -> str | None:
+    """Return None if valid, else a short reason. `method` and `url_or_path` are the request as received.
+    Header lookup is case-insensitive."""
     low = {k.lower(): v for k, v in headers.items()}
-    ts, sig = low.get("x-gca-timestamp"), low.get("x-gca-signature")
+    ts, sig, did = low.get("x-gca-timestamp"), low.get("x-gca-signature"), low.get("x-gca-delivery-id", "")
     if not secret:
         return "receiver has no secret configured"
     if not ts or not sig:
         return "missing signature headers"
+    if low.get("x-gca-signature-version", SIGNATURE_VERSION) != SIGNATURE_VERSION:
+        return "unsupported signature version"
     try:
         age = abs((now if now is not None else time.time()) - int(ts))
     except ValueError:
         return "bad timestamp"
     if age > max_skew_seconds:
         return "timestamp outside allowed window"
-    if not hmac.compare_digest(sign(secret, ts, body), sig):
+    try:
+        expected = sign(secret, ts, method, request_path(url_or_path), did, body)
+    except ValueError as e:
+        return str(e)
+    if not hmac.compare_digest(expected, sig):
         return "signature mismatch"
     return None
 
@@ -120,6 +152,39 @@ class Outbox:
                     "INSERT OR IGNORE INTO webhook_outbox (id, url, type, job_id, payload, created_at, next_attempt_at) "
                     "VALUES (?,?,?,?,?,?,?)",
                     (event["id"], url, event["type"], event.get("job_id"), body, event["created_at"], event["created_at"]))
+
+    # An outbox insert can fail on transient database contention. The audit event has already been written by
+    # then, so the only alternative to losing the webhook is a durable fallback: one JSON line per event in a
+    # spill file next to the database, ingested by the next delivery pass.
+    @property
+    def spill_path(self) -> Path:
+        return self.db_path.with_name("webhook_spill.jsonl")
+
+    def add_or_spill(self, event: dict[str, Any], urls: list[str]) -> bool:
+        """Queue the event; on a database error write it to the spill file instead. Returns True if queued."""
+        try:
+            self.add(event, urls)
+            return True
+        except sqlite3.Error:
+            with self._lock, self.spill_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"event": event, "urls": urls}, default=str, ensure_ascii=False) + "\n")
+            return False
+
+    def ingest_spill(self) -> int:
+        """Move spilled events into the outbox. Lines the database still refuses stay in the file."""
+        if not self.spill_path.exists():
+            return 0
+        with self._lock:
+            lines = [ln for ln in self.spill_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.spill_path.unlink()
+        kept, moved = [], 0
+        for ln in lines:
+            rec = json.loads(ln)
+            if self.add_or_spill(rec["event"], rec["urls"]):
+                moved += 1
+            else:
+                kept.append(ln)
+        return moved
 
     def due(self, limit: int = 100, event_id: str | None = None) -> list[tuple]:
         # 'inflight' rows whose lease has expired belong to a deliverer that died mid-POST: retry them
@@ -183,6 +248,7 @@ class Deliverer:
     def deliver_pending(self, *, limit: int = 100, event_id: str | None = None,
                         timeout: float | None = None) -> dict[str, int]:
         stats = {"delivered": 0, "retry": 0, "dead": 0}
+        self.outbox.ingest_spill()
         rows = self.outbox.due(limit, event_id)
         if not rows:
             return stats
@@ -195,7 +261,7 @@ class Deliverer:
                 attempts += 1
                 try:
                     r = c.post(url, content=body,
-                               headers=signed_headers(self.secret, body, delivery_id=eid, event=etype))
+                               headers=signed_headers(self.secret, "POST", url, body, delivery_id=eid, event=etype))
                     code = r.status_code
                     err = None if 200 <= code < 300 else f"HTTP {code}: {r.text[:200]}"
                 except (httpx.TransportError, httpx.TimeoutException) as e:
@@ -272,25 +338,30 @@ def build_event(cfg: Config, ev: AuditEvent) -> dict[str, Any] | None:
         data = {"by": ev.actor}
     event = {"id": f"evt_{uuid.uuid4().hex}", "type": etype, "created_at": now_iso(), "source": cfg.webhooks.source_name,
              "job_id": ev.job_id if not ev.job_id.startswith("_") else None, "audit_seq": ev.seq, "data": data}
-    # never let a planted secret leave via a webhook
-    if cfg.policy.canary_strings:
-        text = json.dumps(event, default=str, ensure_ascii=False)
-        for c in cfg.policy.canary_strings:
-            if c:
-                text = text.replace(c, "[REDACTED]")
-        event = json.loads(text)
-    return event
+    return redact_event(cfg, event)
+
+
+def redact_event(cfg: Config, event: dict[str, Any]) -> dict[str, Any]:
+    """Never let a planted secret leave via a webhook, whichever event carries it."""
+    if not cfg.policy.canary_strings:
+        return event
+    text = json.dumps(event, default=str, ensure_ascii=False)
+    for c in cfg.policy.canary_strings:
+        if c:
+            text = text.replace(c, "[REDACTED]")
+    return json.loads(text)
 
 
 def approval_requested_event(cfg: Config, job: Job) -> dict[str, Any]:
     wi = job.work_item
-    return {"id": f"evt_{uuid.uuid4().hex}", "type": "approval.requested", "created_at": now_iso(),
-            "source": cfg.webhooks.source_name, "job_id": job.id, "audit_seq": None,
-            "data": {"title": wi.title, "description": wi.description[:4000], "acceptance_criteria": wi.acceptance_criteria,
-                     "requester": wi.requester, "repo_path": wi.repo_path, "allowed_paths": wi.allowed_paths,
-                     "budget": job.budget.model_dump(), "source": wi.source, "source_ref": wi.source_ref,
-                     "decide": {"method": "POST", "path": f"/v1/jobs/{job.id}/decision",
-                                "body": {"decision": "approve|reject", "approver": "<user>", "note": "", "conditions": []}}}}
+    return redact_event(cfg, {
+        "id": f"evt_{uuid.uuid4().hex}", "type": "approval.requested", "created_at": now_iso(),
+        "source": cfg.webhooks.source_name, "job_id": job.id, "audit_seq": None,
+        "data": {"title": wi.title, "description": wi.description[:4000], "acceptance_criteria": wi.acceptance_criteria,
+                 "requester": wi.requester, "repo_path": wi.repo_path, "allowed_paths": wi.allowed_paths,
+                 "budget": job.budget.model_dump(), "source": wi.source, "source_ref": wi.source_ref,
+                 "decide": {"method": "POST", "path": f"/v1/jobs/{job.id}/decision",
+                            "body": {"decision": "approve|reject", "approver": "<user>", "note": "", "conditions": []}}}})
 
 
 # ----------------------------------------------------------------------------- wiring
@@ -306,7 +377,7 @@ class WebhookPublisher:
     def publish(self, event: dict[str, Any]) -> None:
         if not self.cfg.webhooks.outbound_urls or not self.wanted(event["type"]):
             return
-        self.outbox.add(event, self.cfg.webhooks.outbound_urls)
+        self.outbox.add_or_spill(event, self.cfg.webhooks.outbound_urls)
         if self.cfg.webhooks.deliver_inline:
             try:
                 self.deliverer.deliver_pending(event_id=event["id"], timeout=min(self.cfg.webhooks.timeout_seconds, 3))

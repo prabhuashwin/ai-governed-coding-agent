@@ -49,18 +49,22 @@ dies leaves a stale heartbeat; `recover_stale` moves the job to `failed` with a 
 
 | Control | Where | Tested in |
 |---|---|---|
-| Path confinement, protected files, allowed write paths | `policy.resolve_path` | unit, safety |
+| Path confinement, protected files, allowed write paths (file tools) | `policy.resolve_path` | unit, safety |
+| Every file in the diff re-checked against the same rules, so commands cannot write where the file tools could not | `Verifier.verify` | safety |
 | Command allow-list, no shell operators, no absolute/traversal args | `policy.check_command` | unit, safety |
 | Secret-free subprocess environment | `policy.subprocess_env` | unit, safety |
 | Budgets (turns, tool calls, tokens, cost, time) | `BudgetTracker`, checked every turn and every tool call | unit, loop |
 | Blocked-action halt; blocked action ⇒ job fails | `AgentLoop`, `Worker` | loop, safety |
 | Canary secrets withheld from output, flagged in diff, redacted in audit | `ToolExecutor`, `Verifier`, `AuditLog` | safety |
-| Test tamper detection (deleted/renamed/skipped tests, fewer tests, config changes) | `Verifier.tamper_flags` | safety |
+| Test tamper detection (deleted/renamed/skipped tests, fewer test definitions, test config modified **or added**) | `Verifier.tamper_flags` | safety |
+| Fewer tests *executed* than at the base commit (catches collection-time deselection by any means) | `Verifier.verify`, baseline run | safety |
+| Host git never trusts the worktree's `.git` pointer: pinned git dir, empty hooks path, nested repos excluded | `workspace.PinnedGit` | unit |
 | Diff-size budget (files / lines changed) | `Verifier.verify` from `Budget` | safety |
 | Container isolation (no network, dropped caps, limits) for agent and verifier | `ContainerWorkspace`, `make_runner` | unit (fake runtime), real daemon when present |
-| Publishing is explicit and human-invoked; PRs open as drafts | `publish.py` | unit |
+| Publishing is explicit and human-invoked; PRs open as drafts; only the verified commit is pushed | `publish.py` | unit |
+| Webhook signatures bind method, path, delivery id and body; inbound delivery ids reserved before execution | `webhooks.sign`, `inbound.handle` | unit, fuzz |
 | Independent test run from clean checkout | `Verifier.verify` | safety, e2e |
-| Hash-chained audit log | `AuditLog`, `verify_chain` | unit, e2e |
+| Hash-chained audit log, appended under a cross-process lock | `AuditLog`, `verify_chain` | unit, e2e |
 | Idempotent submit, atomic claim, crash recovery | `JobQueue` | unit |
 
 ## Residual risks (pilot)

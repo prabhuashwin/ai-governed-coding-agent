@@ -52,7 +52,7 @@ def run_receiver(port: int, out_file: Path, gca_url: str, approver: str) -> None
     class H(BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802
             body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
-            reason = verify_signature(OUT_SECRET, dict(self.headers), body)
+            reason = verify_signature(OUT_SECRET, "POST", self.path, dict(self.headers), body)
             record = {"valid_signature": reason is None, "reason": reason, "headers_event": self.headers.get("X-GCA-Event")}
             if reason is None:
                 record["event"] = json.loads(body)
@@ -65,7 +65,7 @@ def run_receiver(port: int, out_file: Path, gca_url: str, approver: str) -> None
                 decide = json.dumps({"decision": "approve", "approver": approver, "note": "approved by e2e policy",
                                      "conditions": ["touch only stats.py"]}).encode()
                 path = ev["data"]["decide"]["path"]
-                h = signed_headers(IN_SECRET, decide, delivery_id=f"koru-{uuid.uuid4().hex}")
+                h = signed_headers(IN_SECRET, "POST", path, decide, delivery_id=f"koru-{uuid.uuid4().hex}")
                 try:
                     httpx.post(gca_url + path, content=decide, headers=h, timeout=10)
                 except httpx.HTTPError as e:  # recorded, the driver will notice the job never runs
@@ -99,7 +99,7 @@ def read_events(out_file: Path) -> list[dict]:
 
 def signed_post(client: httpx.Client, url: str, body: dict) -> httpx.Response:
     raw = json.dumps(body).encode()
-    return client.post(url, content=raw, headers=signed_headers(IN_SECRET, raw, delivery_id=f"drv-{uuid.uuid4().hex}"))
+    return client.post(url, content=raw, headers=signed_headers(IN_SECRET, "POST", url, raw, delivery_id=f"drv-{uuid.uuid4().hex}"))
 
 
 def main() -> int:
@@ -196,7 +196,7 @@ def main() -> int:
             checks["verified_independently"] = bool((fd.get("verification") or {}).get("passed"))
             checks["audit_hash_present"] = len(fd.get("audit_tail_hash", "")) == 64
 
-            hd = signed_headers(IN_SECRET, b"")
+            hd = signed_headers(IN_SECRET, "GET", f"/v1/jobs/{job_id}", b"")
             st = c.get(f"{gca_url}/v1/jobs/{job_id}", headers=hd).json()
             checks["status_endpoint_agrees"] = st.get("status") == fd.get("status") and st.get("approver") == "koru-approver"
             on = signed_post(c, f"{gca_url}/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "reason": "drill"})

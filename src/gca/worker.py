@@ -119,11 +119,18 @@ class Worker:
             verifier = Verifier(wi.repo_path, ws.base_commit, ws.branch, wi.test_command, self.cfg.policy,
                                 run_fn=make_runner(self.cfg.workspace, job.id),
                                 max_files_changed=job.budget.max_files_changed,
-                                max_lines_changed=job.budget.max_lines_changed)
+                                max_lines_changed=job.budget.max_lines_changed,
+                                allowed_paths=wi.allowed_paths)
             verification = verifier.verify()
             result.verification = verification
             audit.record("verifier", "verified", passed=verification.passed, flags=verification.flags,
                          exit_code=verification.exit_code, files_changed=verification.files_changed)
+
+            if self.queue.cancel_requested(job.id):  # asked to stop while verifying: never report success
+                job = self.queue.finish(job.id, JobStatus.CANCELLED, result=result, error="cancelled during verification")
+                audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value,
+                             error="cancelled during verification")
+                return job
 
             policy_clean = outcome.blocked_actions == 0 or not self.cfg.policy.fail_on_any_blocked_action
             ok = verification.passed and outcome.stop_reason == StopReason.FINISHED and policy_clean

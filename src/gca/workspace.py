@@ -46,10 +46,6 @@ ARTIFACT_EXCLUDES = [":(exclude,glob)**/__pycache__/**", ":(exclude,glob)**/*.py
                      ":(exclude,glob)**/.gca-home/**"]
 
 
-def _stage(root: Path, *extra: str) -> None:
-    _git(root, "add", "-A", *extra, "--", ".", *ARTIFACT_EXCLUDES, check=False)
-
-
 def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env.setdefault("GIT_AUTHOR_NAME", "gca")
@@ -57,6 +53,43 @@ def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProc
     env.setdefault("GIT_COMMITTER_NAME", "gca")
     env.setdefault("GIT_COMMITTER_EMAIL", "gca@localhost")
     return subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True, check=check, env=env)
+
+
+class PinnedGit:
+    """Host git commands for a worktree the agent can write to.
+
+    A worktree's `.git` is a plain file pointing at the main repository's metadata. The agent (or code it runs)
+    can rewrite it to point at metadata of its own, with hooks that the next host `git commit` would execute
+    with the worker's environment. So host git never *discovers* the repository from the worktree: it is given
+    the git dir that `worktree add` created (which lives under the main repository, outside anything the agent
+    can reach) and a hooks path that is an empty directory outside the worktree.
+    """
+
+    def __init__(self, git_dir: Path, work_tree: Path, hooks_dir: Path):
+        self.git_dir, self.work_tree, self.hooks_dir = git_dir, work_tree, hooks_dir
+        hooks_dir.mkdir(parents=True, exist_ok=True)
+
+    def __call__(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+        return _git(self.work_tree, "--git-dir", str(self.git_dir), "--work-tree", str(self.work_tree),
+                    "-c", f"core.hooksPath={self.hooks_dir}", "-c", "core.fsmonitor=false", *args, check=check)
+
+    def stage(self, *extra: str) -> None:
+        self("add", "-A", *extra, "--", ".", *ARTIFACT_EXCLUDES, *self._nested_repo_excludes(), check=False)
+
+    def _nested_repo_excludes(self) -> list[str]:
+        """Pathspecs excluding any repository nested inside the worktree (other than the worktree's own `.git`).
+
+        `git add -A` either embeds such a directory as a gitlink or aborts outright; a job branch must do neither.
+        """
+        out: list[str] = []
+        for dirpath, dirnames, filenames in os.walk(self.work_tree):
+            rel = Path(dirpath).relative_to(self.work_tree).as_posix()
+            if rel != "." and (".git" in dirnames or ".git" in filenames):
+                out.append(f":(exclude){rel}/**")
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if d not in (".git", "node_modules", "__pycache__")]
+        return out
 
 
 class GitWorktreeWorkspace:
@@ -72,6 +105,11 @@ class GitWorktreeWorkspace:
         # -B: reuse the branch name if a previous attempt left it behind
         _git(self.repo, "worktree", "add", "-B", self.branch, str(self.root), base)
         self.root = self.root.resolve()
+        # Resolve the worktree's git dir once, now, before the agent has run anything; every later host git
+        # command is pinned to it (see PinnedGit).
+        git_dir = Path(_git(self.root, "rev-parse", "--absolute-git-dir").stdout.strip()).resolve()
+        git_dir.relative_to(self.repo)  # must live under the main repository, never under the worktree
+        self.git = PinnedGit(git_dir, self.root, self._tmp / "nohooks")
 
     # ----------------------------------------------------------------- exec
     def run(self, argv: list[str], *, env: dict[str, str], timeout: int) -> CommandResult:
@@ -90,17 +128,17 @@ class GitWorktreeWorkspace:
 
     # ------------------------------------------------------------------ git
     def diff(self) -> str:
-        _stage(self.root, "--intent-to-add")
-        return _git(self.root, "diff", "--no-color", self.base_commit).stdout
+        self.git.stage("--intent-to-add")
+        return self.git("diff", "--no-color", self.base_commit).stdout
 
     def changed_files(self) -> list[str]:
-        _stage(self.root, "--intent-to-add")
-        out = _git(self.root, "diff", "--name-only", self.base_commit).stdout
+        self.git.stage("--intent-to-add")
+        out = self.git("diff", "--name-only", self.base_commit).stdout
         return [line for line in out.splitlines() if line.strip()]
 
     def diff_stat(self) -> tuple[int, int]:
-        _stage(self.root, "--intent-to-add")
-        out = _git(self.root, "diff", "--numstat", self.base_commit).stdout
+        self.git.stage("--intent-to-add")
+        out = self.git("diff", "--numstat", self.base_commit).stdout
         ins = dels = 0
         for line in out.splitlines():
             parts = line.split("\t")
@@ -110,11 +148,11 @@ class GitWorktreeWorkspace:
         return ins, dels
 
     def commit_all(self, message: str) -> str | None:
-        _stage(self.root)
-        if not _git(self.root, "diff", "--cached", "--name-only").stdout.strip():
+        self.git.stage()
+        if not self.git("diff", "--cached", "--name-only").stdout.strip():
             return None
-        _git(self.root, "commit", "-q", "-m", message)
-        return _git(self.root, "rev-parse", "HEAD").stdout.strip()
+        self.git("commit", "-q", "-m", message)
+        return self.git("rev-parse", "HEAD").stdout.strip()
 
     def cleanup(self, *, keep_branch: bool = True) -> None:
         _git(self.repo, "worktree", "remove", "--force", str(self.root), check=False)
@@ -249,8 +287,8 @@ class ContainerWorkspace(GitWorktreeWorkspace):
 
     def diff(self) -> str:
         # exclude the scratch HOME the container uses
-        _stage(self.root, "--intent-to-add")
-        return _git(self.root, "diff", "--no-color", self.base_commit, "--", ".", ":(exclude).gca-home").stdout
+        self.git.stage("--intent-to-add")
+        return self.git("diff", "--no-color", self.base_commit, "--", ".", ":(exclude).gca-home").stdout
 
     def commit_all(self, message: str) -> str | None:
         shutil.rmtree(self.root / ".gca-home", ignore_errors=True)
