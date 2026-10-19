@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -164,7 +166,9 @@ def test_rewritten_git_pointer_cannot_run_hooks_on_the_host(calc_repo: Path, tmp
         hook = hooks / "pre-commit"
         hook.write_text(f"#!/bin/sh\necho pwned > '{marker}'\n")
         hook.chmod(0o755)
-        (ws.root / ".git").write_text("gitdir: evilgit/.git\n")  # what the agent (or its code) would do
+        pointer = ws.root / ".git"
+        os.chmod(pointer, stat.S_IWRITE | stat.S_IREAD)  # git marks it read-only on Windows; an attacker clears that
+        pointer.write_text("gitdir: evilgit/.git\n")  # what the agent (or its code) would do
         ex.execute("edit_file", {"path": "calc.py", "old": CALC_FIX_OLD, "new": CALC_FIX_NEW})
         sha = ws.commit_all("fix")
         assert not marker.exists(), "hook from agent-controlled git metadata ran on the host"
