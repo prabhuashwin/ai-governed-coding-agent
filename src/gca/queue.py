@@ -69,7 +69,7 @@ class JobQueue:
             """CREATE TABLE IF NOT EXISTS controls (
                    name TEXT PRIMARY KEY, value TEXT NOT NULL, reason TEXT, set_by TEXT, set_at TEXT NOT NULL)"""
         )
-        add_column_if_missing(self._conn, "controls", "delivery_id", "TEXT")  # databases from before 0.1.1
+        add_column_if_missing(self._conn, "controls", "delivery_id", "TEXT")  # databases from before 0.2.0
 
     def close(self) -> None:
         self._conn.close()
