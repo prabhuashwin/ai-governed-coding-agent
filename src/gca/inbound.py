@@ -366,7 +366,10 @@ def make_server(cfg: Config, queue: JobQueue, host: str | None = None, port: int
                 self._respond(413, {"error": "body too large"})
                 return
             body = self.rfile.read(length) if length else b""
-            status, payload = handler_logic.handle(method, self.path.split("?", 1)[0], dict(self.headers), body)
+            try:
+                status, payload = handler_logic.handle(method, self.path.split("?", 1)[0], dict(self.headers), body)
+            except Exception as e:  # noqa: BLE001 - the caller must always get a response, never a dropped socket
+                status, payload = 500, {"error": f"internal error: {type(e).__name__}"}
             self._respond(status, payload)
 
         def do_POST(self) -> None:  # noqa: N802

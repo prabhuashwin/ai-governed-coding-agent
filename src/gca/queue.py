@@ -10,6 +10,7 @@ Guarantees tested:
 from __future__ import annotations
 
 import builtins
+import json
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -253,9 +254,14 @@ class JobQueue:
                     "delivery_id=excluded.delivery_id",
                     ("on" if enabled else "off", reason, actor, now_iso(), delivery_id))
                 outcome = "applied"
-            status = 409 if outcome == "superseded" else 200
-            cur.execute("UPDATE inbound_deliveries SET status=?, response=? WHERE id=?",
-                        (status, response if outcome == "applied" else "", delivery_id))
+            # Every outcome records a valid JSON response: a replay of this delivery id is answered from the
+            # row, so an empty body here would turn the second retry into a server error.
+            if outcome == "superseded":
+                status, body = 409, json.dumps({"error": "superseded: the kill switch was changed after this "
+                                                         "delivery was first received", "delivery_id": delivery_id})
+            else:
+                status, body = 200, response
+            cur.execute("UPDATE inbound_deliveries SET status=?, response=? WHERE id=?", (status, body, delivery_id))
             cur.execute("COMMIT")
             return outcome
         except Exception:
@@ -296,6 +302,10 @@ class JobQueue:
             final, why = status, error
             if job.cancel_requested and status == JobStatus.SUCCEEDED:
                 final, why = JobStatus.CANCELLED, "cancelled during verification"
+            elif status == JobStatus.SUCCEEDED and (self.kill_switch_record() or {}).get("value") == "on":
+                # Same rule for the emergency stop, read inside this write transaction: a switch engaged at any
+                # point before the success commits wins, even if every command happened to finish between polls.
+                final, why = JobStatus.CANCELLED, "kill_switch"
             if final not in TRANSITIONS[job.status]:
                 raise InvalidTransition(f"{job.status.value} -> {final.value} is not allowed for {job_id}")
             job.status, job.error = final, why

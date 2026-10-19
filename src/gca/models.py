@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sqlite3
 import uuid
 import weakref
@@ -9,7 +10,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def open_db(owner: object, path: str) -> sqlite3.Connection:
@@ -103,6 +104,10 @@ TRANSITIONS: dict[JobStatus, set[JobStatus]] = {
 class Budget(BaseModel):
     """Hard limits enforced by the harness. The model cannot change these."""
 
+    # NaN/inf are rejected at the boundary: NaN compares false against every limit (so it would slip past the
+    # "may only lower" checks), serialises as null and makes the stored job unreadable.
+    model_config = ConfigDict(allow_inf_nan=False)
+
     max_turns: int = 30
     max_input_tokens: int = 400_000
     max_output_tokens: int = 60_000
@@ -138,6 +143,14 @@ class Restrictions(BaseModel):
     allowed_paths: list[str] | None = None
     allowed_commands: list[str] | None = None
     budget: dict[str, float | int] | None = None
+
+    @field_validator("budget")
+    @classmethod
+    def _finite_budget(cls, v: dict[str, float | int] | None) -> dict[str, float | int] | None:
+        for k, x in (v or {}).items():
+            if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
+                raise ValueError(f"budget.{k} must be a finite non-negative number")
+        return v
 
     _BUDGET_FIELDS = ("max_turns", "max_input_tokens", "max_output_tokens", "max_cost_usd", "max_seconds",
                       "max_tool_calls", "max_files_changed", "max_lines_changed")

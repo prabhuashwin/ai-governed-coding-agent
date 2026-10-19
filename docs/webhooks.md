@@ -178,7 +178,7 @@ only **narrow** what the work item and the operator's policy already allow:
 | Field | Effect | Rejected when |
 |---|---|---|
 | `allowed_paths` | replaces the work item's `allowed_paths`; writes elsewhere are blocked by the policy engine and flagged by the verifier (`write_outside_policy`) | a path is not inside the work item's allowed paths, or the list is empty |
-| `allowed_commands` | the agent may only run these commands (`run_tests` is unaffected) | a command is not in the operator's `[policy] allowed_commands`, or the list is empty |
+| `allowed_commands` | the agent may only run these commands via `run_command`; `run_tests` (the work item's approved test command) is checked against the operator's policy and is unaffected | a command is not in the operator's `[policy] allowed_commands`, or the list is empty |
 | `budget` | lowers any of the budget fields for this job | a value would raise the budget, or the field is unknown |
 
 Every field is optional; omit the whole object for an unrestricted approval. The response echoes what is now

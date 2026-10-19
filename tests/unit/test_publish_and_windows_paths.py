@@ -59,7 +59,7 @@ def test_publish_pushes_branch_and_opens_draft_pr(config, succeeded_job, monkeyp
 
     # make the bare remote look like GitHub for slug detection
     git(job.work_item.repo_path, "remote", "set-url", "origin", str(bare))
-    monkeypatch.setattr("gca.publish.github_slug", lambda url: "o/r")
+    monkeypatch.setattr("gca.publish.github_slug", lambda url, host=None: "o/r")
     res = publish_job(config, q, job.id, transport=httpx.MockTransport(api))
     assert res.pr_url == "https://github.com/o/r/pull/7"
     assert seen["url"].endswith("/repos/o/r/pulls") and seen["auth"] == "Bearer ghp_test"
@@ -76,7 +76,7 @@ def test_publish_without_token_pushes_only(config, succeeded_job, monkeypatch):
     q, job, bare = succeeded_job
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.setattr("gca.publish.github_slug", lambda url: "o/r")
+    monkeypatch.setattr("gca.publish.github_slug", lambda url, host=None: "o/r")
     res = publish_job(config, q, job.id)
     assert res.pr_url is None and "GITHUB_TOKEN" in res.note
     assert job.result.branch in git(job.work_item.repo_path, "ls-remote", "--heads", "origin")
@@ -101,7 +101,7 @@ def test_publish_refuses_failed_jobs_unless_forced(config, work_item, calc_repo,
 def test_publish_existing_pr_is_reported(config, succeeded_job, monkeypatch):
     q, job, bare = succeeded_job
     monkeypatch.setenv("GITHUB_TOKEN", "t")
-    monkeypatch.setattr("gca.publish.github_slug", lambda url: "o/r")
+    monkeypatch.setattr("gca.publish.github_slug", lambda url, host=None: "o/r")
 
     def api(req: httpx.Request) -> httpx.Response:
         if req.method == "POST":

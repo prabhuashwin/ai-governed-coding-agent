@@ -100,9 +100,13 @@ class ToolResult:
 
 class ToolExecutor:
     def __init__(self, workspace: Workspace, policy: PolicyEngine, test_command: list[str],
-                 stop_check: Callable[[], bool] | None = None):
+                 stop_check: Callable[[], bool] | None = None, test_policy: PolicyEngine | None = None):
         self.ws = workspace
         self.policy = policy
+        # The work item's test command is part of what the human approved and is what the verifier runs; it is
+        # checked against the operator's policy (`test_policy`), not against an approval's narrowed command
+        # list, so narrowing `allowed_commands` can never turn `run_tests` into a blocked action.
+        self.test_policy = test_policy or policy
         self.test_command = test_command
         self.stop_check = stop_check  # polled while a command runs, so a stop request ends it at once
         self._last_interrupted = False
@@ -213,8 +217,8 @@ class ToolExecutor:
         _write_exact(p, text.replace(old, new, 1))
         return f"edited {path}"
 
-    def _run(self, argv: list[str]) -> str:
-        argv = self.policy.check_command(list(argv))
+    def _run(self, argv: list[str], policy: PolicyEngine | None = None) -> str:
+        argv = (policy or self.policy).check_command(list(argv))
         res = self.ws.run(argv, env=self.policy.subprocess_env(), timeout=self.policy.cfg.command_timeout_seconds,
                           stop_check=self.stop_check)
         self._last_interrupted = res.interrupted
@@ -226,7 +230,7 @@ class ToolExecutor:
         return self._run(argv)
 
     def _t_run_tests(self) -> str:
-        return self._run(list(self.test_command))
+        return self._run(list(self.test_command), policy=self.test_policy)
 
     def _t_finish(self, summary: str, success: bool) -> str:
         return "finished"
