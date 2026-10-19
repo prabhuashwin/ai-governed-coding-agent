@@ -549,12 +549,12 @@ def test_abandoned_reservation_is_taken_over_by_a_retry(hook_cfg, work_item, rec
     h = CommandHandler(hook_cfg, q)
     hdrs, raw = signed("POST", "/v1/work-items", _wi_body(work_item), delivery_id="crash-1")
     # simulate the crash: the reservation exists, nothing else happened
-    h._conn.execute("INSERT INTO inbound_deliveries VALUES (?,?,0,'')", ("crash-1", "2026-01-01T00:00:00+00:00"))
+    h._conn.execute("INSERT INTO inbound_deliveries (id, received_at, status, response, first_received_at) VALUES (?,?,0,'',?)", ("crash-1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"))
     status, resp = h.handle("POST", "/v1/work-items", hdrs, raw)
     assert status == 201 and not resp.get("replayed")
     assert len(q.list()) == 1
     # and a fresh (recent) reservation is still respected
-    h._conn.execute("INSERT INTO inbound_deliveries VALUES (?,?,0,'')", ("live-1", webhooks.now_iso()))
+    h._conn.execute("INSERT INTO inbound_deliveries (id, received_at, status, response, first_received_at) VALUES (?,?,0,'',?)", ("live-1", webhooks.now_iso(), webhooks.now_iso()))
     hdrs, raw = signed("POST", "/v1/work-items", _wi_body(work_item), delivery_id="live-1")
     assert h._replay("live-1", wait_seconds=0.1)[0] == 409
 
@@ -596,7 +596,7 @@ def test_expired_kill_switch_delivery_cannot_undo_a_newer_stop(hook_cfg, work_it
     h = CommandHandler(hook_cfg, q)
     # the old OFF: applied (control row written with its delivery id), response never recorded, reservation stale
     set_kill_switch(hook_cfg, q, False, reason="resolved", actor="secops", via="webhook", delivery_id="off-1")
-    h._conn.execute("INSERT INTO inbound_deliveries VALUES (?,?,0,'')", ("off-1", "2026-01-01T00:00:00+00:00"))
+    h._conn.execute("INSERT INTO inbound_deliveries (id, received_at, status, response, first_received_at) VALUES (?,?,0,'',?)", ("off-1", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"))
     # a newer ON lands normally
     hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "reason": "incident"}, delivery_id="on-2")
     assert h.handle("POST", "/v1/controls/kill-switch", hd, rw)[0] == 200 and q.kill_switch() is not None
@@ -606,8 +606,88 @@ def test_expired_kill_switch_delivery_cannot_undo_a_newer_stop(hook_cfg, work_it
     assert status == 409 and "superseded" in resp["error"]
     assert q.kill_switch() is not None, "a stale delivery cleared an emergency stop"
     # and a taken-over delivery whose change is still the latest is recognised, not re-applied
-    h._conn.execute("INSERT INTO inbound_deliveries VALUES (?,?,0,'')", ("on-3", "2026-01-01T00:00:00+00:00"))
+    h._conn.execute("INSERT INTO inbound_deliveries (id, received_at, status, response, first_received_at) VALUES (?,?,0,'',?)", ("on-3", "2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"))
     set_kill_switch(hook_cfg, q, True, reason="drill", actor="secops", via="webhook", delivery_id="on-3")
     hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "reason": "drill"}, delivery_id="on-3")
     status, resp = h.handle("POST", "/v1/controls/kill-switch", hd, rw)
     assert status == 200 and resp.get("already_applied") is True
+
+
+# --------------------------------------------------------------------- review round 4 (2026-10-19)
+def _stale_reservation(h, delivery_id, first="2026-01-01T00:00:00+00:00"):
+    h._conn.execute("INSERT OR REPLACE INTO inbound_deliveries (id, received_at, status, response, first_received_at) "
+                    "VALUES (?,?,0,'',?)", (delivery_id, first, first))
+
+
+def test_kill_switch_check_and_update_are_one_transaction(hook_cfg, work_item, receiver):
+    """A newer ON committing between the supersession check and the retried OFF's update used to leave the
+    switch OFF. Many stale-OFF retries racing an ON (separate connections) must always end with the stop on."""
+    import threading
+
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    handlers = [CommandHandler(hook_cfg, JobQueue(hook_cfg.db_path)) for _ in range(6)]
+    for i, h in enumerate(handlers):
+        _stale_reservation(h, f"off-{i}")
+    go = threading.Barrier(7)
+
+    def retry_off(i):
+        go.wait()
+        hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": False, "actor": "secops", "reason": "old"},
+                        delivery_id=f"off-{i}")
+        handlers[i].handle("POST", "/v1/controls/kill-switch", hd, rw)
+
+    def turn_on():
+        go.wait()
+        hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "reason": "incident"},
+                        delivery_id="on-now")
+        assert CommandHandler(hook_cfg, q).handle("POST", "/v1/controls/kill-switch", hd, rw)[0] == 200
+
+    ts = [threading.Thread(target=retry_off, args=(i,)) for i in range(6)] + [threading.Thread(target=turn_on)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert q.kill_switch() is not None, "a stale OFF retry cleared a newer emergency stop"
+
+
+def test_repeated_takeover_keeps_the_first_received_time(hook_cfg, work_item, receiver, monkeypatch):
+    """Taking over an abandoned reservation renews the lease only. If that copy also dies, the next one must
+    still judge supersession from when the delivery was *first* received."""
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    h = CommandHandler(hook_cfg, q)
+    _stale_reservation(h, "off-x", first="2026-01-01T00:00:00+00:00")
+    # first takeover crashes inside the command
+    monkeypatch.setattr(JobQueue, "apply_kill_switch_delivery", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": False, "actor": "secops", "reason": "old"}, delivery_id="off-x")
+    with pytest.raises(RuntimeError):
+        h.handle("POST", "/v1/controls/kill-switch", hd, rw)
+    row = h._conn.execute("SELECT status, first_received_at FROM inbound_deliveries WHERE id='off-x'").fetchone()
+    assert row == (0, "2026-01-01T00:00:00+00:00")  # released for retry, first-received time untouched, row kept
+    monkeypatch.undo()
+    # a newer ON lands, then the OFF is retried a second time
+    hd2, rw2 = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "reason": "incident"}, delivery_id="on-y")
+    assert h.handle("POST", "/v1/controls/kill-switch", hd2, rw2)[0] == 200
+    status, resp = h.handle("POST", "/v1/controls/kill-switch", hd, rw)
+    assert status == 409 and "superseded" in resp["error"] and q.kill_switch() is not None
+
+
+def test_audit_failure_after_the_control_change_keeps_the_delivery_record(hook_cfg, work_item, receiver, monkeypatch):
+    """An audit-write error after the control change committed used to delete the reservation, so a later retry
+    of that OFF ran as a fresh delivery and cleared a newer ON."""
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    h = CommandHandler(hook_cfg, q)
+    from gca import inbound as inbound_mod
+
+    monkeypatch.setattr(inbound_mod.AuditLog, "record", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": False, "actor": "secops", "reason": "resolved"}, delivery_id="off-a")
+    status, resp = h.handle("POST", "/v1/controls/kill-switch", hd, rw)
+    assert status == 200 and resp["audit_recorded"] is False
+    assert h._conn.execute("SELECT status FROM inbound_deliveries WHERE id='off-a'").fetchone()[0] == 200
+    monkeypatch.undo()
+    hd2, rw2 = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "reason": "incident"}, delivery_id="on-b")
+    assert h.handle("POST", "/v1/controls/kill-switch", hd2, rw2)[0] == 200
+    status, resp = h.handle("POST", "/v1/controls/kill-switch", hd, rw)  # the OFF retried
+    assert resp.get("replayed") is True and q.kill_switch() is not None

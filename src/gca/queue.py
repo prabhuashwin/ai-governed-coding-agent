@@ -14,7 +14,19 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .models import TRANSITIONS, Approval, Budget, Job, JobStatus, RunResult, WorkItem, now_iso, open_db
+from .models import (
+    TRANSITIONS,
+    Approval,
+    Budget,
+    Job,
+    JobStatus,
+    RunResult,
+    WorkItem,
+    add_column_if_missing,
+    now_iso,
+    open_db,
+    set_wal,
+)
 
 
 class InvalidTransition(Exception):
@@ -39,7 +51,7 @@ class JobQueue:
         # open *inside* that transaction, so a later ROLLBACK would undo it. Every operation therefore takes
         # this re-entrant lock, not only the explicit transactions.
         self._txn = threading.RLock()
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        set_wal(self._conn)
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS jobs (
@@ -57,8 +69,7 @@ class JobQueue:
             """CREATE TABLE IF NOT EXISTS controls (
                    name TEXT PRIMARY KEY, value TEXT NOT NULL, reason TEXT, set_by TEXT, set_at TEXT NOT NULL)"""
         )
-        if "delivery_id" not in {r[1] for r in self._conn.execute("PRAGMA table_info(controls)")}:
-            self._conn.execute("ALTER TABLE controls ADD COLUMN delivery_id TEXT")  # databases from before 0.1.1
+        add_column_if_missing(self._conn, "controls", "delivery_id", "TEXT")  # databases from before 0.2.0
 
     def close(self) -> None:
         self._conn.close()
@@ -199,6 +210,43 @@ class JobQueue:
             "ON CONFLICT(name) DO UPDATE SET value=excluded.value, reason=excluded.reason, "
             "set_by=excluded.set_by, set_at=excluded.set_at, delivery_id=excluded.delivery_id",
             ("on" if enabled else "off", reason, actor, now_iso(), delivery_id))
+
+    @_serialised
+    def apply_kill_switch_delivery(self, delivery_id: str, first_received_at: str, enabled: bool, *, reason: str,
+                                   actor: str, response: str) -> str:
+        """Apply a kill-switch command that arrived as webhook delivery `delivery_id`, atomically with its outcome.
+
+        One write transaction covers: the supersession check (has the switch been changed since this delivery was
+        *first* received?), the control update, and recording the delivery as done in `inbound_deliveries`. So a
+        newer change cannot slip in between the check and the update, and a crash or audit failure after the
+        commit cannot leave the delivery looking never-applied. Returns "applied", "already_applied" or
+        "superseded"; the latter two change nothing.
+        """
+        cur = self._conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            row = cur.execute(
+                "SELECT value, set_at, delivery_id FROM controls WHERE name='kill:global'").fetchone()
+            if row and row[2] == delivery_id:
+                outcome = "already_applied"
+            elif row and (row[1] or "") > first_received_at:
+                outcome = "superseded"
+            else:
+                cur.execute(
+                    "INSERT INTO controls (name, value, reason, set_by, set_at, delivery_id) "
+                    "VALUES ('kill:global', ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value, "
+                    "reason=excluded.reason, set_by=excluded.set_by, set_at=excluded.set_at, "
+                    "delivery_id=excluded.delivery_id",
+                    ("on" if enabled else "off", reason, actor, now_iso(), delivery_id))
+                outcome = "applied"
+            status = 409 if outcome == "superseded" else 200
+            cur.execute("UPDATE inbound_deliveries SET status=?, response=? WHERE id=?",
+                        (status, response if outcome == "applied" else "", delivery_id))
+            cur.execute("COMMIT")
+            return outcome
+        except Exception:
+            cur.execute("ROLLBACK")
+            raise
 
     @_serialised
     def kill_switch_record(self) -> dict[str, str | None] | None:
