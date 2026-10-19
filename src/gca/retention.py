@@ -42,13 +42,17 @@ def prune(cfg: Config, *, dry_run: bool = False) -> dict[str, int]:
     try:
         conn.execute("PRAGMA busy_timeout=5000")
         terminal = tuple(s.value for s in TERMINAL_STATES)
+        # A database last opened by a pre-0.2.0 build has no `first_received_at` yet (the migration runs when the
+        # inbound handler next opens it); age such rows by the lease, the only timestamp they have.
+        inbound_cols = {r[1] for r in conn.execute("PRAGMA table_info(inbound_deliveries)").fetchall()}
+        received = "COALESCE(first_received_at, received_at)" if "first_received_at" in inbound_cols else "received_at"
         plans = [
             ("jobs", f"status IN ({','.join('?' * len(terminal))}) AND updated_at < ?", (*terminal, _cutoff(r.jobs_days))),
             ("webhook_outbox", "status IN ('delivered', 'dead') AND created_at < ?", (_cutoff(r.outbox_days),)),
             # Age by the immutable first-received time, never by `received_at`: that column is the lease, and a
             # released reservation carries a 1970 lease so a retry can take it over at once. Pruning on the lease
             # would drop a fresh delivery's history and let a stale kill-switch "off" be re-applied later.
-            ("inbound_deliveries", "COALESCE(first_received_at, received_at) < ?", (_cutoff(r.inbound_days),)),
+            ("inbound_deliveries", f"{received} < ?", (_cutoff(r.inbound_days),)),
         ]
         for table, where, params in plans:
             if not _table_exists(conn, table):

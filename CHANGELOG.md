@@ -17,6 +17,18 @@ Fifth external review (of `e05ad46`): eight findings, all fixed with regression 
 - Publishing: GitHub errors after the push return 502 (never a dropped connection); GitHub Enterprise remotes
   matching the configured `api_base` host get their pull request.
 
+Sixth external review (of `db227b2`): six findings, all fixed with regression tests
+(`tests/unit/test_review_round6.py`).
+
+- Stops now kill children that outlived the command itself (POSIX session kill regardless of the leader;
+  Windows job objects), and pipe shutdown is bounded on Windows too.
+- `gca prune` works on databases that have not yet received the `first_received_at` migration.
+- Git remotes are parsed, not regex-matched: ports and credentials are ignored, hostnames compared exactly.
+- Budget restrictions with huge integers are rejected (422) instead of raising.
+- `docs/eval-baseline.md` now states plainly that two real-model jobs shipped an unauthorized write to a job
+  branch (an emptied test file, failed by the verifier; an extra `NOTES.md`, which succeeded and is caught only
+  by human review).
+
 Work package 2 of the Koru pilot plan: the worker controls the platform needs.
 
 - **Enforced approval restrictions.** A decision (webhook or `gca approve`) may carry `restrictions`

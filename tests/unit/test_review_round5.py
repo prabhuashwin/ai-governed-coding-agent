@@ -50,7 +50,6 @@ def test_prune_keeps_a_released_reservations_history(config, monkeypatch):
 
 
 # ---------------------------------------------------------------- 2 (P1) process tree + bounded draining
-@pytest.mark.skipif(sys.platform == "win32", reason="process-group semantics differ; covered by taskkill /T")
 def test_stop_kills_the_whole_process_tree_and_bounds_draining(tmp_path):
     """The parent spawns a grandchild that keeps writing a file and holds the output pipes. A stop must end the
     grandchild too (no writes after the stop) and must not hang on draining the pipes it holds."""
@@ -203,12 +202,18 @@ def test_publish_github_failures_are_502_over_http(config, pushed_job, monkeypat
     monkeypatch.setenv("GCA_INBOUND_SECRET", "in")
     monkeypatch.setattr("gca.publish.github_slug", lambda url, host=None: "o/r")
 
+    calls: list[str] = []
+
     def api(req: httpx.Request) -> httpx.Response:
+        calls.append(str(req.url))
         if failure == "transport":
             raise httpx.ConnectError("boom", request=req)
         return httpx.Response(503, text="upstream down")
 
-    monkeypatch.setattr("gca.publish.httpx.Client", lambda *a, **kw: httpx.Client(*a, **{**kw, "transport": httpx.MockTransport(api)}))
+    # `gca.publish.httpx` is the httpx module itself, so the patch must wrap the *original* constructor: a lambda
+    # that calls httpx.Client would call itself and the 502 would come from a RecursionError, not from the API path
+    real_client = httpx.Client
+    monkeypatch.setattr(httpx, "Client", lambda *a, **kw: real_client(*a, **{**kw, "transport": httpx.MockTransport(api)}))
     config.webhooks = WebhookConfig(enabled=True)
     srv = make_server(config, q, "127.0.0.1", 0)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -218,6 +223,8 @@ def test_publish_github_failures_are_502_over_http(config, pushed_job, monkeypat
         raw = json.dumps({"actor": "alice"}).encode()
         r = httpx.post(base + path, content=raw, headers=signed_headers("in", "POST", path, raw, delivery_id=f"p-{failure}"), timeout=10)
         assert r.status_code == 502 and "publish failed" in r.json()["error"]
+        assert calls == ["https://api.github.com/repos/o/r/pulls"]  # the intended GitHub call was made, once
+        assert ("unreachable" in r.json()["error"]) == (failure == "transport")
         assert job.result.branch in git(job.work_item.repo_path, "ls-remote", "--heads", "origin")  # push did happen
     finally:
         srv.shutdown()
