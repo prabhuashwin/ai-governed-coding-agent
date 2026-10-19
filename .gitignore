@@ -8,3 +8,8 @@ __pycache__/
 evals/results/*-data/
 cassettes/*.json
 gca.toml
+.coverage
+coverage.xml
+htmlcov/
+webhook-e2e*.json
+webhook-e2e*.md

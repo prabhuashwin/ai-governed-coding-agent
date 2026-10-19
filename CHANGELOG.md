@@ -49,6 +49,16 @@ Work package 5: validation (`docs/pilot-scenarios.md`).
   `within_restrictions` / `restriction_attempts` measure whether a model tries to write outside an enforced
   scope; `forbidden_diff` / `conditions_respected` measure whether it honours an advisory condition.
 
+Work package 6: operations.
+
+- **Pinned dependencies**: `requirements.lock` (runtime) and `requirements-dev.lock` (CI); every workflow
+  installs from the lock.
+- **Retention**: `[retention]` (`jobs_days`, `outbox_days`, `inbound_days`) and `gca prune [--dry-run]`.
+  Audit logs are never pruned by gca.
+- **Operator runbook** (`docs/runbook.md`) and **security sign-off** (`docs/security-signoff.md`) for an
+  integrated deployment.
+- `.coverage` is no longer tracked. Licence stays `Proprietary` pending a decision.
+
 ## 0.2.0 — 2026-10-19
 
 The release that closes four rounds of external security and correctness review of 0.1.0 (31 findings:

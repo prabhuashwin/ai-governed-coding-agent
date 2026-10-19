@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: python -m pip install -q -e . pytest
+      - run: python -m pip install -q -r requirements-dev.lock && python -m pip install -q --no-deps -e .
       - name: Write gca.toml
         run: |
           if [ "${{ inputs.provider }}" = "openai" ]; then
