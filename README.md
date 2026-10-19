@@ -33,7 +33,8 @@ engineer submits work item ──► approver authorizes ──► worker claims
 | Which files to read, what to edit, when to run tests          | Path confinement to the worktree; protected files; allowed paths  |
 | How to react to a failing test or an error                    | Command allow-list, no shell, no network, scrubbed environment    |
 | When the goal is met (`finish(success=…)`)                    | Budgets: turns, tool calls, tokens, cost, wall-clock, diff size  |
-|                                                               | Any blocked action fails the job; global kill switch             |
+|                                                               | Any blocked action fails the job; kill switch and cancel interrupt a command in flight |
+|                                                               | Approvers can narrow paths, commands and budget per job (enforced) |
 |                                                               | Independent verifier: fresh checkout, deleted/skipped-test detection, canary scan |
 |                                                               | Append-only, hash-chained audit log per job                       |
 
@@ -141,8 +142,8 @@ gca and the platform exchange **HMAC-signed JSON over HTTPS**. Neither side need
 
 | Direction | What flows |
 |---|---|
-| gca → platform (events) | `job.submitted`, `approval.requested`, `approval.decided`, `job.started`, `job.blocked_action`, `job.verified`, `job.finished` (status, branch, model, tokens, cost, verification, report, audit hash), `job.cancel_requested`, `control.kill_switch` |
-| platform → gca (commands) | `POST /v1/work-items` (submit), `POST /v1/jobs/{id}/decision` (approve/reject), `POST /v1/jobs/{id}/cancel`, `POST /v1/controls/kill-switch`, `GET /v1/jobs/{id}` |
+| gca → platform (events) | `job.submitted`, `approval.requested`, `approval.decided`, `job.started`, `job.blocked_action`, `job.verified`, `job.finished` (status, branch, model, tokens, cost, verification, report, audit hash), `job.cancel_requested`, `job.published`, `control.kill_switch` |
+| platform → gca (commands) | `POST /v1/work-items` (submit), `POST /v1/jobs/{id}/decision` (approve/reject, with enforced restrictions), `POST /v1/jobs/{id}/cancel`, `POST /v1/jobs/{id}/publish`, `POST /v1/controls/kill-switch` (global/tenant/job scope), `GET /v1/jobs/{id}` |
 
 Minimal setup:
 
@@ -170,8 +171,13 @@ What you can rely on:
   a receiver outage never fails a job.
 - **Inbound commands are idempotent** per delivery id.
 - **Self-approval is refused**, and a caller can lower a job's budget but never raise it.
-- **The kill switch** stops running agents at their next turn and blocks new work. Turning it off requires a
-  reason.
+- **The kill switch** stops running agents at their next turn, kills a command or verifier test run in flight
+  within about a second, and blocks new work. Turning it off requires a reason. `scope = "job"` stops one job.
+- **Approvals can restrict**: structured `restrictions` (paths, commands, budget) can only narrow what the
+  work item and operator policy allow, and are enforced, not advisory. Free-text `conditions` are shown to
+  the reviewer.
+- **Publishing can be requested by the platform** (`POST /v1/jobs/{id}/publish`, attributed to a person) or
+  switched off with `allow_publish = false`.
 
 The full contract is in **[`docs/webhooks.md`](docs/webhooks.md)**: headers, signing, every payload,
 verification code in Python and Node, and how Koru's approvals, kill switches, observability and AI gateway
@@ -195,12 +201,12 @@ verification report. Without `GITHUB_TOKEN`, it pushes the branch only.
 |---|---|
 | `gca init` | Write an example `gca.toml` |
 | `gca submit …` | Submit a work item (`--title --description --criteria --repo --test-cmd --allowed-path --max-cost --max-files …`) |
-| `gca approve <job> --approver X [--reject] [--override]` | Approve or reject locally (`--override` is break-glass in webhook mode, and is audited) |
+| `gca approve <job> --approver X [--reject] [--override] [--allow-path P] [--allow-command C] [--max-cost … --max-turns … --max-files … --max-lines …]` | Approve or reject locally, optionally narrowing what the job may touch, run and spend (`--override` is break-glass in webhook mode, and is audited) |
 | `gca run [--once]` | Run the worker (one job, or continuously) |
 | `gca status [job]` | List jobs, or show one in full |
 | `gca report <job> [--diff] [--out f.md]` | The review report (PR description) |
 | `gca audit <job> [--verify]` | Show the audit trail, or verify its hash chain |
-| `gca cancel <job>` | Cancel queued work, or stop a running agent at its next turn |
+| `gca cancel <job>` | Cancel queued work, or stop a running agent (a command in flight is killed) |
 | `gca publish <job>` | Push the branch and open a draft GitHub PR |
 | `gca webhook-serve [--with-worker]` | Serve signed inbound commands and deliver outbound events |
 | `gca webhook-deliver [--requeue-dead]` / `gca webhook-status` | Flush or inspect outbound deliveries |
@@ -214,7 +220,7 @@ Every command accepts `-c path/to/gca.toml` (default `./gca.toml`, or `$GCA_CONF
 
 | Layer | Command | Needs |
 |---|---|---|
-| Unit, loop, safety (red-team), end-to-end: 242 tests | `pytest -q` | nothing; about 2 minutes |
+| Unit, loop, safety (red-team), end-to-end: 262 tests | `pytest -q` | nothing; about 2 minutes |
 | Real containers | `GCA_TEST_RUNTIME=docker GCA_TEST_IMAGE=<image with pytest> pytest tests/unit/test_container_workspace.py` | Docker or Podman |
 | Golden-task evals, real model | `gca eval`, or the **evals (real model)** GitHub workflow | an API key |
 | Local model (no external inference) | **evals (local model, Ollama)** workflow | nothing |
@@ -252,7 +258,7 @@ src/gca/
   audit.py       hash-chained JSONL audit log
   publish.py     push branch + open GitHub pull request
   webhooks.py    signed outbound events: outbox, retries, dead letters
-  inbound.py     signed inbound commands: submit / decision / cancel / kill switch (HTTP server)
+  inbound.py     signed inbound commands: submit / decision / cancel / publish / kill switch (HTTP server)
   providers/     anthropic, openai_compat, testing (scripted/record/replay)
   sources/       servicenow.py (Table API adapter + sync loop)
   evals.py       golden-task eval runner

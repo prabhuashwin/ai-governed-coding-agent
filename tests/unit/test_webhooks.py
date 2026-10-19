@@ -169,7 +169,7 @@ def test_pipeline_emits_lifecycle_events(wh_config, work_item, receiver):
     events = AuditLog(wh_config.audit_dir, job.id).events()
     assert fin["audit_tail_hash"] == events[-1].hash and verify_chain(AuditLog(wh_config.audit_dir, job.id).path)[0]
     assert receiver.of("approval.decided")[0]["data"] == {"decision": "approve", "approver": "lead", "note": "ok",
-                                                          "conditions": []}
+                                                          "conditions": [], "restrictions": None}
     assert all(r["status"] == "delivered" for r in Outbox(wh_config.db_path).rows())
 
 
@@ -257,7 +257,7 @@ def test_webhook_approval_flow(hook_cfg, work_item, receiver):
                      "conditions": ["touch only stats code"]}, delivery_id="d-4")
     assert h.handle("POST", f"/v1/jobs/{job_id}/decision", hd, rw) == (200, {"job_id": job_id, "status": "approved"})
     job = q.get(job_id)
-    assert job.approval.approver == "lead-bob" and "touch only stats code" in job.approval.note
+    assert job.approval.approver == "lead-bob" and job.approval.conditions == ["touch only stats code"]
     assert [e.actor for e in AuditLog(hook_cfg.audit_dir, job_id).events()] == ["dev-alice", "lead-bob"]
     # deciding twice is a conflict
     hd, rw = signed("POST", f"/v1/jobs/{job_id}/decision", {"decision": "reject", "approver": "lead-bob"}, delivery_id="d-5")
@@ -322,7 +322,8 @@ def test_kill_switch_blocks_claims_and_stops_running_agent(hook_cfg, work_item, 
     q.approve(job.id, "lead")
     hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "sec-ops", "reason": "incident 42"}, delivery_id="k-1")
     assert h.handle("POST", "/v1/controls/kill-switch", hd, rw)[0] == 200
-    assert receiver.of("control.kill_switch")[0]["data"] == {"enabled": True, "reason": "incident 42", "actor": "sec-ops"}
+    assert receiver.of("control.kill_switch")[0]["data"] == {"enabled": True, "reason": "incident 42", "actor": "sec-ops",
+                                                             "scope": "global"}
     assert Worker(hook_cfg, q).run_once() is None  # nothing is claimed while killed
     hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": False, "actor": "sec-ops", "reason": "resolved"}, delivery_id="k-2")
     h.handle("POST", "/v1/controls/kill-switch", hd, rw)
@@ -348,7 +349,7 @@ def test_cancel_via_inbound(hook_cfg, work_item, receiver):
     hd, rw = signed("POST", f"/v1/jobs/{job.id}/cancel", {"by": "koru-user"}, delivery_id="c-1")
     s, r = CommandHandler(hook_cfg, q).handle("POST", f"/v1/jobs/{job.id}/cancel", hd, rw)
     assert s == 200 and r["status"] == "cancelled"
-    assert receiver.of("job.cancel_requested")[0]["data"] == {"by": "koru-user"}
+    assert receiver.of("job.cancel_requested")[0]["data"] == {"by": "koru-user", "scope": "job", "reason": ""}
 
 
 def test_kill_cli(config, tmp_path, capsys):
@@ -691,3 +692,112 @@ def test_audit_failure_after_the_control_change_keeps_the_delivery_record(hook_c
     assert h.handle("POST", "/v1/controls/kill-switch", hd2, rw2)[0] == 200
     status, resp = h.handle("POST", "/v1/controls/kill-switch", hd, rw)  # the OFF retried
     assert resp.get("replayed") is True and q.kill_switch() is not None
+
+
+# --------------------------------------------------------------------- work package 2: worker controls
+def test_decision_restrictions_are_enforced_or_rejected(hook_cfg, work_item, receiver):
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    h = CommandHandler(hook_cfg, q)
+    job = q.submit(work_item)
+    path = f"/v1/jobs/{job.id}/decision"
+    # widening is a 422, and the job stays pending approval
+    hd, rw = signed("POST", path, {"decision": "approve", "approver": "lead",
+                                   "restrictions": {"budget": {"max_cost_usd": 10_000}}}, delivery_id="d-wide")
+    s, r = h.handle("POST", path, hd, rw)
+    assert s == 422 and "restrictions rejected" in r["error"]
+    assert q.get(job.id).status == JobStatus.SUBMITTED
+    # narrowing is applied and echoed back as `enforced`
+    body = {"decision": "approve", "approver": "lead", "conditions": ["no API changes"],
+            "restrictions": {"allowed_paths": ["calc.py"], "budget": {"max_turns": 4}}}
+    hd, rw = signed("POST", path, body, delivery_id="d-narrow")
+    s, r = h.handle("POST", path, hd, rw)
+    assert s == 200 and r["enforced"]["allowed_paths"] == ["calc.py"] and r["enforced"]["budget"]["max_turns"] == 4
+    job = q.get(job.id)
+    assert job.work_item.allowed_paths == ["calc.py"] and job.budget.max_turns == 4
+    assert job.approval.restrictions.budget == {"max_turns": 4}
+    ev = receiver.of("approval.decided")[0]["data"]
+    assert ev["restrictions"] == {"allowed_paths": ["calc.py"], "budget": {"max_turns": 4}}
+
+
+@pytest.fixture
+def published_job(hook_cfg, work_item, calc_repo, tmp_path, receiver):
+    from conftest import git
+    bare = tmp_path / "remote.git"
+    git(tmp_path, "init", "-q", "--bare", str(bare))
+    git(calc_repo, "remote", "add", "origin", str(bare))
+    git(calc_repo, "push", "-q", "origin", "main")
+    git(calc_repo, "remote", "set-head", "origin", "main")
+    webhooks.install(hook_cfg)
+    q = JobQueue(hook_cfg.db_path)
+    job = q.submit(work_item)
+    q.approve(job.id, "lead")
+    job = Worker(hook_cfg, q, provider_factory=lambda: ScriptedProvider(steps_fix_calc())).run_once()
+    assert job.status == JobStatus.SUCCEEDED
+    return q, job, bare
+
+
+def test_publish_via_inbound(hook_cfg, published_job, receiver):
+    from conftest import git
+    q, job, bare = published_job
+    h = CommandHandler(hook_cfg, q)
+    path = f"/v1/jobs/{job.id}/publish"
+    hd, rw = signed("POST", path, {"draft": True}, delivery_id="p-0")
+    assert h.handle("POST", path, hd, rw)[0] == 422  # actor required: every publish is attributed
+    hd, rw = signed("POST", path, {"actor": "koru-user", "create_pr": False}, delivery_id="p-1")
+    s, r = h.handle("POST", path, hd, rw)
+    assert s == 200 and r["branch"] == job.result.branch and r["pr_url"] is None
+    assert job.result.branch in git(job.work_item.repo_path, "ls-remote", "--heads", "origin")
+    ev = receiver.of("job.published")
+    assert ev and ev[0]["data"]["step"] == "branch_pushed" and ev[0]["data"]["actor"] == "koru-user"
+    assert ev[0]["data"]["commit"] == job.result.verification.commit
+    # a replay of the same delivery returns the recorded response without pushing again
+    s2, r2 = h.handle("POST", path, hd, rw)
+    assert (s2, r2) == (s, {**r, "replayed": True})
+    # the audit trail carries the request and the push
+    acts = [e.event for e in AuditLog(hook_cfg.audit_dir, job.id).events()]
+    assert "publish_requested" in acts and "branch_pushed" in acts
+
+
+def test_publish_refused_when_disabled_or_not_succeeded(hook_cfg, work_item, receiver):
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    h = CommandHandler(hook_cfg, q)
+    job = q.submit(work_item)
+    path = f"/v1/jobs/{job.id}/publish"
+    hd, rw = signed("POST", path, {"actor": "koru-user"}, delivery_id="p-2")
+    s, r = h.handle("POST", path, hd, rw)
+    assert s == 409 and "only succeeded jobs" in r["error"]
+    hook_cfg.webhooks.allow_publish = False
+    hd, rw = signed("POST", path, {"actor": "koru-user"}, delivery_id="p-3")
+    s, r = h.handle("POST", path, hd, rw)
+    assert s == 403 and "allow_publish" in r["error"]
+
+
+def test_kill_switch_scopes(hook_cfg, work_item, receiver):
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    h = CommandHandler(hook_cfg, q)
+    job = q.submit(work_item)
+    # job scope maps onto cancellation of that job and leaves the instance running
+    hd, rw = signed("POST", "/v1/controls/kill-switch",
+                    {"enabled": True, "actor": "secops", "scope": "job", "job_id": job.id, "reason": "runaway"},
+                    delivery_id="k-job")
+    s, r = h.handle("POST", "/v1/controls/kill-switch", hd, rw)
+    assert s == 200 and r["scope"] == "job" and r["status"] == "cancelled"
+    assert q.kill_switch() is None
+    assert receiver.of("job.cancel_requested")[0]["data"] == {"by": "secops", "scope": "job", "reason": "runaway"}
+    # a job stop cannot be undone; disengage must come with a scope that makes sense
+    hd, rw = signed("POST", "/v1/controls/kill-switch",
+                    {"enabled": False, "actor": "secops", "scope": "job", "job_id": job.id, "reason": "x"},
+                    delivery_id="k-job-off")
+    assert h.handle("POST", "/v1/controls/kill-switch", hd, rw)[0] == 422
+    hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "scope": "region"},
+                    delivery_id="k-bad")
+    assert h.handle("POST", "/v1/controls/kill-switch", hd, rw)[0] == 422
+    # tenant scope == this instance
+    hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "scope": "tenant"},
+                    delivery_id="k-tenant")
+    s, r = h.handle("POST", "/v1/controls/kill-switch", hd, rw)
+    assert s == 200 and r["scope"] == "tenant" and q.kill_switch() is not None
+    assert receiver.of("control.kill_switch")[0]["data"]["scope"] == "tenant"

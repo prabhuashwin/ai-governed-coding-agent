@@ -131,10 +131,59 @@ class WorkItem(BaseModel):
     idempotency_key: str | None = None
 
 
+class Restrictions(BaseModel):
+    """Enforceable approval conditions. Each one can only *narrow* what the work item and operator policy already
+    allow: paths must lie inside the work item's allowed paths (if any), commands inside the operator's allow-list,
+    and budget fields can only go down."""
+    allowed_paths: list[str] | None = None
+    allowed_commands: list[str] | None = None
+    budget: dict[str, float | int] | None = None
+
+    _BUDGET_FIELDS = ("max_turns", "max_input_tokens", "max_output_tokens", "max_cost_usd", "max_seconds",
+                      "max_tool_calls", "max_files_changed", "max_lines_changed")
+
+    def apply(self, job: Job, operator_commands: list[str]) -> list[str]:
+        """Narrow `job` in place. Returns human-readable lines describing what was applied. Raises ValueError when a
+        restriction would widen scope or leave nothing allowed."""
+        applied: list[str] = []
+        if self.allowed_paths is not None:
+            wanted = [p.strip().strip("/") for p in self.allowed_paths if p.strip().strip("/")]
+            if not wanted:
+                raise ValueError("allowed_paths must name at least one path")
+            existing = [p.strip("/") for p in job.work_item.allowed_paths]
+            if existing:
+                inside = [p for p in wanted if any(p == e or p.startswith(e + "/") for e in existing)]
+                if len(inside) != len(wanted):
+                    outside = sorted(set(wanted) - set(inside))
+                    raise ValueError(f"allowed_paths {outside} lie outside the work item's allowed paths {existing}")
+            job.work_item.allowed_paths = wanted
+            applied.append(f"paths limited to {wanted}")
+        if self.allowed_commands is not None:
+            wanted_cmds = [c.strip() for c in self.allowed_commands if c.strip()]
+            if not wanted_cmds:
+                raise ValueError("allowed_commands must name at least one command")
+            unknown = sorted(set(wanted_cmds) - set(operator_commands))
+            if unknown:
+                raise ValueError(f"allowed_commands {unknown} are not in the operator's command allow-list")
+            applied.append(f"commands limited to {wanted_cmds}")
+        if self.budget:
+            for k, v in self.budget.items():
+                if k not in self._BUDGET_FIELDS:
+                    raise ValueError(f"unknown budget field {k!r}")
+                current = getattr(job.budget, k)
+                if v > current:
+                    raise ValueError(f"budget.{k}={v} would raise the job's limit of {current}")
+                setattr(job.budget, k, type(current)(v))
+                applied.append(f"budget.{k} lowered to {v}")
+        return applied
+
+
 class Approval(BaseModel):
     approver: str
     approved_at: str = Field(default_factory=now_iso)
     note: str = ""
+    conditions: list[str] = Field(default_factory=list)  # free text, for humans
+    restrictions: Restrictions | None = None  # enforced
 
 
 class Usage(BaseModel):
@@ -223,3 +272,6 @@ class AuditEvent(BaseModel):
     data: dict[str, Any] = Field(default_factory=dict)
     prev_hash: str
     hash: str
+
+
+Restrictions.model_rebuild()

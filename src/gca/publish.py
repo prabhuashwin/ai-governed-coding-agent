@@ -44,7 +44,7 @@ def _git(repo: str, *args: str) -> str:
 def publish_job(cfg: Config, queue: JobQueue, job_id: str, *, remote: str = "origin", base: str | None = None,
                 draft: bool = True, create_pr: bool = True, token_env: str = "GITHUB_TOKEN",
                 api_base: str = "https://api.github.com", transport: httpx.BaseTransport | None = None,
-                allow_failed: bool = False) -> PublishResult:
+                allow_failed: bool = False, actor: str = "publisher") -> PublishResult:
     job = queue.get(job_id)
     if not job.result or not job.result.branch:
         raise ValueError(f"{job_id} has no branch to publish (status {job.status.value})")
@@ -68,7 +68,7 @@ def publish_job(cfg: Config, queue: JobQueue, job_id: str, *, remote: str = "ori
     else:
         raise ValueError(f"{job_id} has no verified commit on record (it predates commit pinning); re-run the job, "
                          f"or pass --allow-failed to push the branch head unverified")
-    audit.record("publisher", "branch_pushed", remote=remote_url, branch=branch, commit=verified)
+    audit.record(actor, "branch_pushed", remote=remote_url, branch=branch, commit=verified)
     result = PublishResult(job_id=job.id, branch=branch, pushed_to=remote_url)
 
     if not create_pr:
@@ -106,5 +106,5 @@ def publish_job(cfg: Config, queue: JobQueue, job_id: str, *, remote: str = "ori
         else:
             r.raise_for_status()
             result.pr_url = r.json().get("html_url")
-    audit.record("publisher", "pull_request_opened", url=result.pr_url, base=base, draft=draft)
+    audit.record(actor, "pull_request_opened", url=result.pr_url, base=base, draft=draft)
     return result

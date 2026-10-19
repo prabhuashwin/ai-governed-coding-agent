@@ -87,9 +87,18 @@ class Worker:
                          path=str(ws.root),
                          kind=self.cfg.workspace.kind, image=self.cfg.workspace.image if self.cfg.workspace.kind == "container" else None)
 
-            policy = PolicyEngine(self.cfg.policy, ws.root, wi.allowed_paths)
+            policy_cfg = self.cfg.policy
+            restr = job.approval.restrictions if job.approval else None
+            if restr and restr.allowed_commands is not None:  # the approver narrowed the operator's allow-list
+                policy_cfg = policy_cfg.model_copy(update={"allowed_commands": [
+                    c for c in policy_cfg.allowed_commands if c in restr.allowed_commands]})
+            policy = PolicyEngine(policy_cfg, ws.root, wi.allowed_paths)
             tracker = BudgetTracker(job.budget)
-            executor = ToolExecutor(ws, policy, wi.test_command)
+
+            def stop_requested() -> bool:  # polled while commands run: a cancel or kill switch ends them at once
+                return self.queue.kill_switch() is not None or self.queue.cancel_requested(job.id)
+
+            executor = ToolExecutor(ws, policy, wi.test_command, stop_check=stop_requested)
             provider = self.provider_factory()
             result.provider, result.model = provider.name, provider.model
 
@@ -117,7 +126,7 @@ class Worker:
             job = self.queue.transition(job.id, JobStatus.VERIFYING)
             self.queue.heartbeat(job.id)
             verifier = Verifier(wi.repo_path, ws.base_commit, ws.branch, wi.test_command, self.cfg.policy,
-                                run_fn=make_runner(self.cfg.workspace, job.id),
+                                run_fn=make_runner(self.cfg.workspace, job.id, stop_check=stop_requested),
                                 max_files_changed=job.budget.max_files_changed,
                                 max_lines_changed=job.budget.max_lines_changed,
                                 allowed_paths=wi.allowed_paths)
@@ -125,6 +134,12 @@ class Worker:
             result.verification = verification
             audit.record("verifier", "verified", passed=verification.passed, flags=verification.flags,
                          exit_code=verification.exit_code, files_changed=verification.files_changed)
+
+            if "interrupted" in verification.flags:  # a stop request landed while the tests ran
+                why = "kill_switch" if self.queue.kill_switch() is not None else "cancelled during verification"
+                job = self.queue.complete(job.id, JobStatus.CANCELLED, result=result, error=why, render=render_report)
+                audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value, error=job.error)
+                return job
 
             policy_clean = outcome.blocked_actions == 0 or not self.cfg.policy.fail_on_any_blocked_action
             ok = verification.passed and outcome.stop_reason == StopReason.FINISHED and policy_clean

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import fnmatch
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -94,13 +95,17 @@ class ToolResult:
     content: str
     is_error: bool = False
     blocked: bool = False  # policy violation (counts towards max_blocked_actions)
+    interrupted: bool = False  # a running command was stopped by a cancel or kill-switch request
 
 
 class ToolExecutor:
-    def __init__(self, workspace: Workspace, policy: PolicyEngine, test_command: list[str]):
+    def __init__(self, workspace: Workspace, policy: PolicyEngine, test_command: list[str],
+                 stop_check: Callable[[], bool] | None = None):
         self.ws = workspace
         self.policy = policy
         self.test_command = test_command
+        self.stop_check = stop_check  # polled while a command runs, so a stop request ends it at once
+        self._last_interrupted = False
 
     def _truncate(self, s: str, limit: int | None = None) -> str:
         limit = limit or self.policy.cfg.max_output_chars
@@ -113,13 +118,14 @@ class ToolExecutor:
     def execute(self, name: str, args: dict[str, Any]) -> ToolResult:
         if name not in TOOL_NAMES:
             return ToolResult(f"unknown tool: {name}", is_error=True)
+        self._last_interrupted = False
         try:
             fn = getattr(self, f"_t_{name}")
             out = fn(**args)
             canaries = self.policy.find_canaries(out)
             if canaries:
                 return ToolResult("output withheld: it contained protected secret material", is_error=True, blocked=True)
-            return ToolResult(out)
+            return ToolResult(out, is_error=self._last_interrupted, interrupted=self._last_interrupted)
         except PolicyViolation as e:
             return ToolResult(f"BLOCKED by policy: {e}", is_error=True, blocked=True)
         except TypeError as e:
@@ -209,7 +215,9 @@ class ToolExecutor:
 
     def _run(self, argv: list[str]) -> str:
         argv = self.policy.check_command(list(argv))
-        res = self.ws.run(argv, env=self.policy.subprocess_env(), timeout=self.policy.cfg.command_timeout_seconds)
+        res = self.ws.run(argv, env=self.policy.subprocess_env(), timeout=self.policy.cfg.command_timeout_seconds,
+                          stop_check=self.stop_check)
+        self._last_interrupted = res.interrupted
         return self._truncate(f"$ {' '.join(argv)}\n[exit {res.exit_code}]\n{res.output}")
 
     def _t_run_command(self, argv: list[str]) -> str:

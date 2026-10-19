@@ -20,6 +20,7 @@ from .models import (
     Budget,
     Job,
     JobStatus,
+    Restrictions,
     RunResult,
     WorkItem,
     add_column_if_missing,
@@ -144,8 +145,21 @@ class JobQueue:
                 setattr(job, k, v)
         return self._update(job_id, mutate)
 
-    def approve(self, job_id: str, approver: str, note: str = "") -> Job:
-        return self.transition(job_id, JobStatus.APPROVED, approval=Approval(approver=approver, note=note))
+    def approve(self, job_id: str, approver: str, note: str = "", *, conditions: builtins.list[str] | None = None,
+                restrictions: Restrictions | None = None, operator_commands: builtins.list[str] | None = None) -> Job:
+        """Approve, applying any enforceable restrictions to the job in the same transaction."""
+        def mutate(job: Job) -> None:
+            if JobStatus.APPROVED not in TRANSITIONS[job.status]:
+                raise InvalidTransition(f"{job.status.value} -> approved is not allowed for {job_id}")
+            applied: builtins.list[str] = []
+            if restrictions is not None:
+                applied = restrictions.apply(job, operator_commands or [])
+            job.status = JobStatus.APPROVED
+            job.approval = Approval(approver=approver, note=note, conditions=list(conditions or []),
+                                    restrictions=restrictions)
+            if applied:
+                job.approval.note = (job.approval.note + "\nEnforced: " + "; ".join(applied)).strip()
+        return self._update(job_id, mutate)
 
     def reject(self, job_id: str, approver: str, note: str = "") -> Job:
         return self.transition(job_id, JobStatus.REJECTED, approval=Approval(approver=approver, note=note))

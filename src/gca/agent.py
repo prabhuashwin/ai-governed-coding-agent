@@ -179,7 +179,12 @@ class AgentLoop:
                 self.audit.record("agent" if not res.blocked else "policy",
                                   "tool_call" if not res.blocked else "blocked_action",
                                   tool=call.name, args=_short_args(call.input), is_error=res.is_error,
-                                  result_chars=len(res.content), result_head=res.content[:300])
+                                  result_chars=len(res.content), result_head=res.content[:300],
+                                  interrupted=res.interrupted)
+                if res.interrupted:  # a stop request ended the command mid-way: do not give the model another turn
+                    if self.kill_check():
+                        return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="global kill switch engaged")
+                    return self._outcome(StopReason.CANCELLED, blocked=blocked, detail="command interrupted")
                 if res.blocked:
                     blocked += 1
                     if blocked >= self.max_blocked:

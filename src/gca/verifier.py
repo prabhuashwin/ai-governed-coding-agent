@@ -210,14 +210,14 @@ class Verifier:
                 notes.append(f"test file modified: {parts[-1]} (not weakened, but check the change)")
         return notes
 
-    def _run_at(self, rev: str, tmp: Path, name: str) -> tuple[int, str, PolicyEngine]:
+    def _run_at(self, rev: str, tmp: Path, name: str) -> tuple[int, str, PolicyEngine, bool]:
         """Check `rev` out fresh under `tmp` and run the test command there."""
         wt = tmp / name
         _git(self.repo, "worktree", "add", "--detach", str(wt), rev)
         policy = PolicyEngine(self.policy_cfg, wt, self.allowed_paths)
         res = self.run_fn(self.test_command, wt, policy.subprocess_env(), self.timeout)
         shutil.rmtree(wt / ".gca-home", ignore_errors=True)
-        return res.exit_code, res.output, policy
+        return res.exit_code, res.output, policy, bool(getattr(res, "interrupted", False))
 
     def verify(self) -> VerificationResult:
         flags = self.tamper_flags()
@@ -225,13 +225,19 @@ class Verifier:
         commit = _git(self.repo, "rev-parse", "--verify", f"{self.branch}^{{commit}}").strip()
         tmp = Path(tempfile.mkdtemp(prefix="gca-verify-"))
         try:
-            exit_code, out, policy = self._run_at(commit, tmp, "wt")
+            exit_code, out, policy, interrupted = self._run_at(commit, tmp, "wt")
+            if interrupted:
+                return VerificationResult(passed=False, tests_ran=False, exit_code=exit_code, output_tail=out[-4000:],
+                                          flags=["interrupted"], notes=notes, commit=commit)
             ran = exit_code != 127
 
             if self.baseline_count and ran:
                 # The base commit is the trusted baseline for how many tests exist. If the branch executes fewer,
                 # tests were removed, skipped or deselected, however that was done.
-                _, base_out, _ = self._run_at(self.base, tmp, "base")
+                _, base_out, _, base_interrupted = self._run_at(self.base, tmp, "base")
+                if base_interrupted:
+                    return VerificationResult(passed=False, tests_ran=False, exit_code=exit_code, output_tail=out[-4000:],
+                                              flags=["interrupted"], notes=notes, commit=commit)
                 n_base, n_branch = tests_ran(base_out), tests_ran(out)
                 if n_base is not None and n_branch is not None and n_branch < n_base:
                     flags.append(f"tests_ran_decreased:{n_base}->{n_branch}")

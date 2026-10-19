@@ -12,7 +12,7 @@ from . import __version__
 from .audit import AuditLog, verify_chain
 from .cmdline import split_command
 from .config import Config, load_config
-from .models import JobStatus, WorkItem
+from .models import JobStatus, Restrictions, WorkItem
 from .queue import JobQueue
 from .worker import Worker
 
@@ -138,9 +138,23 @@ def cmd_approve(args, cfg):
               "Use --override (recorded in the audit log) only for break-glass situations.", file=sys.stderr)
         return 4
     q = _queue(cfg)
-    job = q.reject(args.job_id, args.approver, args.note) if args.reject else q.approve(args.job_id, args.approver, args.note)
+    restrictions = None
+    budget = {k: v for k, v in (("max_cost_usd", args.max_cost), ("max_turns", args.max_turns),
+                                ("max_files_changed", args.max_files), ("max_lines_changed", args.max_lines))
+              if v is not None}
+    if args.allow_path or args.allow_command or budget:
+        restrictions = Restrictions(allowed_paths=args.allow_path or None, allowed_commands=args.allow_command or None,
+                                    budget=budget or None)
+    try:
+        job = q.reject(args.job_id, args.approver, args.note) if args.reject else \
+            q.approve(args.job_id, args.approver, args.note, restrictions=restrictions,
+                      operator_commands=cfg.policy.allowed_commands)
+    except ValueError as e:
+        print(f"restrictions rejected: {e}", file=sys.stderr)
+        return 2
     AuditLog(cfg.audit_dir, job.id).record(args.approver, "rejected" if args.reject else "approved", note=args.note,
-                                           override=bool(getattr(args, "override", False)))
+                                           override=bool(getattr(args, "override", False)),
+                                           restrictions=restrictions.model_dump(exclude_none=True) if restrictions else None)
     print(f"{job.id} -> {job.status.value}")
     return 0
 
@@ -349,7 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-files", type=int, help="diff may touch at most N files"); s.add_argument("--max-lines", type=int, help="diff may change at most N lines")
     s.set_defaults(fn=cmd_submit)
 
-    s = sub.add_parser("approve", help="approve (or --reject) a job"); s.add_argument("job_id"); s.add_argument("--approver", required=True); s.add_argument("--note", default=""); s.add_argument("--reject", action="store_true"); s.add_argument("--override", action="store_true", help="break-glass: approve locally even when approval.mode=webhook"); s.set_defaults(fn=cmd_approve)
+    s = sub.add_parser("approve", help="approve (or --reject) a job"); s.add_argument("job_id"); s.add_argument("--approver", required=True); s.add_argument("--note", default=""); s.add_argument("--reject", action="store_true"); s.add_argument("--override", action="store_true", help="break-glass: approve locally even when approval.mode=webhook"); s.add_argument("--allow-path", action="append", help="enforced condition: restrict writes to this path (repeatable; must lie inside the work item's allowed paths)"); s.add_argument("--allow-command", action="append", help="enforced condition: restrict the agent to this command (repeatable; subset of the operator allow-list)"); s.add_argument("--max-cost", type=float, help="enforced condition: lower the cost budget (USD)"); s.add_argument("--max-turns", type=int); s.add_argument("--max-files", type=int); s.add_argument("--max-lines", type=int); s.set_defaults(fn=cmd_approve)
     s = sub.add_parser("cancel"); s.add_argument("job_id"); s.add_argument("--by", default="cli"); s.set_defaults(fn=cmd_cancel)
     s = sub.add_parser("run", help="run the worker"); s.add_argument("--once", action="store_true"); s.add_argument("--poll", type=float, default=2.0); s.add_argument("--max-jobs", type=int); s.set_defaults(fn=cmd_run)
     s = sub.add_parser("status"); s.add_argument("job_id", nargs="?"); s.set_defaults(fn=cmd_status)

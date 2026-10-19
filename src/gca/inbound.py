@@ -27,7 +27,8 @@ from pydantic import ValidationError
 
 from .audit import AuditLog
 from .config import Config
-from .models import Budget, JobStatus, WorkItem, add_column_if_missing, now_iso, open_db
+from .models import Budget, JobStatus, Restrictions, WorkItem, add_column_if_missing, now_iso, open_db
+from .publish import publish_job
 from .queue import InvalidTransition, JobQueue
 from .webhooks import verify_signature
 
@@ -158,7 +159,7 @@ class CommandHandler:
             return self.submit(p, delivery_id)
         if method == "POST" and path == "/v1/controls/kill-switch":
             return self.kill_switch(p, delivery_id, first_received_at)
-        m = re.fullmatch(r"/v1/jobs/([A-Za-z0-9_\-]+)(/decision|/cancel)?", path)
+        m = re.fullmatch(r"/v1/jobs/([A-Za-z0-9_\-]+)(/decision|/cancel|/publish)?", path)
         if m:
             job_id, action = m.group(1), m.group(2)
             if method == "GET" and action is None:
@@ -167,6 +168,8 @@ class CommandHandler:
                 return self.decision(job_id, p)
             if method == "POST" and action == "/cancel":
                 return self.cancel(job_id, p)
+            if method == "POST" and action == "/publish":
+                return self.publish(job_id, p)
         raise CommandError(404, f"no route for {method} {path}")
 
     # ------------------------------------------------------------- commands
@@ -201,17 +204,31 @@ class CommandHandler:
         if approver == job.work_item.requester and not self.cfg.approval.allow_self_approval:
             raise CommandError(403, "self-approval is not allowed")
         note = str(p.get("note", ""))
-        conditions = [str(c) for c in p.get("conditions", [])][:20]
-        if conditions:
-            note = (note + "\nConditions: " + "; ".join(conditions)).strip()
+        conditions = [str(c) for c in p.get("conditions", [])][:20]  # free text, recorded for humans
+        restrictions = None  # structured, enforced
+        if p.get("restrictions") is not None:
+            if not isinstance(p["restrictions"], dict):
+                raise CommandError(422, "restrictions must be an object")
+            restrictions = Restrictions.model_validate(p["restrictions"])
         try:
-            job = self.queue.approve(job_id, approver, note) if decision == "approve" \
-                else self.queue.reject(job_id, approver, note)
+            if decision == "approve":
+                job = self.queue.approve(job_id, approver, note, conditions=conditions, restrictions=restrictions,
+                                         operator_commands=self.cfg.policy.allowed_commands)
+            else:
+                job = self.queue.reject(job_id, approver, note)
         except InvalidTransition as e:
             raise CommandError(409, str(e)) from e
+        except ValueError as e:  # a restriction that would widen scope or leave nothing allowed
+            raise CommandError(422, f"restrictions rejected: {e}") from e
         self._audit(job_id).record(approver, "approved" if decision == "approve" else "rejected", note=note,
-                                   conditions=conditions, via="webhook")
-        return 200, {"job_id": job_id, "status": job.status.value}
+                                   conditions=conditions, via="webhook",
+                                   restrictions=restrictions.model_dump(exclude_none=True) if restrictions else None)
+        out: dict[str, Any] = {"job_id": job_id, "status": job.status.value}
+        if job.approval and job.approval.restrictions:
+            out["enforced"] = {"allowed_paths": job.work_item.allowed_paths,
+                               "allowed_commands": job.approval.restrictions.allowed_commands,
+                               "budget": job.budget.model_dump()}
+        return 200, out
 
     def cancel(self, job_id: str, p: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         self._job(job_id)
@@ -222,6 +239,32 @@ class CommandHandler:
         self._audit(job_id).record(str(p.get("by", "webhook")), "cancel_requested", via="webhook")
         return 200, {"job_id": job_id, "status": job.status.value, "cancel_requested": job.cancel_requested}
 
+    def publish(self, job_id: str, p: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Push the job's verified commit and open a draft pull request, on an explicit, signed, attributed
+        request from the platform. The same rules as `gca publish`: the job must have succeeded and its branch
+        must still point at the verified commit."""
+        if not self.cfg.webhooks.allow_publish:
+            raise CommandError(403, "publishing via webhook is disabled ([webhooks] allow_publish = false)")
+        job = self._job(job_id)
+        actor = str(p.get("actor", "")).strip()
+        if not actor:
+            raise CommandError(422, "actor is required")
+        if job.status != JobStatus.SUCCEEDED:
+            raise CommandError(409, f"{job_id} is {job.status.value}; only succeeded jobs can be published")
+        draft = p.get("draft", True)
+        if not isinstance(draft, bool):
+            raise CommandError(422, "draft must be true or false")
+        self._audit(job_id).record(actor, "publish_requested", via="webhook", draft=draft)
+        try:
+            res = publish_job(self.cfg, self.queue, job_id, remote=str(p.get("remote", "origin")),
+                              base=p.get("base"), draft=draft, create_pr=bool(p.get("create_pr", True)), actor=actor)
+        except ValueError as e:  # not publishable in its current state (e.g. the branch moved after verification)
+            raise CommandError(409, str(e)) from e
+        except RuntimeError as e:  # git or GitHub failure
+            raise CommandError(502, f"publish failed: {e}") from e
+        return 200, {"job_id": job_id, "branch": res.branch, "pushed_to": res.pushed_to, "pr_url": res.pr_url,
+                     "note": res.note}
+
     def kill_switch(self, p: dict[str, Any], delivery_id: str = "",
                     first_received_at: str | None = None) -> tuple[int, dict[str, Any]]:
         if not isinstance(p.get("enabled"), bool):
@@ -229,13 +272,31 @@ class CommandHandler:
         actor, reason = str(p.get("actor", "")).strip(), str(p.get("reason", "")).strip()
         if not actor:
             raise CommandError(422, "actor is required")
+        # Scopes. This gca instance is one containment scope (run one instance per tenant); "global" and "tenant"
+        # both mean this instance. "job" stops one running job: it maps onto cancellation, which also interrupts a
+        # command in flight.
+        scope = str(p.get("scope", "global"))
+        if scope == "job":
+            target = str(p.get("job_id", "")).strip()
+            if not target or not p["enabled"]:
+                raise CommandError(422, "scope 'job' needs job_id and enabled=true (a job stop cannot be undone)")
+            self._job(target)
+            try:
+                job = self.queue.request_cancel(target)
+            except InvalidTransition as e:
+                raise CommandError(409, str(e)) from e
+            self._audit(target).record(actor, "cancel_requested", via="webhook", reason=reason, scope="job")
+            return 200, {"scope": "job", "job_id": target, "status": job.status.value,
+                         "cancel_requested": job.cancel_requested}
+        if scope not in ("global", "tenant"):
+            raise CommandError(422, "scope must be 'global', 'tenant' or 'job'")
         if not p["enabled"] and not reason:
             raise CommandError(422, "a reason is required to disengage the kill switch")
         # The kill switch is the one command whose re-run is not harmless: an old "off" re-applied after a newer
         # "on" would clear an emergency stop. So its supersession check, the control change and the record of this
         # delivery's outcome are one transaction (JobQueue.apply_kill_switch_delivery). The audit entry is written
         # afterwards; if that fails the change and its delivery record are already durable, so a retry replays.
-        resp: dict[str, Any] = {"enabled": p["enabled"], "actor": actor, "reason": reason}
+        resp: dict[str, Any] = {"enabled": p["enabled"], "actor": actor, "reason": reason, "scope": scope}
         outcome = self.queue.apply_kill_switch_delivery(
             delivery_id, first_received_at or now_iso(), p["enabled"], reason=reason, actor=actor,
             response=json.dumps(resp, default=str))
@@ -245,7 +306,7 @@ class CommandHandler:
             return 200, {**resp, "already_applied": True}
         try:
             AuditLog(self.cfg.audit_dir, "_controls").record(actor, "kill_switch", enabled=p["enabled"], reason=reason,
-                                                               via="webhook", delivery_id=delivery_id)
+                                                               via="webhook", delivery_id=delivery_id, scope=scope)
         except Exception as e:  # noqa: BLE001 - the control change is committed; say so rather than fail the request
             resp["audit_recorded"] = False
             resp["audit_error"] = str(e)[:200]
