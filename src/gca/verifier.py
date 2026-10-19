@@ -196,9 +196,10 @@ class Verifier:
     def verify(self) -> VerificationResult:
         flags = self.tamper_flags()
         notes = self.review_notes()
+        commit = _git(self.repo, "rev-parse", "--verify", f"{self.branch}^{{commit}}").strip()
         tmp = Path(tempfile.mkdtemp(prefix="gca-verify-"))
         try:
-            exit_code, out, policy = self._run_at(self.branch, tmp, "wt")
+            exit_code, out, policy = self._run_at(commit, tmp, "wt")
             ran = exit_code != 127
 
             if self.baseline_count and ran:
@@ -238,7 +239,7 @@ class Verifier:
             passed = ran and exit_code == 0 and not flags and bool(files)
             return VerificationResult(passed=passed, tests_ran=ran, exit_code=exit_code,
                                       output_tail=out[-4000:], flags=flags, files_changed=files,
-                                      insertions=ins, deletions=dels, notes=notes)
+                                      insertions=ins, deletions=dels, notes=notes, commit=commit)
         finally:
             for name in ("wt", "base"):
                 if (tmp / name).exists():

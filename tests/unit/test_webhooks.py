@@ -495,3 +495,46 @@ def test_retried_submit_without_idempotency_key_reuses_the_job(hook_cfg, work_it
     b = CommandHandler(hook_cfg, q).handle("POST", "/v1/work-items", hdrs, raw)
     assert a[0] == b[0] == 201 and a[1]["job_id"] == b[1]["job_id"] and b[1]["replayed"]
     assert q.get(a[1]["job_id"]).work_item.idempotency_key == "delivery:dup-2"
+
+
+def test_approval_requested_event_is_redacted(hook_cfg, work_item, receiver):
+    """A canary in the work item was redacted in job.submitted but sent verbatim in approval.requested."""
+    canary = hook_cfg.policy.canary_strings[0]
+    q = JobQueue(hook_cfg.db_path)
+    webhooks.install(hook_cfg)
+    h = CommandHandler(hook_cfg, q)
+    body = _wi_body(work_item, description=f"please use token {canary} to log in")
+    hdrs, raw = signed("POST", "/v1/work-items", body, delivery_id="r-1")
+    assert h.handle("POST", "/v1/work-items", hdrs, raw)[0] == 201
+    for ev in receiver.events:
+        assert canary not in json.dumps(ev), ev["type"]
+    assert "[REDACTED]" in receiver.of("approval.requested")[0]["data"]["description"]
+
+
+def test_outbox_insert_failure_spills_and_is_recovered(hook_cfg, work_item, receiver, monkeypatch):
+    """An outbox insert that fails on database contention was swallowed after the audit append, losing the
+    event for good. It is now spilled to a file and queued on the next delivery pass."""
+    import sqlite3
+
+    from gca.webhooks import Outbox
+
+    q = JobQueue(hook_cfg.db_path)
+    pub = webhooks.install(hook_cfg)
+    real_add = Outbox.add
+    calls = {"n": 0}
+
+    def flaky_add(self, event, urls):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_add(self, event, urls)
+
+    monkeypatch.setattr(Outbox, "add", flaky_add)
+    hook_cfg.webhooks.deliver_inline = False  # so the spill is visible before a delivery pass picks it up
+    job = q.submit(work_item)
+    AuditLog(hook_cfg.audit_dir, job.id).record("alice", "submitted", work_item=work_item.model_dump())
+    # job.submitted (the failing insert) was spilled; approval.requested (the next insert) was queued normally
+    assert calls["n"] == 2 and pub.outbox.spill_path.exists()
+    assert not receiver.of("job.submitted")
+    webhooks.flush(hook_cfg)
+    assert calls["n"] == 3 and receiver.of("job.submitted") and not pub.outbox.spill_path.exists()

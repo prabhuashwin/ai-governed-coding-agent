@@ -140,6 +140,7 @@ class VerificationResult(BaseModel):
     insertions: int = 0
     deletions: int = 0
     notes: list[str] = Field(default_factory=list)  # reviewer warnings that do not fail the job
+    commit: str | None = None  # the exact commit that was verified; publishing pushes this and nothing else
 
 
 class RunResult(BaseModel):

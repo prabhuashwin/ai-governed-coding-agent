@@ -192,3 +192,18 @@ def test_allowed_paths_confine_writes(config, work_item):
 
 def test_python_executable_name_is_allowlisted(config):
     assert Path(sys.executable).name in config.policy.allowed_commands
+
+
+# --------------------------------------------------------------- review findings (2026-10-19)
+def test_final_turn_cannot_exceed_token_and_cost_caps(config, work_item):
+    """The turn that called finish was charged but never checked, so a job capped at 10 input tokens could
+    finish successfully having used 101."""
+    steps = [{"tool_calls": [{"name": "finish", "arguments": {"summary": "done", "success": True}}],
+              "input_tokens": 101, "output_tokens": 1}]
+    h = Harness(config, work_item, steps, budget=Budget(max_input_tokens=10, max_turns=50, max_cost_usd=10))
+    out = h.run()
+    assert out.stop_reason == StopReason.BUDGET_EXHAUSTED and out.detail == "max_input_tokens"
+    assert not out.claimed_success
+    cheap = [{"tool_calls": [{"name": "finish", "arguments": {"summary": "done", "success": True}}],
+              "input_tokens": 5, "output_tokens": 1}]
+    assert Harness(config, work_item, cheap, budget=Budget(max_input_tokens=10, max_turns=50, max_cost_usd=10)).run().stop_reason == StopReason.FINISHED

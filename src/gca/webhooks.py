@@ -153,6 +153,39 @@ class Outbox:
                     "VALUES (?,?,?,?,?,?,?)",
                     (event["id"], url, event["type"], event.get("job_id"), body, event["created_at"], event["created_at"]))
 
+    # An outbox insert can fail on transient database contention. The audit event has already been written by
+    # then, so the only alternative to losing the webhook is a durable fallback: one JSON line per event in a
+    # spill file next to the database, ingested by the next delivery pass.
+    @property
+    def spill_path(self) -> Path:
+        return self.db_path.with_name("webhook_spill.jsonl")
+
+    def add_or_spill(self, event: dict[str, Any], urls: list[str]) -> bool:
+        """Queue the event; on a database error write it to the spill file instead. Returns True if queued."""
+        try:
+            self.add(event, urls)
+            return True
+        except sqlite3.Error:
+            with self._lock, self.spill_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps({"event": event, "urls": urls}, default=str, ensure_ascii=False) + "\n")
+            return False
+
+    def ingest_spill(self) -> int:
+        """Move spilled events into the outbox. Lines the database still refuses stay in the file."""
+        if not self.spill_path.exists():
+            return 0
+        with self._lock:
+            lines = [ln for ln in self.spill_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            self.spill_path.unlink()
+        kept, moved = [], 0
+        for ln in lines:
+            rec = json.loads(ln)
+            if self.add_or_spill(rec["event"], rec["urls"]):
+                moved += 1
+            else:
+                kept.append(ln)
+        return moved
+
     def due(self, limit: int = 100, event_id: str | None = None) -> list[tuple]:
         # 'inflight' rows whose lease has expired belong to a deliverer that died mid-POST: retry them
         q = ("SELECT id, url, type, payload, attempts FROM webhook_outbox "
@@ -215,6 +248,7 @@ class Deliverer:
     def deliver_pending(self, *, limit: int = 100, event_id: str | None = None,
                         timeout: float | None = None) -> dict[str, int]:
         stats = {"delivered": 0, "retry": 0, "dead": 0}
+        self.outbox.ingest_spill()
         rows = self.outbox.due(limit, event_id)
         if not rows:
             return stats
@@ -304,25 +338,30 @@ def build_event(cfg: Config, ev: AuditEvent) -> dict[str, Any] | None:
         data = {"by": ev.actor}
     event = {"id": f"evt_{uuid.uuid4().hex}", "type": etype, "created_at": now_iso(), "source": cfg.webhooks.source_name,
              "job_id": ev.job_id if not ev.job_id.startswith("_") else None, "audit_seq": ev.seq, "data": data}
-    # never let a planted secret leave via a webhook
-    if cfg.policy.canary_strings:
-        text = json.dumps(event, default=str, ensure_ascii=False)
-        for c in cfg.policy.canary_strings:
-            if c:
-                text = text.replace(c, "[REDACTED]")
-        event = json.loads(text)
-    return event
+    return redact_event(cfg, event)
+
+
+def redact_event(cfg: Config, event: dict[str, Any]) -> dict[str, Any]:
+    """Never let a planted secret leave via a webhook, whichever event carries it."""
+    if not cfg.policy.canary_strings:
+        return event
+    text = json.dumps(event, default=str, ensure_ascii=False)
+    for c in cfg.policy.canary_strings:
+        if c:
+            text = text.replace(c, "[REDACTED]")
+    return json.loads(text)
 
 
 def approval_requested_event(cfg: Config, job: Job) -> dict[str, Any]:
     wi = job.work_item
-    return {"id": f"evt_{uuid.uuid4().hex}", "type": "approval.requested", "created_at": now_iso(),
-            "source": cfg.webhooks.source_name, "job_id": job.id, "audit_seq": None,
-            "data": {"title": wi.title, "description": wi.description[:4000], "acceptance_criteria": wi.acceptance_criteria,
-                     "requester": wi.requester, "repo_path": wi.repo_path, "allowed_paths": wi.allowed_paths,
-                     "budget": job.budget.model_dump(), "source": wi.source, "source_ref": wi.source_ref,
-                     "decide": {"method": "POST", "path": f"/v1/jobs/{job.id}/decision",
-                                "body": {"decision": "approve|reject", "approver": "<user>", "note": "", "conditions": []}}}}
+    return redact_event(cfg, {
+        "id": f"evt_{uuid.uuid4().hex}", "type": "approval.requested", "created_at": now_iso(),
+        "source": cfg.webhooks.source_name, "job_id": job.id, "audit_seq": None,
+        "data": {"title": wi.title, "description": wi.description[:4000], "acceptance_criteria": wi.acceptance_criteria,
+                 "requester": wi.requester, "repo_path": wi.repo_path, "allowed_paths": wi.allowed_paths,
+                 "budget": job.budget.model_dump(), "source": wi.source, "source_ref": wi.source_ref,
+                 "decide": {"method": "POST", "path": f"/v1/jobs/{job.id}/decision",
+                            "body": {"decision": "approve|reject", "approver": "<user>", "note": "", "conditions": []}}}})
 
 
 # ----------------------------------------------------------------------------- wiring
@@ -338,7 +377,7 @@ class WebhookPublisher:
     def publish(self, event: dict[str, Any]) -> None:
         if not self.cfg.webhooks.outbound_urls or not self.wanted(event["type"]):
             return
-        self.outbox.add(event, self.cfg.webhooks.outbound_urls)
+        self.outbox.add_or_spill(event, self.cfg.webhooks.outbound_urls)
         if self.cfg.webhooks.deliver_inline:
             try:
                 self.deliverer.deliver_pending(event_id=event["id"], timeout=min(self.cfg.webhooks.timeout_seconds, 3))

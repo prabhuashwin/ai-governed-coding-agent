@@ -159,3 +159,28 @@ def test_split_command_keeps_windows_paths():
     assert split_command(r'"C:\Program Files\Py\python.exe" -c "print(1)"', windows=True) == \
         [r"C:\Program Files\Py\python.exe", "-c", "print(1)"]
     assert split_command("python -m pytest -k 'a and b'", windows=False) == ["python", "-m", "pytest", "-k", "a and b"]
+
+
+# --------------------------------------------------------------- review findings (2026-10-19)
+def test_publish_pushes_the_verified_commit_not_a_moved_branch(config, succeeded_job, monkeypatch):
+    """After verification someone (or something) added a commit to the job branch. Publishing used to push
+    the branch head with the old passing report attached; it must refuse, and when forced push only the
+    commit the report describes."""
+    q, job, bare = succeeded_job
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    verified = job.result.verification.commit
+    assert verified and verified == git(job.work_item.repo_path, "rev-parse", job.result.branch).strip()
+    # the branch moves after verification
+    wt = Path(job.work_item.repo_path).parent / "later"
+    git(job.work_item.repo_path, "worktree", "add", "-q", str(wt), job.result.branch)
+    (wt / "calc.py").write_text("def add(a, b):\n    return 42\n")
+    git(wt, "commit", "-q", "-am", "unverified change")
+    moved = git(job.work_item.repo_path, "rev-parse", job.result.branch).strip()
+    assert moved != verified
+    with pytest.raises(ValueError, match="changed after verification"):
+        publish_job(config, q, job.id, create_pr=False)
+    assert job.result.branch not in git(job.work_item.repo_path, "ls-remote", "--heads", "origin")
+    res = publish_job(config, q, job.id, create_pr=False, allow_failed=True)
+    assert res.pushed_to
+    remote_head = git(job.work_item.repo_path, "ls-remote", "--heads", "origin", job.result.branch).split()[0]
+    assert remote_head == verified  # the verified commit, never the moved head
