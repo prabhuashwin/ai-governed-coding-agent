@@ -27,7 +27,7 @@ from pydantic import ValidationError
 
 from .audit import AuditLog
 from .config import Config
-from .models import Budget, JobStatus, WorkItem, now_iso, open_db
+from .models import Budget, JobStatus, WorkItem, add_column_if_missing, now_iso, open_db
 from .queue import InvalidTransition, JobQueue
 from .webhooks import verify_signature
 
@@ -52,6 +52,10 @@ class CommandHandler:
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS inbound_deliveries (
                    id TEXT PRIMARY KEY, received_at TEXT NOT NULL, status INTEGER NOT NULL, response TEXT NOT NULL)""")
+        # received_at is the lease (renewed when a copy takes over an abandoned reservation); first_received_at never
+        # changes and is what supersession checks compare against
+        add_column_if_missing(self._conn, "inbound_deliveries", "first_received_at", "TEXT")
+        self._conn.execute("UPDATE inbound_deliveries SET first_received_at=received_at WHERE first_received_at IS NULL")
         self._lock = threading.Lock()
 
     def _audit(self, job_id: str) -> AuditLog:
@@ -66,20 +70,20 @@ class CommandHandler:
         if reason:
             return 401, {"error": "unauthorized", "detail": reason}
         delivery_id = {k.lower(): v for k, v in headers.items()}.get("x-gca-delivery-id", "")
-        taken_over_since: str | None = None
+        first_received_at: str | None = None
         if method == "POST":
             if not delivery_id:
                 return 400, {"error": "X-GCA-Delivery-Id header is required for POST"}
             # Reserve the delivery id *before* doing anything, so two concurrent copies of the same delivery
             # cannot both run the command. The reservation row (status 0) is filled in when the command is done.
-            reserved, taken_over_since = self._reserve(delivery_id)
+            reserved, first_received_at, _ = self._reserve(delivery_id)
             if not reserved:
                 return self._replay(delivery_id)
         try:
             payload = json.loads(body or b"{}") if method == "POST" else {}
             if not isinstance(payload, dict):
                 raise CommandError(400, "body must be a JSON object")
-            status, resp = self._route(method, path, payload, delivery_id, taken_over_since)
+            status, resp = self._route(method, path, payload, delivery_id, first_received_at)
         except CommandError as e:
             status, resp = e.status, {"error": e.message}
         except json.JSONDecodeError:
@@ -88,40 +92,50 @@ class CommandHandler:
             status, resp = 422, {"error": "validation failed", "detail": json.loads(e.json())[:10]}
         except Exception:
             if method == "POST":
-                with self._lock:  # nothing was recorded for this delivery; let a retry run it
-                    self._conn.execute("DELETE FROM inbound_deliveries WHERE id=? AND status=0", (delivery_id,))
+                self._release(delivery_id)
             raise
         if method == "POST":
-            with self._lock:
-                if status < 500:
-                    self._conn.execute("UPDATE inbound_deliveries SET status=?, response=? WHERE id=?",
+            if status < 500:  # (a kill-switch command has already recorded itself atomically; this is a no-op then)
+                with self._lock:
+                    self._conn.execute("UPDATE inbound_deliveries SET status=?, response=? WHERE id=? AND status=0",
                                        (status, json.dumps(resp, default=str), delivery_id))
-                else:
-                    self._conn.execute("DELETE FROM inbound_deliveries WHERE id=?", (delivery_id,))
+            else:
+                self._release(delivery_id)
         return status, resp
+
+    def _release(self, delivery_id: str) -> None:
+        """The command did not complete: let a retry take the delivery over right away. The row is kept, not
+        deleted, so its first-received time survives and a later retry is still judged against it."""
+        with self._lock:
+            self._conn.execute("UPDATE inbound_deliveries SET received_at='1970-01-01T00:00:00+00:00' "
+                               "WHERE id=? AND status=0", (delivery_id,))
 
     # A reservation (status 0) older than this belongs to a process that died mid-command: it is taken over by
     # the next copy of the delivery, which re-runs the command. Every command is safe to re-run: submit is
     # idempotent per delivery id, a second decision is a 409, cancel and the kill switch are idempotent.
     RESERVATION_TTL_SECONDS = 120
 
-    def _reserve(self, delivery_id: str) -> tuple[bool, str | None]:
-        """(reserved, taken_over_since): the second value is the abandoned reservation's original time when this
-        copy took over a delivery whose first copy died mid-command, else None."""
+    def _reserve(self, delivery_id: str) -> tuple[bool, str | None, str | None]:
+        """(reserved, first_received_at, taken_over_since).
+
+        first_received_at is the immutable time the delivery id was first seen (now, for a fresh one).
+        taken_over_since is set when this copy took over a delivery whose earlier copy died mid-command."""
         with self._lock:
-            if self._conn.execute("INSERT OR IGNORE INTO inbound_deliveries VALUES (?,?,0,'')",
-                                  (delivery_id, now_iso())).rowcount == 1:
-                return True, None
+            now = now_iso()
+            if self._conn.execute("INSERT OR IGNORE INTO inbound_deliveries (id, received_at, status, response, "
+                                  "first_received_at) VALUES (?,?,0,'',?)", (delivery_id, now, now)).rowcount == 1:
+                return True, now, None
             cutoff = (datetime.now(timezone.utc) - timedelta(seconds=self.RESERVATION_TTL_SECONDS)).isoformat()
-            row = self._conn.execute("SELECT received_at FROM inbound_deliveries WHERE id=? AND status=0 AND received_at<?",
-                                     (delivery_id, cutoff)).fetchone()
+            row = self._conn.execute(
+                "SELECT received_at, first_received_at FROM inbound_deliveries WHERE id=? AND status=0 AND received_at<?",
+                (delivery_id, cutoff)).fetchone()
             if row is None:
-                return False, None
-            # take over the abandoned reservation (atomic: only one copy wins the UPDATE)
+                return False, None, None
+            # take over the abandoned reservation: renew the lease only, never the first-received time
             won = self._conn.execute(
                 "UPDATE inbound_deliveries SET received_at=? WHERE id=? AND status=0 AND received_at=?",
-                (now_iso(), delivery_id, row[0])).rowcount == 1
-            return won, (row[0] if won else None)
+                (now, delivery_id, row[0])).rowcount == 1
+            return won, (row[1] or row[0]) if won else None, (row[0] if won else None)
 
     def _replay(self, delivery_id: str, wait_seconds: float = 5.0) -> tuple[int, dict[str, Any]]:
         """The stored response for a delivery id seen before; waits briefly for one still in progress."""
@@ -129,7 +143,7 @@ class CommandHandler:
         while True:
             row = self._conn.execute("SELECT status, response FROM inbound_deliveries WHERE id=?",
                                      (delivery_id,)).fetchone()
-            if row is None:  # the first copy failed with a 5xx and released the id: this copy may run it
+            if row is None:
                 return 409, {"error": "delivery is being retried", "delivery_id": delivery_id}
             if int(row[0]) != 0:
                 return int(row[0]), {**json.loads(row[1]), "replayed": True}
@@ -139,11 +153,11 @@ class CommandHandler:
             time.sleep(0.05)
 
     def _route(self, method: str, path: str, p: dict[str, Any], delivery_id: str = "",
-               taken_over_since: str | None = None) -> tuple[int, dict[str, Any]]:
+               first_received_at: str | None = None) -> tuple[int, dict[str, Any]]:
         if method == "POST" and path == "/v1/work-items":
             return self.submit(p, delivery_id)
         if method == "POST" and path == "/v1/controls/kill-switch":
-            return self.kill_switch(p, delivery_id, taken_over_since)
+            return self.kill_switch(p, delivery_id, first_received_at)
         m = re.fullmatch(r"/v1/jobs/([A-Za-z0-9_\-]+)(/decision|/cancel)?", path)
         if m:
             job_id, action = m.group(1), m.group(2)
@@ -209,7 +223,7 @@ class CommandHandler:
         return 200, {"job_id": job_id, "status": job.status.value, "cancel_requested": job.cancel_requested}
 
     def kill_switch(self, p: dict[str, Any], delivery_id: str = "",
-                    taken_over_since: str | None = None) -> tuple[int, dict[str, Any]]:
+                    first_received_at: str | None = None) -> tuple[int, dict[str, Any]]:
         if not isinstance(p.get("enabled"), bool):
             raise CommandError(422, "enabled must be true or false")
         actor, reason = str(p.get("actor", "")).strip(), str(p.get("reason", "")).strip()
@@ -218,17 +232,24 @@ class CommandHandler:
         if not p["enabled"] and not reason:
             raise CommandError(422, "a reason is required to disengage the kill switch")
         # The kill switch is the one command whose re-run is not harmless: an old "off" re-applied after a newer
-        # "on" would clear an emergency stop. The control row records which delivery last set it, so a copy that
-        # took over an abandoned reservation can tell whether its change already landed, or was superseded.
-        current = self.queue.kill_switch_record()
-        if current and delivery_id and current["delivery_id"] == delivery_id:
-            return 200, {"enabled": current["value"] == "on", "actor": current["set_by"], "reason": current["reason"],
-                         "already_applied": True}
-        if taken_over_since and current and (current["set_at"] or "") > taken_over_since:
+        # "on" would clear an emergency stop. So its supersession check, the control change and the record of this
+        # delivery's outcome are one transaction (JobQueue.apply_kill_switch_delivery). The audit entry is written
+        # afterwards; if that fails the change and its delivery record are already durable, so a retry replays.
+        resp: dict[str, Any] = {"enabled": p["enabled"], "actor": actor, "reason": reason}
+        outcome = self.queue.apply_kill_switch_delivery(
+            delivery_id, first_received_at or now_iso(), p["enabled"], reason=reason, actor=actor,
+            response=json.dumps(resp, default=str))
+        if outcome == "superseded":
             raise CommandError(409, "superseded: the kill switch was changed after this delivery was first received")
-        set_kill_switch(self.cfg, self.queue, p["enabled"], reason=reason, actor=actor, via="webhook",
-                        delivery_id=delivery_id or None)
-        return 200, {"enabled": p["enabled"], "actor": actor, "reason": reason}
+        if outcome == "already_applied":
+            return 200, {**resp, "already_applied": True}
+        try:
+            AuditLog(self.cfg.audit_dir, "_controls").record(actor, "kill_switch", enabled=p["enabled"], reason=reason,
+                                                               via="webhook", delivery_id=delivery_id)
+        except Exception as e:  # noqa: BLE001 - the control change is committed; say so rather than fail the request
+            resp["audit_recorded"] = False
+            resp["audit_error"] = str(e)[:200]
+        return 200, resp
 
     def status(self, job_id: str) -> tuple[int, dict[str, Any]]:
         job = self._job(job_id)

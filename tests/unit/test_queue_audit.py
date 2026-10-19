@@ -258,3 +258,41 @@ def test_complete_turns_a_late_cancel_into_cancelled(q: JobQueue):
     q.claim_next("w")
     q.transition(other.id, JobStatus.VERIFYING)
     assert q.complete(other.id, JobStatus.SUCCEEDED).status == JobStatus.SUCCEEDED
+
+
+def test_concurrent_startup_migration_does_not_fail(tmp_path: Path):
+    """Two constructors observing the missing column raced; the loser died with `duplicate column name`."""
+    import sqlite3
+    import threading
+
+    db = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE controls (name TEXT PRIMARY KEY, value TEXT NOT NULL, reason TEXT, set_by TEXT, "
+                 "set_at TEXT NOT NULL)")  # schema from before the delivery_id column
+    conn.commit()
+    conn.close()
+    errors: list[BaseException] = []
+    go = threading.Barrier(8)
+
+    queues: list[JobQueue] = []
+
+    def start():
+        try:
+            go.wait()
+            queues.append(JobQueue(db))
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    ts = [threading.Thread(target=start) for _ in range(8)]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    assert not errors, errors
+    for queue in queues:
+        queue.close()
+    check = sqlite3.connect(db)
+    try:
+        assert "delivery_id" in {r[1] for r in check.execute("PRAGMA table_info(controls)")}
+    finally:
+        check.close()

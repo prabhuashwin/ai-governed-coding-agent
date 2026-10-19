@@ -23,6 +23,21 @@ def open_db(owner: object, path: str) -> sqlite3.Connection:
     return conn
 
 
+def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+    """Schema migration safe under concurrent startup: the check and the ALTER run in one write transaction, and
+    a second process that lost the race sees the column already there (or a benign duplicate-column error)."""
+    cur = conn.cursor()
+    cur.execute("BEGIN IMMEDIATE")
+    try:
+        if column not in {r[1] for r in cur.execute(f"PRAGMA table_info({table})")}:
+            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        cur.execute("COMMIT")
+    except sqlite3.OperationalError as e:
+        cur.execute("ROLLBACK")
+        if "duplicate column" not in str(e).lower():
+            raise
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 

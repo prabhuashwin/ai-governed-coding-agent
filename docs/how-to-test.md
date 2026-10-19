@@ -165,6 +165,16 @@ A third pass (commit `3a441cd`) found one P1 and two P2 leftovers, fixed with te
 | P2 | Tools earlier in the same response could exhaust `max_seconds` before `finish` was honoured | The clock is re-checked when `finish` is reached |
 | P2 | A job cancelled in the finishing transaction kept a report saying `succeeded` | The report is rendered inside that transaction, after the final status is decided |
 
+A fourth pass (commit `11487c0`) found three P1 and one P2, all in the kill-switch recovery path added in round
+3 and the schema migration; fixed with tests marked "review round 4 (2026-10-19)":
+
+| # | Finding | Fix |
+|---|---|---|
+| P1 | A newer ON could commit between the supersession check and the retried OFF's update | `JobQueue.apply_kill_switch_delivery`: check, control update and delivery record in one write transaction |
+| P1 | Taking over a reservation overwrote its receipt time, so a second takeover judged supersession from the wrong moment | `first_received_at` is immutable; takeovers renew only the lease |
+| P1 | An audit failure after the control change deleted the reservation, so a retry ran as a fresh delivery | The delivery outcome is recorded in the same transaction as the change; failed commands expire the lease instead of deleting the row |
+| P2 | Concurrent startup could fail on `duplicate column name` | Migrations run in a write transaction and tolerate the benign duplicate |
+
 The real-model evals in `docs/eval-baseline.md` predate these fixes; re-run them before quoting the numbers.
 
 ## Known gaps
