@@ -223,7 +223,7 @@ Every command accepts `-c path/to/gca.toml` (default `./gca.toml`, or `$GCA_CONF
 
 | Layer | Command | Needs |
 |---|---|---|
-| Unit, loop, safety (red-team), end-to-end: 268 tests | `pytest -q` | nothing; about 2 minutes |
+| Unit, loop, safety (red-team), end-to-end: 270 tests | `pytest -q` | nothing; about 2 minutes |
 | Real containers | `GCA_TEST_RUNTIME=docker GCA_TEST_IMAGE=<image with pytest> pytest tests/unit/test_container_workspace.py` | Docker or Podman |
 | Golden-task evals, real model | `gca eval`, or the **evals (real model)** GitHub workflow | an API key |
 | Local model (no external inference) | **evals (local model, Ollama)** workflow | nothing |
@@ -243,6 +243,7 @@ keys stay in repository secrets, and results are committed to the `eval-results`
 | [`docs/webhooks.md`](docs/webhooks.md) | The integration contract for Koru or any webhook platform |
 | [`docs/multi-tenancy.md`](docs/multi-tenancy.md) | One instance per tenant: what is per instance, identity trust, TLS placement, operating N instances |
 | [`docs/koru-adapter.md`](docs/koru-adapter.md), [`docs/webhook-contract-samples.json`](docs/webhook-contract-samples.json) | Who owns the Koru-side adapter, what it maps, and real samples of every command and event to build it against |
+| [`docs/pilot-scenarios.md`](docs/pilot-scenarios.md) | The pilot scenario matrix: every scenario mapped to its automated evidence and real-model evidence, the evidence format, and the pilot operating system |
 | [`docs/sample-report.md`](docs/sample-report.md), [`docs/sample-audit.txt`](docs/sample-audit.txt) | What a finished job produces |
 | [`evals/README.md`](evals/README.md) | How golden tasks work and how to add one |
 
