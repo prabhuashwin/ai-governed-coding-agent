@@ -2,7 +2,8 @@
 # Install: pip install -r requirements-dev.lock && pip install --no-deps -e .
 -r requirements.lock
 coverage==7.16.2
-hypothesis==6.170.2
+hypothesis==6.170.2; python_version >= "3.11"
+hypothesis==6.168.5; python_version < "3.11"
 iniconfig==2.3.1
 librt==0.16.0
 mypy==2.4.0
