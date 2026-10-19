@@ -62,7 +62,8 @@ For the pilot sign-off, the evidence pack is:
 
 1. The CI run of the commit being signed off (green = every harness row above holds).
 2. One eval run per candidate model on all tasks with `--repeats 3`, cited as above, with tasks 10 and 11
-   read as behaviour measurements, not pass/fail gates.
+   read as behaviour measurements, not pass/fail gates. Done for gpt-4.1-mini: `real-openai-11 @ d2a7cda`,
+   31/33 (`docs/eval-baseline.md`).
 3. `webhook-e2e.md` from `scripts/webhook_e2e.py` against the Koru staging adapter (blocked on Koru;
    `docs/koru-adapter.md` lists the acceptance run).
 
