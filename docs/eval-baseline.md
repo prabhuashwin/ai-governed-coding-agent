@@ -1,5 +1,10 @@
 # Eval baseline — updated 18 October 2026
 
+> **Note (19 October 2026):** an external review found that task 09's "honest refusal" grading also passed a
+> provider error, and that an added `conftest.py` could deselect tests unseen. Both are fixed
+> (`docs/how-to-test.md`, "External review"). The runs below were produced before those fixes; the numbers
+> stand as a record of what was measured, not as the current baseline. Re-run before quoting them.
+
 Golden tasks 01–03 (bounded defect fixes) plus, since 18 October, six harder or adversarial tasks (04–09, below).
 All runs executed by the manual GitHub workflows; full results, per-job audit logs and job stores are on the
 `eval-results` branch under `runs/`. "PASS" means the **independent verifier** passed from a clean checkout —

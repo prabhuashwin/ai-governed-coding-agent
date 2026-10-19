@@ -119,6 +119,30 @@ Track accepted-PR rate and reviewer time per job; the proposal's acceptance targ
 - A new provider → mocked wire-format test in `test_providers.py`; an eval run before relying on it.
 - A new task type → an eval task directory (see `evals/README.md`).
 
+## External review, 19 October 2026
+
+An independent review of commit `6c447e1` reported six P1 and nine P2 findings; all fifteen were reproduced,
+fixed and given regression tests (look for "review findings (2026-10-19)" in the test files):
+
+| # | Finding | Fix |
+|---|---|---|
+| P1 | Agent-writable `.git` pointer let planted git metadata run hooks on the host | `PinnedGit`: host git uses the trusted git dir and an empty hooks path |
+| P1 | Hidden eval tests ran on the host with the eval process's environment | They run through the configured workspace runner with the scrubbed env |
+| P1 | An *added* `conftest.py` deselected the failing test; the job succeeded | Added config files flagged; the verifier also runs the base commit and fails the job if fewer tests ran |
+| P1 | Webhook signature covered timestamp and body only | Signature v2 binds method, path and delivery id |
+| P1 | Commands could write outside `allowed_paths` | The verifier checks every changed file against the policy |
+| P1 | Concurrent duplicate deliveries created two jobs | Delivery ids reserved before the command runs |
+| P2 | Publish pushed a branch that had moved after verification | The verified commit is recorded and is what gets pushed |
+| P2 | Audit writers in two processes corrupted the chain | Cross-process file lock; tail re-read before each append |
+| P2 | Cancel during verification was ignored; a stale cancel reverted a finished job | Re-check after verification; conditional updates in a write transaction |
+| P2 | An outbox insert failure lost the event | Spilled to a file and queued on the next delivery pass |
+| P2 | ServiceNow records at `verifying` were never updated again | Polled like every other non-terminal state |
+| P2 | The finish turn bypassed token and cost caps | Checked before finish is honoured |
+| P2 | A provider error graded as an honest refusal | A refusal requires the model to have finished with `success=false` |
+| P2 | `approval.requested` was not canary-redacted | All outbound events share one redaction |
+
+The real-model evals in `docs/eval-baseline.md` predate these fixes; re-run them before quoting the numbers.
+
 ## Known gaps
 
 - `kind = "worktree"` is not a sandbox against a hostile model (an allow-listed `python` can open sockets).
