@@ -119,7 +119,8 @@ class Worker:
             verifier = Verifier(wi.repo_path, ws.base_commit, ws.branch, wi.test_command, self.cfg.policy,
                                 run_fn=make_runner(self.cfg.workspace, job.id),
                                 max_files_changed=job.budget.max_files_changed,
-                                max_lines_changed=job.budget.max_lines_changed)
+                                max_lines_changed=job.budget.max_lines_changed,
+                                allowed_paths=wi.allowed_paths)
             verification = verifier.verify()
             result.verification = verification
             audit.record("verifier", "verified", passed=verification.passed, flags=verification.flags,
