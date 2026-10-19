@@ -21,3 +21,13 @@ def test_cross_process_webhook_conversation(tmp_path):
     res = json.loads(out.with_suffix(".json").read_text())
     assert res["passed"] and all(res["checks"].values())
     assert res["event_types"][-1] == "job.finished" and res["finished"]["status"] == "succeeded"
+    # the contract samples the adapter team codes against cover every command and every event type gca emits
+    contract = json.loads(out.with_suffix(".contract.json").read_text())
+    assert set(contract["commands"]) >= {"submit", "submit_replayed", "submit_outside_allowed_repos", "decision",
+                                         "publish", "kill_switch_on", "kill_switch_job_scope", "status"}
+    from gca.webhooks import EVENT_TYPES
+    assert set(contract["events"]) == set(EVENT_TYPES) - {"job.blocked_action"}  # no hostile step in the smoke script
+    committed = json.loads((SCRIPT.parents[1] / "docs" / "webhook-contract-samples.json").read_text())
+    assert set(committed["commands"]) == set(contract["commands"]) and set(committed["events"]) == set(contract["events"])
+    for t, ev in contract["events"].items():  # same shape as the committed snapshot: an adapter built on it stays valid
+        assert set(ev["data"]) == set(committed["events"][t]["data"]), t

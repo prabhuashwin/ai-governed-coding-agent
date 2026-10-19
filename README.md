@@ -242,6 +242,7 @@ keys stay in repository secrets, and results are committed to the `eval-results`
 | [`docs/eval-baseline.md`](docs/eval-baseline.md) | Measured pass rates and costs (hosted and local models) and what they mean |
 | [`docs/webhooks.md`](docs/webhooks.md) | The integration contract for Koru or any webhook platform |
 | [`docs/multi-tenancy.md`](docs/multi-tenancy.md) | One instance per tenant: what is per instance, identity trust, TLS placement, operating N instances |
+| [`docs/koru-adapter.md`](docs/koru-adapter.md), [`docs/webhook-contract-samples.json`](docs/webhook-contract-samples.json) | Who owns the Koru-side adapter, what it maps, and real samples of every command and event to build it against |
 | [`docs/sample-report.md`](docs/sample-report.md), [`docs/sample-audit.txt`](docs/sample-audit.txt) | What a finished job produces |
 | [`evals/README.md`](evals/README.md) | How golden tasks work and how to add one |
 

@@ -53,6 +53,13 @@ Through the real `gca` CLI with the provider selected **only** by `gca.toml`: in
 run-before-approval does nothing → approve → run → status → report (+diff) → audit verify → branch exists,
 working copy untouched. Reject and cancel paths. The eval runner itself with a scripted model.
 
+**Webhook contract test** (`test_webhook_e2e_script.py` → `scripts/webhook_e2e.py`): gca, a fake Koru and a
+driver as three OS processes over real signed HTTP. Nineteen checks covering every inbound command and
+every event type except `job.blocked_action`; writes `webhook-e2e.contract.json`, and the test fails if the
+event shapes differ from the committed `docs/webhook-contract-samples.json` (the adapter team's reference).
+Run `python scripts/webhook_e2e.py --provider openai --model gpt-4.1-mini` for the same conversation with a
+real model.
+
 ## Layer 5 — Golden-task evals (`evals/`, `gca eval`)
 
 The only layer that uses a real model. Each task is a tiny repo with a seeded bug and failing tests; the
