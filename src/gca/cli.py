@@ -13,6 +13,7 @@ from .audit import AuditLog, verify_chain
 from .cmdline import split_command
 from .config import Config, load_config
 from .models import JobStatus, Restrictions, WorkItem
+from .policy import PolicyViolation, check_repo_allowed
 from .queue import JobQueue
 from .worker import Worker
 
@@ -56,9 +57,18 @@ enabled = false
 outbound_urls = []          # e.g. ["https://koru.example.com/hooks/gca"]
 outbound_secret_env = "GCA_WEBHOOK_SECRET"
 inbound_secret_env = "GCA_INBOUND_SECRET"
-inbound_host = "127.0.0.1"
+inbound_host = "127.0.0.1"  # anything else needs a TLS-terminating proxy in front and behind_tls_proxy = true
 inbound_port = 8787
+# behind_tls_proxy = true
+# allow_publish = true      # false: the platform cannot ask gca to push/open PRs; use `gca publish`
 # events = ["approval.requested", "job.finished"]   # empty = all
+
+[publish]                   # this instance's (= this tenant's) publishing identity
+remote = "origin"
+draft = true
+token_env = "GITHUB_TOKEN"  # a token scoped to this tenant's repositories only
+# base = "main"
+# api_base = "https://ghe.example.com/api/v3"
 
 [servicenow]                # optional: `gca servicenow-sync` polls this table (approval happens in ServiceNow)
 # instance_url = "https://dev12345.service-now.com"
@@ -77,6 +87,7 @@ max_files_changed = 20     # verifier fails the job if the diff is larger than t
 max_lines_changed = 800
 
 [policy]
+# allowed_repos = ["/srv/repos/tenant-a"]   # work items may only target checkouts under these roots (empty = any)
 allowed_commands = ["python", "python3", "pytest", "npm", "node", "npx", "ls", "cat", "grep"]
 command_timeout_seconds = 300
 max_blocked_actions = 5
@@ -110,9 +121,14 @@ def cmd_init(args, cfg):
 
 def cmd_submit(args, cfg):
     desc = Path(args.description_file).read_text(encoding="utf-8") if args.description_file else (args.description or "")
+    try:
+        repo_path = check_repo_allowed(cfg.policy.allowed_repos, args.repo)
+    except PolicyViolation as e:
+        print(str(e), file=sys.stderr)
+        return 2
     item = WorkItem(
         title=args.title, description=desc, acceptance_criteria=args.criteria or [],
-        repo_path=str(Path(args.repo).resolve()), base_ref=args.base,
+        repo_path=repo_path, base_ref=args.base,
         test_command=split_command(args.test_cmd) if args.test_cmd else WorkItem.model_fields["test_command"].default_factory(),
         allowed_paths=args.allowed_path or [], requester=args.requester, idempotency_key=args.idempotency_key,
     )
@@ -231,8 +247,10 @@ def cmd_audit(args, cfg):
 
 def cmd_publish(args, cfg):
     from .publish import publish_job
-    res = publish_job(cfg, _queue(cfg), args.job_id, remote=args.remote, base=args.base, draft=not args.ready,
-                      create_pr=not args.no_pr, allow_failed=args.allow_failed)
+    pub = cfg.publish
+    res = publish_job(cfg, _queue(cfg), args.job_id, remote=args.remote or pub.remote, base=args.base or pub.base,
+                      draft=False if args.ready else pub.draft, create_pr=not args.no_pr,
+                      token_env=pub.token_env, api_base=pub.api_base, allow_failed=args.allow_failed)
     print(f"pushed {res.branch} -> {res.pushed_to}")
     if res.pr_url:
         print(f"pull request: {res.pr_url}")
@@ -369,7 +387,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("status"); s.add_argument("job_id", nargs="?"); s.set_defaults(fn=cmd_status)
     s = sub.add_parser("report"); s.add_argument("job_id"); s.add_argument("--out"); s.add_argument("--diff", action="store_true"); s.set_defaults(fn=cmd_report)
     s = sub.add_parser("audit"); s.add_argument("job_id"); s.add_argument("--verify", action="store_true"); s.set_defaults(fn=cmd_audit)
-    s = sub.add_parser("publish", help="push a succeeded job's branch and open a draft pull request"); s.add_argument("job_id"); s.add_argument("--remote", default="origin"); s.add_argument("--base", help="base branch (default: the remote's HEAD)"); s.add_argument("--ready", action="store_true", help="open as ready for review instead of draft"); s.add_argument("--no-pr", action="store_true", help="push only"); s.add_argument("--allow-failed", action="store_true", help="publish a failed job's branch for inspection"); s.set_defaults(fn=cmd_publish)
+    s = sub.add_parser("publish", help="push a succeeded job's branch and open a draft pull request"); s.add_argument("job_id"); s.add_argument("--remote", help="default: [publish] remote"); s.add_argument("--base", help="base branch (default: [publish] base, else the remote's HEAD)"); s.add_argument("--ready", action="store_true", help="open as ready for review instead of draft"); s.add_argument("--no-pr", action="store_true", help="push only"); s.add_argument("--allow-failed", action="store_true", help="publish a failed job's branch for inspection"); s.set_defaults(fn=cmd_publish)
     s = sub.add_parser("webhook-serve", help="serve signed inbound commands (submit/decision/cancel/kill-switch)"); s.add_argument("--host"); s.add_argument("--port", type=int); s.add_argument("--with-worker", action="store_true", help="also run a worker in this process"); s.add_argument("--poll", type=float, default=2.0); s.add_argument("--flush-every", type=float, default=5.0); s.set_defaults(fn=cmd_webhook_serve)
     s = sub.add_parser("webhook-deliver", help="deliver pending outbound webhook events now"); s.add_argument("--requeue-dead", action="store_true"); s.set_defaults(fn=cmd_webhook_deliver)
     s = sub.add_parser("webhook-status", help="list outbound webhook deliveries"); s.add_argument("--status", choices=["pending", "inflight", "delivered", "dead"]); s.add_argument("--limit", type=int, default=50); s.set_defaults(fn=cmd_webhook_status)

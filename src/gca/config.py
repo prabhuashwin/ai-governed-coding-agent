@@ -46,6 +46,10 @@ class ProviderConfig(BaseModel):
 
 
 class PolicyConfig(BaseModel):
+    # Repositories this instance may work on: directories whose subtree may be a work item's repo_path.
+    # Empty = any path on this host (single-developer use). Set it for every shared or platform-driven deployment:
+    # a signed submission can otherwise point the agent at any checkout the gca user can read.
+    allowed_repos: list[str] = Field(default_factory=list)
     # argv[0] values the agent may run via run_command. Everything else is blocked.
     allowed_commands: list[str] = Field(
         default_factory=lambda: ["python", "python3", "pytest", "npm", "node", "npx", "ls", "cat", "grep"]
@@ -118,8 +122,18 @@ class WebhookConfig(BaseModel):
     inbound_port: int = 8787
     inbound_secret_env: str = "GCA_INBOUND_SECRET"
     allow_publish: bool = True  # accept POST /v1/jobs/{id}/publish (push the verified commit, open a draft PR)
+    behind_tls_proxy: bool = False  # required to bind a non-loopback inbound_host: the server itself is plain HTTP
     max_skew_seconds: int = 300  # reject signed requests older/newer than this
     source_name: str = "gca"  # appears as `source` in every event envelope
+
+
+class PublishConfig(BaseModel):
+    """Where a job's branch goes when it is published. One instance = one tenant = one set of credentials."""
+    remote: str = "origin"
+    base: str | None = None  # default: the remote's HEAD
+    draft: bool = True
+    token_env: str = "GITHUB_TOKEN"  # environment variable holding this tenant's GitHub token (GH_TOKEN also read)
+    api_base: str = "https://api.github.com"  # GitHub Enterprise: https://ghe.example/api/v3
 
 
 class ApprovalConfig(BaseModel):
@@ -132,6 +146,7 @@ class Config(BaseModel):
     provider: ProviderConfig = Field(default_factory=ProviderConfig)
     webhooks: WebhookConfig = Field(default_factory=WebhookConfig)
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
+    publish: PublishConfig = Field(default_factory=PublishConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     servicenow: ServiceNowConfig = Field(default_factory=ServiceNowConfig)
     budget: Budget = Field(default_factory=Budget)

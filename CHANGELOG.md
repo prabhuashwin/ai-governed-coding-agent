@@ -20,6 +20,16 @@ Work package 2 of the Koru pilot plan: the worker controls the platform needs.
 - **Kill-switch scopes.** `scope` is `global` or `tenant` (this instance) or `job` with `job_id`, which maps
   onto cancellation. Events and audit entries carry the scope.
 
+Work package 3: one instance per tenant (`docs/multi-tenancy.md`).
+
+- **Repository allow-list.** `[policy] allowed_repos` restricts every submission (webhook 403, CLI exit 2,
+  ServiceNow record error) to checkouts under the listed roots, symlinks resolved. Empty keeps today's
+  behaviour for single-developer use.
+- **Publishing identity.** New `[publish]` section (`remote`, `base`, `draft`, `token_env`, `api_base`) used
+  by `gca publish` and the inbound publish command; a request cannot choose the token or API endpoint.
+- **TLS placement.** The inbound server refuses to bind a non-loopback address unless
+  `[webhooks] behind_tls_proxy = true`.
+
 ## 0.2.0 — 2026-10-19
 
 The release that closes four rounds of external security and correctness review of 0.1.0 (31 findings:
