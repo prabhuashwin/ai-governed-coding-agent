@@ -148,7 +148,9 @@ class Restrictions(BaseModel):
     @classmethod
     def _finite_budget(cls, v: dict[str, float | int] | None) -> dict[str, float | int] | None:
         for k, x in (v or {}).items():
-            if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x) or x < 0:
+            # ints are always finite (and math.isfinite would overflow on a huge one); only floats can be NaN/inf
+            if isinstance(x, bool) or not isinstance(x, (int, float)) or (isinstance(x, float) and not math.isfinite(x)) \
+                    or x < 0:
                 raise ValueError(f"budget.{k} must be a finite non-negative number")
         return v
 

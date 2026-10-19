@@ -200,6 +200,18 @@ interruption, retention and publishing code; fixed with `tests/unit/test_review_
 Real-model runs `real-openai-9`/`-10` predate this round; the fixes change no agent-facing behaviour except
 the `run_tests` restriction case.
 
+A sixth pass (commit `db227b2`, probing the round-5 fixes) found one P1, four P2 and one P3; fixed with
+`tests/unit/test_review_round6.py`:
+
+| # | Finding | Fix |
+|---|---|---|
+| P1 | `kill_tree` returned early once the command's own process had exited, so a child that outlived its parent was never killed and kept writing | POSIX: `killpg` on the session regardless of the leader's state; Windows: the command runs in a job object (`_WinJob`) and `TerminateJobObject` ends every member, with `taskkill /T` as the fallback |
+| P2 | On Windows, closing a pipe under a blocked reader thread blocked too, defeating the drain bound | Streams are left to the reader threads on Windows; the job kill closes the pipes; the bound holds |
+| P2 | `gca prune` failed on a database that had not received the `first_received_at` migration | The column is checked with `PRAGMA table_info` and the lease is used when it is absent |
+| P2 | Remote parsing was a regex: an explicit port skipped the PR, and hostname text inside another host's path matched | `parse_remote` parses URL and scp forms and compares real hostnames; ports and credentials ignored |
+| P2 | Two publish tests patched `httpx.Client` with a lambda that called itself; the 502 came from a `RecursionError` | The patch wraps the original constructor and the test asserts the single intended GitHub call |
+| P3 | `math.isfinite(10**309)` raised `OverflowError` → 500 | Only floats are checked for finiteness; huge ints are rejected by the narrowing rule (422) |
+
 ## Known gaps
 
 - `kind = "worktree"` is not a sandbox against a hostile model (an allow-listed `python` can open sockets).

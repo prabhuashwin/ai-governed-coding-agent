@@ -37,16 +37,40 @@ def api_host(api_base: str) -> str | None:
     return "github.com" if host in ("api.github.com", "github.com") else host
 
 
+def parse_remote(remote_url: str) -> tuple[str | None, str | None]:
+    """(host, 'owner/repo') of a git remote: https://[user@]host[:port]/owner/repo(.git), ssh://git@host[:port]/owner/repo,
+    or scp-like git@host:owner/repo(.git). The host is the real hostname (port and credentials stripped), never a
+    substring found elsewhere in the URL, so a path like https://evil.example/github.com/o/r is evil.example."""
+    s = remote_url.strip()
+    if "://" in s:
+        try:
+            u = urlsplit(s)
+        except ValueError:
+            return None, None
+        host, path = (u.hostname or "").lower(), u.path
+    else:
+        m = re.match(r"^(?:[^@/:]+@)?([^@:/]+):(?!//)(.+)$", s)  # scp-like; a leading drive letter is not a host
+        if not m or len(m.group(1)) == 1:
+            return None, None
+        host, path = m.group(1).lower(), m.group(2)
+    if not host:
+        return None, None
+    path = path.strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [p for p in path.split("/") if p]
+    if len(parts) != 2:
+        return host, None
+    return host, f"{parts[0]}/{parts[1]}"
+
+
 def github_slug(remote_url: str, host: str | None = None) -> str | None:
-    """'owner/repo' from https://<host>/o/r(.git), git@<host>:o/r(.git), ssh://git@<host>/o/r. `host` is github.com
-    or, for GitHub Enterprise, the host the configured `api_base` serves (otherwise an Enterprise remote would be
-    taken for "not GitHub" and the pull request silently skipped)."""
+    """'owner/repo' when the remote's hostname is github.com or, for GitHub Enterprise, the host the configured
+    `api_base` serves (otherwise an Enterprise remote would be taken for "not GitHub" and the pull request silently
+    skipped). Hostnames are compared exactly: ports and credentials are ignored, substrings never match."""
     hosts = {"github.com"} | ({host.lower()} if host else set())
-    for h in hosts:
-        m = re.search(rf"(?:^|[@/.]){re.escape(h)}[:/]+([^/]+)/([^/]+?)(?:\.git)?/?$", remote_url.strip(), re.I)
-        if m:
-            return f"{m.group(1)}/{m.group(2)}"
-    return None
+    h, slug = parse_remote(remote_url)
+    return slug if h in hosts else None
 
 
 def _git(repo: str, *args: str) -> str:

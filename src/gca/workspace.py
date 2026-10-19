@@ -41,28 +41,90 @@ STOP_POLL_SECONDS = 0.25
 KILL_DRAIN_SECONDS = 5.0  # how long to wait for output after killing a process tree before giving up on it
 
 
+class _WinJob:
+    """A Windows job object the command and all its descendants are placed in, so `terminate()` ends the whole
+    tree even after the command's own process has exited (a child that outlives its parent is otherwise
+    unreachable: `taskkill /T` walks the live parent chain). Falls back to `taskkill` if jobs are unavailable."""
+
+    _LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_EXTENDED_LIMIT_INFORMATION = 9
+
+    def __init__(self, proc: subprocess.Popen):
+        import ctypes
+        from ctypes import wintypes
+        self.handle = None
+        self.pid = proc.pid
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
+        job = k32.CreateJobObjectW(None, None)
+        if not job:
+            return
+
+        class _BasicLimits(ctypes.Structure):
+            _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                        ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                        ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                        ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                        ("SchedulingClass", wintypes.DWORD)]
+
+        class _IoCounters(ctypes.Structure):
+            _fields_ = [(n, ctypes.c_uint64) for n in ("ReadOperationCount", "WriteOperationCount",
+                                                        "OtherOperationCount", "ReadTransferCount",
+                                                        "WriteTransferCount", "OtherTransferCount")]
+
+        class _ExtendedLimits(ctypes.Structure):
+            _fields_ = [("BasicLimitInformation", _BasicLimits), ("IoInfo", _IoCounters),
+                        ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                        ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+
+        info = _ExtendedLimits()
+        info.BasicLimitInformation.LimitFlags = self._LIMIT_KILL_ON_JOB_CLOSE
+        ok = k32.SetInformationJobObject(job, self._JOB_EXTENDED_LIMIT_INFORMATION, ctypes.byref(info),
+                                         ctypes.sizeof(info))
+        if ok and k32.AssignProcessToJobObject(job, wintypes.HANDLE(proc._handle)):  # type: ignore[attr-defined]
+            self.handle, self._k32 = job, k32
+        else:
+            k32.CloseHandle(job)
+
+    def terminate(self) -> None:
+        if self.handle is not None:
+            self._k32.TerminateJobObject(self.handle, 1)
+            return
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(self.pid)], capture_output=True, timeout=10)
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self._k32.CloseHandle(self.handle)
+            self.handle = None
+
+
 def _popen_tree(cmd: list[str], *, cwd: str | None, env: dict[str, str] | None) -> subprocess.Popen:
-    """Start `cmd` as the leader of its own process group / session so the whole tree can be killed at once."""
+    """Start `cmd` so that the whole tree it spawns can be killed at once, whether or not `cmd` itself is still
+    alive: a new session (process group) on POSIX, a job object on Windows."""
     kw: dict = {}
     if sys.platform == "win32":
         kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         kw["start_new_session"] = True
-    return subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             stdin=subprocess.DEVNULL, **kw)
+    if sys.platform == "win32":
+        proc._gca_job = _WinJob(proc)  # type: ignore[attr-defined]
+    return proc
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
-    """Kill the process and every descendant. Killing only the parent leaves children (a test runner's workers,
-    a script's subprocesses) running — and writing to the worktree — after a cancel, and keeps the output pipes
-    open so draining them never finishes."""
-    if proc.poll() is not None:
-        return
+    """Kill the command and every descendant, including children that outlived the command itself. The group /
+    job outlives its leader, so this must not short-circuit when the leader has already exited — that is exactly
+    the case where a surviving child keeps writing and keeps the output pipes open."""
     try:
         if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=10)
+            job = getattr(proc, "_gca_job", None)
+            if job is not None:
+                job.terminate()
+            else:
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=10)
         else:
-            os.killpg(proc.pid, signal.SIGKILL)
+            os.killpg(proc.pid, signal.SIGKILL)  # pgid == pid: the command started its own session
     except (ProcessLookupError, PermissionError, OSError, subprocess.SubprocessError):
         pass
     try:
@@ -72,23 +134,30 @@ def kill_tree(proc: subprocess.Popen) -> None:
 
 
 def _drain(proc: subprocess.Popen) -> tuple[str, str]:
-    """Collect what the (killed) process wrote, with a bound: a grandchild that survived and still holds the
-    pipes must not hang the worker. Whatever was not read is lost, which is fine for a stopped command."""
+    """Collect what the (killed) tree wrote, with a bound. A process that escaped the group/job (it called
+    `setsid` itself) and still holds the pipes must not hang the worker; whatever was not read is lost, which is
+    fine for a stopped command. On Windows the pipes are read by threads, and closing a pipe under a blocked
+    reader blocks too, so the streams are left to the reader threads there."""
     try:
         out_b, err_b = proc.communicate(timeout=KILL_DRAIN_SECONDS)
+        return out_b.decode(errors="replace"), err_b.decode(errors="replace")
     except subprocess.TimeoutExpired:
-        for stream in (proc.stdout, proc.stderr):
-            try:
-                if stream:
-                    stream.close()
-            except OSError:
-                pass
+        if sys.platform != "win32":
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    if stream:
+                        stream.close()
+                except OSError:
+                    pass
         try:
             proc.wait(timeout=1)  # the leader itself is dead; reap it so nothing lingers as a zombie
         except subprocess.TimeoutExpired:
             pass
-        return "", "[output not drained: a child process kept the pipes open]"
-    return out_b.decode(errors="replace"), err_b.decode(errors="replace")
+        return "", "[output not drained: a process outside the command's group kept the pipes open]"
+    finally:
+        job = getattr(proc, "_gca_job", None)
+        if job is not None:
+            job.close()
 
 
 def run_until_stopped(cmd: list[str], *, cwd: str | None, env: dict[str, str] | None, timeout: int,
@@ -123,6 +192,9 @@ def run_until_stopped(cmd: list[str], *, cwd: str | None, env: dict[str, str] | 
         except subprocess.TimeoutExpired:
             pass
         else:
+            job = getattr(proc, "_gca_job", None)
+            if job is not None:
+                job.close()
             out, err = out_b.decode(errors="replace"), err_b.decode(errors="replace")
             if stop_check is not None and stop_check():  # it arrived while the command ran: the result is void
                 return CommandResult(shown, -1, out, err + "\n[interrupted: stop requested]", interrupted=True)
