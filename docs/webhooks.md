@@ -14,6 +14,10 @@ other's SDK, only this contract.
                                                                GET  /v1/jobs/{id}
 ```
 
+Real samples of every command (request and response) and every event, produced by the cross-process
+contract test, are in **`docs/webhook-contract-samples.json`**. Who builds the Koru side and how the two
+stay in step: `docs/koru-adapter.md`.
+
 ## Mapping to Koru capabilities
 
 | Koru capability | Wiring |
@@ -230,4 +234,8 @@ switch requires a non-empty `reason`. Every change is recorded in the hash-chain
   approval flow, self-approval, restrictions, idempotent replay, publish, kill switch before and during a run
   and its scopes, real HTTP server; `tests/safety/test_worker_controls.py`: restrictions enforced end to end,
   interruption of a running command and of verification).
-  **Not yet exercised against Koru itself.** That needs Koru's endpoint and shared secrets.
+  The cross-process contract test (`scripts/webhook_e2e.py`, run in CI) covers submit, replay, allow-list
+  refusal, approval with enforced restrictions, the lifecycle, status, publish and both kill-switch scopes
+  over real signed HTTP, and regenerates the samples.
+  **Not yet exercised against Koru itself.** That needs Koru's endpoint and shared secrets
+  (`docs/koru-adapter.md` lists the acceptance run).

@@ -30,6 +30,16 @@ Work package 3: one instance per tenant (`docs/multi-tenancy.md`).
 - **TLS placement.** The inbound server refuses to bind a non-loopback address unless
   `[webhooks] behind_tls_proxy = true`.
 
+Work package 4: the Koru adapter (`docs/koru-adapter.md`).
+
+- **Ownership.** The adapter is Koru-side code owned by the Koru platform team; this repository owns the
+  contract, the contract test and the samples. The seam: gca guarantees the samples, the adapter is tested
+  against them.
+- **Contract test.** `scripts/webhook_e2e.py` now exercises the whole surface over real signed HTTP
+  (submit, replay, allow-list refusal, approval with enforced restrictions, lifecycle, status, publish,
+  instance- and job-scope stops) and writes `webhook-e2e.contract.json`; the committed snapshot is
+  `docs/webhook-contract-samples.json`, and CI fails if event shapes drift from it.
+
 ## 0.2.0 — 2026-10-19
 
 The release that closes four rounds of external security and correctness review of 0.1.0 (31 findings:
