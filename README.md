@@ -178,6 +178,9 @@ What you can rely on:
   the reviewer.
 - **Publishing can be requested by the platform** (`POST /v1/jobs/{id}/publish`, attributed to a person) or
   switched off with `allow_publish = false`.
+- **One instance per tenant**: its own secrets, `[policy] allowed_repos`, `[publish]` token and data
+  directory; the plain-HTTP server only binds off loopback behind a declared TLS proxy. See
+  [`docs/multi-tenancy.md`](docs/multi-tenancy.md).
 
 The full contract is in **[`docs/webhooks.md`](docs/webhooks.md)**: headers, signing, every payload,
 verification code in Python and Node, and how Koru's approvals, kill switches, observability and AI gateway
@@ -220,7 +223,7 @@ Every command accepts `-c path/to/gca.toml` (default `./gca.toml`, or `$GCA_CONF
 
 | Layer | Command | Needs |
 |---|---|---|
-| Unit, loop, safety (red-team), end-to-end: 262 tests | `pytest -q` | nothing; about 2 minutes |
+| Unit, loop, safety (red-team), end-to-end: 268 tests | `pytest -q` | nothing; about 2 minutes |
 | Real containers | `GCA_TEST_RUNTIME=docker GCA_TEST_IMAGE=<image with pytest> pytest tests/unit/test_container_workspace.py` | Docker or Podman |
 | Golden-task evals, real model | `gca eval`, or the **evals (real model)** GitHub workflow | an API key |
 | Local model (no external inference) | **evals (local model, Ollama)** workflow | nothing |
@@ -238,6 +241,7 @@ keys stay in repository secrets, and results are committed to the `eval-results`
 | [`docs/how-to-test.md`](docs/how-to-test.md) | Every test layer and how to extend it |
 | [`docs/eval-baseline.md`](docs/eval-baseline.md) | Measured pass rates and costs (hosted and local models) and what they mean |
 | [`docs/webhooks.md`](docs/webhooks.md) | The integration contract for Koru or any webhook platform |
+| [`docs/multi-tenancy.md`](docs/multi-tenancy.md) | One instance per tenant: what is per instance, identity trust, TLS placement, operating N instances |
 | [`docs/sample-report.md`](docs/sample-report.md), [`docs/sample-audit.txt`](docs/sample-audit.txt) | What a finished job produces |
 | [`evals/README.md`](evals/README.md) | How golden tasks work and how to add one |
 

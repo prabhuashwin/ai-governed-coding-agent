@@ -27,6 +27,7 @@ from ..audit import AuditLog
 from ..cmdline import split_command
 from ..config import Config, ServiceNowConfig
 from ..models import TERMINAL_STATES, Job, JobStatus, WorkItem
+from ..policy import check_repo_allowed
 from ..queue import JobQueue
 
 
@@ -120,6 +121,7 @@ def sync_once(cfg: Config, queue: JobQueue, source: ServiceNowSource) -> dict[st
     for rec in source.fetch_approved():
         try:
             item = source.to_work_item(rec)
+            item.repo_path = check_repo_allowed(cfg.policy.allowed_repos, item.repo_path)
             job = queue.submit(item, cfg.budget)
             audit = AuditLog(cfg.audit_dir, job.id, redactions=cfg.policy.canary_strings)
             if job.status == JobStatus.SUBMITTED:

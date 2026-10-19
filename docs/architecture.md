@@ -65,6 +65,8 @@ dies leaves a stale heartbeat; `recover_stale` moves the job to `failed` with a 
 | Approval restrictions can only narrow (paths, commands, budget), applied in the approval transaction and enforced by policy, loop and verifier | `Restrictions.apply`, `JobQueue.approve` | unit, safety |
 | Cancel and kill switch interrupt a command or verifier run in flight (≤ 0.25 s poll); the job ends `cancelled`, never `succeeded`, with verification flagged `interrupted` | `workspace.run_until_stopped`, `Verifier`, `Worker` | safety |
 | Webhook signatures bind method, path, delivery id and body; inbound delivery ids reserved before execution | `webhooks.sign`, `inbound.handle` | unit, fuzz |
+| Repository allow-list: a work item may only target a checkout under `[policy] allowed_repos` (symlinks resolved), from any source | `policy.check_repo_allowed` | unit |
+| One tenant per instance: own secrets, repos, publishing token and data dir; plain-HTTP server refuses non-loopback binds unless declared behind a TLS proxy | `docs/multi-tenancy.md`, `inbound.make_server` | unit |
 | Independent test run from clean checkout | `Verifier.verify` | safety, e2e |
 | Hash-chained audit log, appended under a cross-process lock | `AuditLog`, `verify_chain` | unit, e2e |
 | Idempotent submit, atomic claim, crash recovery | `JobQueue` | unit |

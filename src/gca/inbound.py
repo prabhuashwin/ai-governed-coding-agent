@@ -28,6 +28,7 @@ from pydantic import ValidationError
 from .audit import AuditLog
 from .config import Config
 from .models import Budget, JobStatus, Restrictions, WorkItem, add_column_if_missing, now_iso, open_db
+from .policy import PolicyViolation, check_repo_allowed
 from .publish import publish_job
 from .queue import InvalidTransition, JobQueue
 from .webhooks import verify_signature
@@ -179,6 +180,10 @@ class CommandHandler:
         if delivery_id and not p.get("idempotency_key"):
             p["idempotency_key"] = f"delivery:{delivery_id}"  # a retried delivery can never create a second job
         item = WorkItem.model_validate(p)
+        try:
+            item.repo_path = check_repo_allowed(self.cfg.policy.allowed_repos, item.repo_path)
+        except PolicyViolation as e:
+            raise CommandError(403, str(e)) from e
         budget = self.cfg.budget.model_copy(update=Budget.model_validate(budget_in).model_dump(exclude_unset=True)) \
             if budget_in else self.cfg.budget
         # a caller can lower limits but never raise them above the operator's configured budget
@@ -251,13 +256,15 @@ class CommandHandler:
             raise CommandError(422, "actor is required")
         if job.status != JobStatus.SUCCEEDED:
             raise CommandError(409, f"{job_id} is {job.status.value}; only succeeded jobs can be published")
-        draft = p.get("draft", True)
+        draft = p.get("draft", self.cfg.publish.draft)
         if not isinstance(draft, bool):
             raise CommandError(422, "draft must be true or false")
         self._audit(job_id).record(actor, "publish_requested", via="webhook", draft=draft)
         try:
-            res = publish_job(self.cfg, self.queue, job_id, remote=str(p.get("remote", "origin")),
-                              base=p.get("base"), draft=draft, create_pr=bool(p.get("create_pr", True)), actor=actor)
+            pub = self.cfg.publish
+            res = publish_job(self.cfg, self.queue, job_id, remote=str(p.get("remote", pub.remote)),
+                              base=p.get("base", pub.base), draft=draft, create_pr=bool(p.get("create_pr", True)),
+                              token_env=pub.token_env, api_base=pub.api_base, actor=actor)
         except ValueError as e:  # not publishable in its current state (e.g. the branch moved after verification)
             raise CommandError(409, str(e)) from e
         except RuntimeError as e:  # git or GitHub failure
@@ -371,5 +378,8 @@ def make_server(cfg: Config, queue: JobQueue, host: str | None = None, port: int
         def log_message(self, fmt: str, *args: Any) -> None:  # quiet by default
             pass
 
-    return ThreadingHTTPServer((host or cfg.webhooks.inbound_host, port if port is not None else cfg.webhooks.inbound_port),
-                               _Handler)
+    bind = host or cfg.webhooks.inbound_host
+    if bind not in ("127.0.0.1", "localhost", "::1") and not cfg.webhooks.behind_tls_proxy:
+        raise ValueError(f"refusing to bind the plain-HTTP inbound server on {bind}: put it behind a TLS-terminating "
+                         "proxy and set [webhooks] behind_tls_proxy = true, or bind 127.0.0.1")
+    return ThreadingHTTPServer((bind, port if port is not None else cfg.webhooks.inbound_port), _Handler)

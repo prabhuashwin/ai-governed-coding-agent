@@ -20,6 +20,20 @@ class PolicyViolation(Exception):
     """Raised when an action is blocked. The message is safe to show to the agent."""
 
 
+def check_repo_allowed(allowed_repos: list[str], repo_path: str) -> str:
+    """Return the resolved repo path if it lies inside one of `allowed_repos` (or the list is empty); raise
+    PolicyViolation otherwise. Symlinks are resolved on both sides so a link inside an allowed root cannot
+    point the agent at a checkout outside it."""
+    target = Path(repo_path).resolve()
+    if not allowed_repos:
+        return str(target)
+    for root in allowed_repos:
+        r = Path(root).resolve()
+        if target == r or r in target.parents:
+            return str(target)
+    raise PolicyViolation(f"repository {repo_path} is not in this instance's allowed_repos")
+
+
 @dataclass
 class BudgetTracker:
     budget: Budget

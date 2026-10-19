@@ -36,12 +36,22 @@ enabled = true
 outbound_urls = ["https://koru.example.com/hooks/gca"]
 outbound_secret_env = "GCA_WEBHOOK_SECRET"   # shared with Koru; signs events gca sends
 inbound_secret_env  = "GCA_INBOUND_SECRET"   # shared with Koru; verifies commands gca receives
-inbound_host = "0.0.0.0"                     # default 127.0.0.1; expose only behind TLS
+inbound_host = "0.0.0.0"                     # default 127.0.0.1; any other bind needs behind_tls_proxy = true
+behind_tls_proxy = true                      # you have put a TLS-terminating proxy in front (docs/multi-tenancy.md)
 inbound_port = 8787
 events = []                                  # empty = all; e.g. ["approval.requested", "job.finished"]
 include_report = true
 max_attempts = 8
 allow_publish = true                         # false: POST /v1/jobs/{id}/publish answers 403; use `gca publish`
+
+[publish]                                    # this instance's publishing identity (one tenant = one token)
+remote = "origin"
+draft = true
+token_env = "GITHUB_TOKEN"
+# base = "main"; api_base = "https://ghe.example/api/v3"
+
+[policy]
+allowed_repos = ["/srv/repos/tenant-a"]      # submissions outside these roots are refused (403)
 ```
 
 Run it:
@@ -148,6 +158,7 @@ should not depend on it. Any configured canary secret is replaced with `[REDACTE
  "idempotency_key": "koru:req-123", "budget": {"max_turns": 15, "max_cost_usd": 0.25}}
 ```
 Response: `{"job_id": "job_…", "status": "submitted", "approval": "pending_webhook_decision"}`.
+403 when `repo_path` is not inside one of the instance's `[policy] allowed_repos`.
 `budget` can only **lower** the operator's configured limits.
 
 ### `POST /v1/jobs/{id}/decision` → 200
@@ -180,7 +191,8 @@ its next turn, and a command or verifier test run in flight is killed within abo
 
 ### `POST /v1/jobs/{id}/publish` → 200
 `{"actor": "alice@corp", "draft": true, "base": "main", "remote": "origin", "create_pr": true}`. `actor` is
-required (every publish is attributed to a person). Pushes the verified commit and opens a draft PR, exactly
+required (every publish is attributed to a person). `remote`, `base` and `draft` default to `[publish]`; the
+token and API endpoint always come from `[publish]` and cannot be chosen by the request. Pushes the verified commit and opens a draft PR, exactly
 like `gca publish`: the job must be `succeeded` and its branch must still point at the verified commit.
 Response: `{"job_id", "branch", "pushed_to", "pr_url", "note"}`; replays return the recorded response without
 pushing again. Errors: 403 when `[webhooks] allow_publish = false`, 409 when the job has not succeeded or its
@@ -210,7 +222,8 @@ switch requires a non-empty `reason`. Every change is recorded in the hash-chain
   before the command runs, so a retry can never create a second job. A work item submitted without an
   `idempotency_key` gets `delivery:<delivery id>` as its key.
 - The kill switch is global to this gca instance (`scope` `global` or `tenant`). Koru's per-tenant switch maps
-  onto it, one gca instance per tenant; per-agent (per-job) stops use `scope = "job"`.
+  onto it, one gca instance per tenant; per-agent (per-job) stops use `scope = "job"`. The tenancy model —
+  what is per instance, how identities are trusted, where TLS terminates — is in `docs/multi-tenancy.md`.
 - Stops are prompt: a running command or verifier test run is killed within `STOP_POLL_SECONDS` (0.25 s) of
   the cancel or kill switch landing in the queue, in both the host and container workspaces.
 - Tested end to end against a mocked platform (`tests/unit/test_webhooks.py`: signing, retries, dead letters,
