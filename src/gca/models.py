@@ -23,19 +23,47 @@ def open_db(owner: object, path: str) -> sqlite3.Connection:
     return conn
 
 
+def _retry_locked(fn, *, seconds: float = 10.0):
+    """Call `fn` until it stops raising 'database is locked'. The busy handler covers ordinary statements, but a
+    few schema-level operations (changing the journal mode, DDL during another connection's write) can return
+    SQLITE_BUSY immediately on some platforms, so startup under contention retries them explicitly."""
+    import time
+
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() and "busy" not in str(e).lower() or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.02)
+
+
+def set_wal(conn: sqlite3.Connection) -> None:
+    """Switch to WAL journaling; harmless to skip if another connection is mid-write at the moment (WAL is a
+    performance setting, and the next opener will set it)."""
+    try:
+        _retry_locked(lambda: conn.execute("PRAGMA journal_mode=WAL"), seconds=2.0)
+    except sqlite3.OperationalError:
+        pass
+
+
 def add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
     """Schema migration safe under concurrent startup: the check and the ALTER run in one write transaction, and
     a second process that lost the race sees the column already there (or a benign duplicate-column error)."""
-    cur = conn.cursor()
-    cur.execute("BEGIN IMMEDIATE")
-    try:
-        if column not in {r[1] for r in cur.execute(f"PRAGMA table_info({table})")}:
-            cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-        cur.execute("COMMIT")
-    except sqlite3.OperationalError as e:
-        cur.execute("ROLLBACK")
-        if "duplicate column" not in str(e).lower():
-            raise
+    def once() -> None:
+        cur = conn.cursor()
+        cur.execute("BEGIN IMMEDIATE")
+        try:
+            if column not in {r[1] for r in cur.execute(f"PRAGMA table_info({table})")}:
+                cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            cur.execute("COMMIT")
+        except sqlite3.OperationalError as e:
+            cur.execute("ROLLBACK")
+            if "duplicate column" not in str(e).lower():
+                raise
+
+    _retry_locked(once)
 
 
 def now_iso() -> str:

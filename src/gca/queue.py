@@ -25,6 +25,7 @@ from .models import (
     add_column_if_missing,
     now_iso,
     open_db,
+    set_wal,
 )
 
 
@@ -50,7 +51,7 @@ class JobQueue:
         # open *inside* that transaction, so a later ROLLBACK would undo it. Every operation therefore takes
         # this re-entrant lock, not only the explicit transactions.
         self._txn = threading.RLock()
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        set_wal(self._conn)
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS jobs (
