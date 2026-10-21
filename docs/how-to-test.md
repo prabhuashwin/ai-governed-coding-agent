@@ -55,7 +55,7 @@ run-before-approval does nothing → approve → run → status → report (+dif
 working copy untouched. Reject and cancel paths. The eval runner itself with a scripted model.
 
 **Webhook contract test** (`test_webhook_e2e_script.py` → `scripts/webhook_e2e.py`): gca, a fake Koru and a
-driver as three OS processes over real signed HTTP, with opaque identities on. Twenty-five checks covering
+driver as three OS processes over real signed HTTP, with opaque identities on. Twenty-six checks covering
 every inbound command (including agent-scope stops and an approval window running out) and every event type
 except `job.blocked_action`; writes `webhook-e2e.contract.json`, and the test fails if the
 event shapes differ from the committed `docs/webhook-contract-samples.json` (the adapter team's reference).
@@ -213,6 +213,20 @@ A sixth pass (commit `db227b2`, probing the round-5 fixes) found one P1, four P2
 | P2 | Remote parsing was a regex: an explicit port skipped the PR, and hostname text inside another host's path matched | `parse_remote` parses URL and scp forms and compares real hostnames; ports and credentials ignored |
 | P2 | Two publish tests patched `httpx.Client` with a lambda that called itself; the 502 came from a `RecursionError` | The patch wraps the original constructor and the test asserts the single intended GitHub call |
 | P3 | `math.isfinite(10**309)` raised `OverflowError` → 500 | Only floats are checked for finiteness; huge ints are rejected by the narrowing rule (422) |
+
+Before the Koru-gap changes (per-agent stop, approval deadline, opaque identities) were merged, an independent
+review found six issues, fixed with the tests named in `tests/unit/test_koru_gaps.py` (section "independent
+review, before merge"); Windows CI found a seventh:
+
+| # | Finding | Fix |
+|---|---|---|
+| P1 | Kill-switch supersession compared the switch's *apply* time with the new delivery's receipt time, so an "off" received before an "on" but applied after the "on" arrived made the "on" look stale (11 of 200 real-HTTP trials; the instance switch had the same flaw) | `controls.version` holds the first-received time of the request that set the switch; deliveries are compared by receipt |
+| P1 | Opaque mode's default pattern accepted bare user names (`jane.doe`), and ServiceNow text fields passed user names through | `identity_pattern` is required in opaque mode and may not accept an email or a spaced name; ServiceNow people must be `sys_id`s |
+| P2 | `agent_id` (or `job_id`) sent without the matching `scope` acted on the instance switch — an agent release could release the instance | Mismatched targets are refused (422) |
+| P2 | An expiry whose audit record failed (or a crash after the cancellation) was never recorded or reported | The expiry stays marked until recorded; the next sweep retries it; one failure does not hold up others |
+| P3 | A stop that landed during a model call let that reply's tool calls run | Stop checks before every tool call |
+| P3 | Docs overstated stop latency (model calls) and how often a plain worker sweeps expiries | Wording corrected |
+| CI | Windows: a transient SQLite lock while recording a delivery aborted the delivery pass (the event would be posted again after its lease) | Outbox claim/mark retry transient lock errors |
 
 ## Known gaps
 

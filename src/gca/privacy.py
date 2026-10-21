@@ -8,6 +8,9 @@ and the audit chain stays intact.
 
 What this does not cover: free text the caller sends (title, description, acceptance criteria, notes, conditions,
 reasons) is recorded as given. Keep personal data out of it.
+
+ServiceNow people are ServiceNow `sys_id`s (32 hex characters), a different id space from the platform's user
+ids, and are checked against that shape instead (`sources/servicenow.py`).
 """
 
 from __future__ import annotations
@@ -28,9 +31,12 @@ def check_identity(cfg: Config, value: str | None, field: str) -> str:
     v = (value or "").strip()
     if not cfg.privacy.opaque_identities:
         return v
+    pattern = cfg.privacy.identity_pattern
+    if not pattern:  # only reachable if the setting was changed after validation: refuse everyone, never accept
+        raise IdentityError("opaque identities are on but no [privacy] identity_pattern is set")
     if not v:
         raise IdentityError(f"{field} is required: an opaque user id (opaque identities are on)")
-    if not re.fullmatch(cfg.privacy.identity_pattern, v):
-        raise IdentityError(f"{field} must be an opaque user id matching {cfg.privacy.identity_pattern!r}, not a name "
-                            "or email address ([privacy] opaque_identities = true)")
+    if not re.fullmatch(pattern, v):
+        raise IdentityError(f"{field} must be an opaque user id matching {pattern!r}, not a name, user name or "
+                            "email address ([privacy] opaque_identities = true)")
     return v

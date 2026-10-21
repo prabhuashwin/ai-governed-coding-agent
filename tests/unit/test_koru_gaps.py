@@ -364,18 +364,38 @@ def test_cli_approval_timeout(tmp_path, calc_repo, capsys):
 
 
 # ======================================================================== 3. opaque identities
+ID_PATTERN = r"^u_[0-9a-z]{2,32}$"  # a platform's user-id format, as an operator would declare it
+
+
 @pytest.fixture
 def opaque_cfg(hook_cfg):
-    hook_cfg.privacy = PrivacyConfig(opaque_identities=True)
+    hook_cfg.privacy = PrivacyConfig(opaque_identities=True, identity_pattern=ID_PATTERN)
     return hook_cfg
+
+
+def test_opaque_mode_needs_an_explicit_id_pattern_that_refuses_emails_and_names():
+    with pytest.raises(ValidationError, match="needs identity_pattern"):
+        PrivacyConfig(opaque_identities=True)
+    for loose in (r".*", r"^[\w.@ -]+$", r"^\S+@\S+$"):
+        with pytest.raises(ValidationError, match="must not accept"):
+            PrivacyConfig(opaque_identities=True, identity_pattern=loose)
+    with pytest.raises(ValidationError):
+        PrivacyConfig(identity_pattern="(unclosed")
+    assert PrivacyConfig().identity_pattern is None  # off by default, nothing required
+
+
+def test_a_pattern_removed_after_validation_fails_closed(opaque_cfg, work_item):
+    opaque_cfg.privacy.identity_pattern = None  # assignment is not validated: refuse everyone, never accept
+    h = CommandHandler(opaque_cfg, JobQueue(opaque_cfg.db_path))
+    assert call(h, "POST", "/v1/work-items", wi_body(work_item, requester="u_7f3a"))[0] == 422
 
 
 def test_opaque_mode_refuses_names_and_emails_at_every_entry_point(opaque_cfg, work_item):
     q = JobQueue(opaque_cfg.db_path)
     h = CommandHandler(opaque_cfg, q)
-    for who in ("alice@corp.example", "Alice Smith", ""):
+    for who in ("alice@corp.example", "Alice Smith", "", "alice", "alice.smith", "Alice_Smith"):
         status, resp = call(h, "POST", "/v1/work-items", wi_body(work_item, requester=who))
-        assert status == 422 and "alice" not in json.dumps(resp).lower()  # never echoed back
+        assert status == 422 and "alice" not in json.dumps(resp).lower(), who  # never echoed back
     no_requester = {k: v for k, v in wi_body(work_item).items() if k != "requester"}
     assert call(h, "POST", "/v1/work-items", no_requester)[0] == 422
     status, resp = call(h, "POST", "/v1/work-items", wi_body(work_item, requester=["alice@corp.example"]))
@@ -385,6 +405,7 @@ def test_opaque_mode_refuses_names_and_emails_at_every_entry_point(opaque_cfg, w
     assert status == 201
     jid = resp["job_id"]
     assert call(h, "POST", f"/v1/jobs/{jid}/decision", {"decision": "approve", "approver": "bob@corp.example"})[0] == 422
+    assert call(h, "POST", f"/v1/jobs/{jid}/decision", {"decision": "approve", "approver": "john.smith"})[0] == 422
     assert call(h, "POST", f"/v1/jobs/{jid}/cancel", {"by": "carol@corp.example"})[0] == 422
     assert call(h, "POST", f"/v1/jobs/{jid}/publish", {"actor": "dave@corp.example"})[0] == 422
     assert kill(h, True, scope="global", agent_id=None, actor="eve@corp.example")[0] == 422
@@ -394,7 +415,9 @@ def test_opaque_mode_refuses_names_and_emails_at_every_entry_point(opaque_cfg, w
     for f in opaque_cfg.audit_dir.glob("*.jsonl"):
         assert "@" not in f.read_text(encoding="utf-8"), f.name
     rows = [r[0] for r in h._conn.execute("SELECT response FROM inbound_deliveries")]
-    assert not any("corp.example" in r or "Alice" in r for r in rows)
+    assert not any("corp.example" in r or "alice" in r.lower() or "john" in r for r in rows)
+    actors = {e.actor for f in opaque_cfg.audit_dir.glob("job_*.jsonl") for e in AuditLog(opaque_cfg.audit_dir, f.stem).events()}
+    assert actors <= {"u_7f3a", "u_9c1d", "webhook"}, actors
 
 
 def test_a_custom_identity_pattern_is_enforced(opaque_cfg, work_item):
@@ -414,12 +437,14 @@ def test_identities_are_unchanged_when_opaque_mode_is_off(hook_cfg, work_item):
 
 def test_cli_refuses_names_in_opaque_mode(tmp_path, calc_repo, capsys):
     toml = tmp_path / "gca.toml"
-    toml.write_text(f'data_dir = "{(tmp_path / "d").as_posix()}"\n[privacy]\nopaque_identities = true\n')
+    toml.write_text(f'data_dir = "{(tmp_path / "d").as_posix()}"\n[privacy]\nopaque_identities = true\n'
+                    f"identity_pattern = '{ID_PATTERN}'\n")
     sub = ["-c", str(toml), "submit", "--title", "t", "--description", "d", "--repo", str(calc_repo)]
     assert cli_main(sub + ["--requester", "alice@corp.example"]) == 2
     assert cli_main(sub) == 0  # the command's own label "cli" names no one
     jid = capsys.readouterr().out.strip().split()[-1]
     assert cli_main(["-c", str(toml), "approve", jid, "--approver", "Bob Jones"]) == 2
+    assert cli_main(["-c", str(toml), "approve", jid, "--approver", "bob.jones"]) == 2
     assert cli_main(["-c", str(toml), "cancel", jid, "--by", "carol@corp.example"]) == 2
     assert cli_main(["-c", str(toml), "kill", "on", "--reason", "x", "--by", "eve@corp.example"]) == 2
     assert cli_main(["-c", str(toml), "approve", jid, "--approver", "u_lead"]) == 0
@@ -430,13 +455,18 @@ def test_servicenow_records_people_by_sys_id_in_opaque_mode(config, monkeypatch)
     monkeypatch.setenv("SN_USER", "svc")
     monkeypatch.setenv("SN_PASSWORD", "pw")
     from gca.sources.servicenow import sync_once
-    no_opener = {**REC, "sys_id": "def456", "number": "WI0001002", "opened_by": "", "sys_created_by": "jane.doe"}
-    config.privacy = PrivacyConfig(opaque_identities=True)
+    opener, approver = "a" * 32, "b" * 32  # sys_user sys_ids
+    ref = {**REC, "sys_id": "abc123", "opened_by": {"value": opener, "display_value": "Ashwin Prabhu"},
+           "approver": {"value": approver, "display_value": "Tech Lead"}}
+    no_opener = {**ref, "sys_id": "def456", "number": "WI0001002", "opened_by": "", "sys_created_by": "jane.doe"}
+    typed = {**ref, "sys_id": "ghi789", "number": "WI0001003", "approver": "jane.doe"}  # a plain text field
+    config.privacy = PrivacyConfig(opaque_identities=True, identity_pattern=ID_PATTERN)  # its own id space
     q = JobQueue(config.db_path)
-    rep = sync_once(config, q, make_source(FakeTableAPI([REC, no_opener])))
-    assert rep["errors"] == []
+    rep = sync_once(config, q, make_source(FakeTableAPI([ref, no_opener, typed])))
+    assert len(rep["errors"]) == 1 and "WI0001003" in rep["errors"][0] and "jane" not in rep["errors"][0]
     by_ref = {j.work_item.source_ref: j for j in q.list()}
-    assert by_ref["abc123"].work_item.requester == "u1" and by_ref["abc123"].approval.approver == "u2"
+    assert set(by_ref) == {"abc123", "def456"}  # the typed user name never reached the queue or the audit log
+    assert by_ref["abc123"].work_item.requester == opener and by_ref["abc123"].approval.approver == approver
     assert by_ref["def456"].work_item.requester == "servicenow"  # never the user name
     for f in config.audit_dir.glob("*.jsonl"):
         text = f.read_text(encoding="utf-8")
@@ -454,3 +484,83 @@ def test_servicenow_keeps_display_names_when_opaque_mode_is_off(config, monkeypa
     assert q.list()[0].work_item.requester == "Ashwin Prabhu"
     q.close()
 
+
+
+# ======================================================================== independent review, before merge
+@pytest.mark.parametrize("agent_id", [None, "a1"])
+def test_supersession_follows_receipt_order_not_apply_order(config, agent_id):
+    """An "off" received before an "on" but applied after the "on" arrived must not make the "on" look stale:
+    requests are ordered by when they were first received. And a genuinely older delivery is still refused."""
+    q = JobQueue(config.db_path)
+    CommandHandler(config, q)  # creates the inbound_deliveries table the delivery outcome is recorded in
+    t = "2026-01-01T00:00:0{}+00:00".format
+    assert q.apply_kill_switch_delivery("d0", t(0), True, reason="incident", actor="u", response="{}", agent_id=agent_id) == "applied"
+    assert q.apply_kill_switch_delivery("d1", t(1), False, reason="resolved", actor="u", response="{}", agent_id=agent_id) == "applied"
+    # d2 was received after d1 but is applied only now (long after d1 was applied): it is the newest request
+    assert q.apply_kill_switch_delivery("d2", t(2), True, reason="again", actor="u", response="{}", agent_id=agent_id) == "applied"
+    assert q.kill_switch(agent_id) is not None
+    # a delivery received between d1 and d2 that turns up late is older than what the switch holds
+    assert q.apply_kill_switch_delivery("d3", "2026-01-01T00:00:01.500000+00:00", False, reason="late", actor="u",
+                                        response="{}", agent_id=agent_id) == "superseded"
+    assert q.kill_switch(agent_id) is not None
+    # a direct (CLI) change is a request made now: older deliveries arriving afterwards are stale
+    q.set_kill_switch(False, reason="operator", actor="u", agent_id=agent_id)
+    assert q.apply_kill_switch_delivery("d4", t(3), True, reason="old", actor="u", response="{}", agent_id=agent_id) == "superseded"
+    assert q.kill_switch(agent_id) is None
+    q.close()
+
+
+def test_a_target_that_does_not_match_the_scope_is_refused(hook_cfg):
+    q = JobQueue(hook_cfg.db_path)
+    h = CommandHandler(hook_cfg, q)
+    set_kill_switch(hook_cfg, q, True, reason="incident", actor="u-sec", via="cli")
+    # an agent release sent without scope "agent" must never release the instance
+    status, resp = call(h, "POST", "/v1/controls/kill-switch",
+                        {"enabled": False, "agent_id": "a1", "reason": "agent a1 fixed", "actor": "u-sec"})
+    assert status == 422 and "scope 'agent'" in resp["error"]
+    assert q.kill_switch() is not None
+    for body in ({"enabled": True, "agent_id": "a1", "scope": "tenant"}, {"enabled": True, "job_id": "job_x"},
+                 {"enabled": True, "job_id": "job_x", "scope": "agent", "agent_id": "a1"}):
+        assert call(h, "POST", "/v1/controls/kill-switch", {**body, "actor": "u-sec", "reason": "r"})[0] == 422, body
+
+
+def test_an_expiry_whose_record_fails_is_recorded_by_a_later_sweep(hook_cfg, work_item, events, monkeypatch):
+    q = JobQueue(hook_cfg.db_path)
+    a = q.submit(work_item.model_copy(update={"idempotency_key": "a"}), approval_expires_at=PAST)
+    b = q.submit(work_item.model_copy(update={"idempotency_key": "b"}), approval_expires_at=PAST)
+    real = AuditLog.record
+    broken = {a.id}
+
+    def flaky(self, actor, event, **data):
+        if event == "approval_expired" and self.job_id in broken:
+            raise OSError("disk full")
+        return real(self, actor, event, **data)
+
+    monkeypatch.setattr(AuditLog, "record", flaky)
+    assert [j.id for j in expire_overdue(hook_cfg, q)] == [b.id]  # one failure does not hold up the others
+    assert q.get(a.id).status == JobStatus.CANCELLED  # cancelled, but its expiry is still to be recorded
+    broken.clear()
+    assert [j.id for j in expire_overdue(hook_cfg, q)] == [a.id]  # recorded by the next sweep
+    assert expire_overdue(hook_cfg, q) == []
+    assert sorted(e["job_id"] for e in of(events, "approval.expired")) == sorted([a.id, b.id])
+    assert q.get(a.id).approval_expires_at == PAST  # the deadline itself is kept on the job
+
+
+def test_a_stop_during_the_model_call_keeps_its_tool_calls_from_running(config, work_item, calc_repo):
+    """The stop lands while the model is thinking; its reply asks for an edit. Nothing in the reply runs."""
+    q = JobQueue(config.db_path)
+    job = q.submit(work_item.model_copy(update={"agent_id": "a1"}))
+    q.approve(job.id, "lead")
+    from conftest import CALC_FIX_NEW, CALC_FIX_OLD
+
+    class StopWhileThinking(ScriptedProvider):
+        def complete(self, system, messages, tools):
+            JobQueue(config.db_path).set_kill_switch(True, reason="drill", actor="u-sec", agent_id="a1")
+            return super().complete(system, messages, tools)
+
+    steps = [{"tool_calls": [{"name": "edit_file", "arguments": {"path": "calc.py", "old": CALC_FIX_OLD, "new": CALC_FIX_NEW}}]},
+             {"tool_calls": [{"name": "finish", "arguments": {"summary": "done", "success": True}}]}]
+    job = Worker(config, q, provider_factory=lambda: StopWhileThinking(steps)).run_once()
+    assert job.status == JobStatus.CANCELLED and job.error == "agent_stopped"
+    assert job.result.diff == "" and job.result.agent.usage.tool_calls == 0
+    assert not [e for e in AuditLog(config.audit_dir, job.id).events() if e.event == "tool_call"]

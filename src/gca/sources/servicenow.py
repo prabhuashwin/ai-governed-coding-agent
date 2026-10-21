@@ -19,6 +19,7 @@ Approval never happens in gca; it only mirrors ServiceNow's decision.
 from __future__ import annotations
 
 import os
+import re
 from typing import Any
 
 import httpx
@@ -28,8 +29,9 @@ from ..cmdline import split_command
 from ..config import Config, ServiceNowConfig
 from ..models import TERMINAL_STATES, Job, JobStatus, WorkItem
 from ..policy import check_repo_allowed
-from ..privacy import check_identity
 from ..queue import JobQueue
+
+SYS_ID_PATTERN = r"^[0-9a-f]{32}$"  # a ServiceNow record id; what people are recorded as in opaque mode
 
 
 class ServiceNowSource:
@@ -131,8 +133,11 @@ def sync_once(cfg: Config, queue: JobQueue, source: ServiceNowSource) -> dict[st
             item.repo_path = check_repo_allowed(cfg.policy.allowed_repos, item.repo_path)
             approver = source._ref(source.g(rec, "approver"), opaque=opaque) or "servicenow"
             for who, field in ((item.requester, "opened_by"), (approver, "approver")):
-                if who != "servicenow":  # "servicenow": no person on the record
-                    check_identity(cfg, who, field)
+                # people are recorded by sys_id only; "servicenow" means no person is on the record. A plain text
+                # field holding a user name is refused (the value is not echoed into the error)
+                if opaque and who != "servicenow" and not re.fullmatch(SYS_ID_PATTERN, who):
+                    raise ValueError(f"{field} must be a sys_user sys_id when opaque identities are on "
+                                     "(a reference to sys_user, not a name or user name)")
             job = queue.submit(item, cfg.budget)
             audit = AuditLog(cfg.audit_dir, job.id, redactions=cfg.policy.canary_strings)
             if job.status == JobStatus.SUBMITTED:

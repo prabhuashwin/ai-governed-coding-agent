@@ -39,7 +39,7 @@ timeout_seconds = 86400                # longest wait for a decision; requests m
 
 [privacy]
 opaque_identities = true               # people only as opaque platform user ids (no names or emails)
-# identity_pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"   # your platform's id shape
+identity_pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"   # required: your platform's id format
 
 [webhooks]
 enabled = true
@@ -146,7 +146,7 @@ Envelope (every event):
 |---|---|
 | `job.submitted` | `work_item` {id, title, description, acceptance_criteria, repo_path, base_ref, allowed_paths, requester, source, source_ref, agent_id}, `budget`, approval_expires_at |
 | `approval.requested` | title, description, acceptance_criteria, requester, repo_path, allowed_paths, budget, source, source_ref, agent_id, approval_expires_at (null = no deadline), `decide` {method, path, body template}. Emitted only when `approval.mode = "webhook"` |
-| `approval.expired` | expired_at, title, requester, agent_id, source, source_ref. The window closed without a decision; the job is now `cancelled` with error `approval_expired`. Close the approval request on your side |
+| `approval.expired` | expired_at, title, requester, agent_id, source, source_ref. The window closed without a decision; the job is now `cancelled` with error `approval_expired`. Close the approval request on your side. Recorded at least once (a failed record is retried by the next sweep): handle it idempotently per `job_id` |
 | `approval.decided` | decision (`approve` or `reject`), approver, note, conditions[], restrictions (object or null) |
 | `job.started` | worker, attempt, branch, title |
 | `job.blocked_action` | tool, args (truncated), reason |
@@ -156,8 +156,9 @@ Envelope (every event):
 | `job.published` | step (`branch_pushed` or `pull_request_opened`), actor, branch, remote, commit, url, base, draft |
 | `control.kill_switch` | enabled, reason, actor, scope (`global`, `tenant` or `agent`), agent_id (for `agent`, else null); `job_id` is null |
 
-Delivery is **at least once**: deduplicate on `id`. Order is creation order per process, but receivers
-should not depend on it. Any configured canary secret is replaced with `[REDACTED]` before an event leaves.
+Delivery is **at least once**: deduplicate on `id`. Events are created in order per process but may
+arrive in any order (inline delivery, the background flusher and the worker deliver concurrently): order by
+`created_at` (and `audit_seq` within a job), never by arrival. Any configured canary secret is replaced with `[REDACTED]` before an event leaves.
 
 ## Inbound commands
 
@@ -181,9 +182,10 @@ when that agent's switch is engaged (the job is accepted and waits).
 - `approval_timeout_seconds` (optional, whole seconds, 1–7,776,000): how long to wait for a decision. It can
   only **shorten** `[approval] timeout_seconds`. With neither set, a job waits for a decision indefinitely. The
   deadline is fixed at the first submission; a resubmission with the same idempotency key keeps it.
-- With `[privacy] opaque_identities = true`, `requester` is required and must match `identity_pattern`
-  (default: letters, digits and `_ . : -`, so no email address or "First Last" name); otherwise 422. The refused
-  value is never echoed back or stored.
+- With `[privacy] opaque_identities = true`, `requester` is required and must match `identity_pattern` (required
+  in that mode: the platform's exact user-id format, which gca refuses to start with if it would accept an email
+  address or a spaced name); otherwise 422, so user names such as `jane.doe` are refused too. The refused value is
+  never echoed back or stored, and no 422 validation detail echoes submitted values.
 
 ### `POST /v1/jobs/{id}/decision` → 200
 ```json
@@ -229,13 +231,19 @@ the PR step (push alone works without it).
 
 | scope | stops | while engaged | release |
 |---|---|---|---|
-| `global` (default), `tenant` | this gca instance (run one instance per tenant) | running jobs stop within ~1 s (`error = kill_switch`); nothing is claimed | `enabled: false` + `reason` |
-| `agent` + `agent_id` | every job submitted with that `agent_id` | its running jobs stop within ~1 s (`error = agent_stopped`); its queued jobs wait, approved; new submissions are accepted and wait | `enabled: false` + `reason`; waiting jobs then run (cancel any that should not) |
+| `global` (default), `tenant` | this gca instance (run one instance per tenant) | running jobs stop (`error = kill_switch`, see below); nothing is claimed | `enabled: false` + `reason` |
+| `agent` + `agent_id` | every job submitted with that `agent_id` | its running jobs stop (`error = agent_stopped`); its queued jobs wait, approved; new submissions are accepted and wait | `enabled: false` + `reason`; waiting jobs then run (cancel any that should not) |
 | `job` + `job_id` | that one job | cancelled, cannot be undone (`enabled` must be `true`) | — |
 
+How fast a running job stops: a command or verifier test run in flight is killed within about a second, and no
+further tool call starts; a model call in flight is allowed to return (bounded by the provider timeout) and its
+reply is not acted on. Whatever the timing, a stopped job never ends `succeeded`.
+
 Disengaging requires a non-empty `reason`. The instance switch and each agent's switch are separate: one
-never clears another, and an old "off" delivery retried after a newer "on" for the same switch is refused as
-superseded (409). Every change is recorded in the hash-chained `.gca/audit/_controls.jsonl` (with `scope` and
+never clears another. Requests to the same switch are ordered by when gca first received them, not by when
+they were applied: an older delivery, whenever it arrives or is retried, is refused as superseded (409), and a
+direct `gca kill` counts as a request made at that moment. `agent_id` or `job_id` with a `scope` that does not
+match it is refused (422) rather than guessed, so an agent release can never release the instance. Every change is recorded in the hash-chained `.gca/audit/_controls.jsonl` (with `scope` and
 `agent_id`); job stops in that job's log as `cancel_requested` with `scope = job`.
 
 ### `GET /v1/jobs/{id}` → 200
@@ -257,18 +265,20 @@ superseded (409). Every change is recorded in the hash-chained `.gca/audit/_cont
   onto it, one gca instance per tenant; Koru's per-agent switch maps onto `scope = "agent"`; a single job stop
   uses `scope = "job"`. The tenancy model —
   what is per instance, how identities are trusted, where TLS terminates — is in `docs/multi-tenancy.md`.
-- Stops are prompt: a running command or verifier test run is killed within `STOP_POLL_SECONDS` (0.25 s) of
-  the cancel or kill switch landing in the queue, in both the host and container workspaces.
-- Approval deadlines are exact for decisions (a decision after the deadline is refused even if the sweep has
-  not run yet) and prompt for the expiry itself: the worker sweeps on every poll and `gca webhook-serve` on every
-  flush, so `approval.expired` follows the deadline within `--poll` / `--flush-every` seconds.
+- Stops are prompt for actions: a running command or verifier test run is killed within `STOP_POLL_SECONDS`
+  (0.25 s) of the cancel or kill switch landing in the queue, in both the host and container workspaces, and no
+  tool call starts after it; a model call in flight returns first (it cannot act).
+- Approval deadlines are exact for decisions (a decision after the deadline is refused even if no sweep has run
+  yet). The expiry itself is swept by `gca webhook-serve` every `--flush-every` seconds, whatever its worker is
+  doing, and by a worker between jobs (every `--poll` while idle, not during a job). A plain `gca run` therefore
+  reports an expiry only after the job it is running. Each expiry is recorded at least once.
 - Tested end to end against a mocked platform (`tests/unit/test_webhooks.py`: signing, retries, dead letters,
   approval flow, self-approval, restrictions, idempotent replay, publish, kill switch before and during a run
   and its scopes, real HTTP server; `tests/safety/test_worker_controls.py`: restrictions enforced end to end,
   interruption of a running command and of verification).
   The cross-process contract test (`scripts/webhook_e2e.py`, run in CI) covers submit, replay, allow-list
   refusal, approval with enforced restrictions, the lifecycle, status, publish, the instance-, agent- and
-  job-scope stops, an approval window running out, and an email identity refused in opaque mode, over real
-  signed HTTP (25 checks), and regenerates the samples.
+  job-scope stops, an approval window running out, and an email and a bare user name refused in opaque mode,
+  over real signed HTTP (26 checks), and regenerates the samples.
   **Not yet exercised against Koru itself.** That needs Koru's endpoint and shared secrets
   (`docs/koru-adapter.md` lists the acceptance run).

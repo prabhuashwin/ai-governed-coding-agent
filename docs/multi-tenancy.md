@@ -73,10 +73,14 @@ identity_pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 and gca only ever records people as opaque platform user ids. Every identity a caller supplies — `requester`
 (required in this mode), `approver`, `actor`, `by`, on the webhook API and the CLI — must match
 `identity_pattern`; anything else is refused (422 / exit 2) before anything is written, and the refused value is
-not echoed back or stored. The default pattern (letters, digits, `_ . : -`) already excludes email addresses and
-"First Last" names; set your platform's exact id shape for a strict guarantee. ServiceNow records are mapped by
-`sys_id` (never the display name or user name). Labels gca uses when no person is named (`cli`, `webhook`,
-`servicenow`, `gca`, `worker:<id>`) are not people.
+not echoed back or stored. `identity_pattern` is **required** in this mode: no generic pattern can tell a user
+name such as `jane.doe` from an id, so you state the platform's exact id format, and gca refuses to start if
+the pattern would accept an email address or a spaced name. ServiceNow people are recorded only as `sys_id`s
+(32 hex characters, a separate id space checked on its own): a record whose `opened_by` or `approver` holds
+anything else — a display name, a user name typed into a text field — is refused for that record. Make those
+fields references to `sys_user` (the bootstrap's `u_approver` is a text field: put the approver's `sys_id` in
+it, or leave it empty). Labels gca uses when no person is named (`cli`, `webhook`, `servicenow`, `gca`,
+`worker:<id>`) are not people.
 
 Koru keeps the id → person mapping. **Forgetting a user = Koru deletes that mapping.** Every gca record about
 the person (audit log, job rows, events already delivered, the PR description) then holds an id that resolves

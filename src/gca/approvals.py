@@ -30,9 +30,21 @@ def approval_deadline(cfg: Config, requested: Any = None) -> str | None:
 
 
 def expire_overdue(cfg: Config, queue: JobQueue, *, job_id: str | None = None) -> list[Job]:
-    """Cancel jobs whose approval window has closed (all of them, or just `job_id`) and record each expiry."""
-    expired = queue.expire_overdue_approvals(job_id=job_id)
-    for job in expired:
-        AuditLog(cfg.audit_dir, job.id, redactions=cfg.policy.canary_strings).record(
-            "gca", "approval_expired", expires_at=job.approval_expires_at, agent_id=job.work_item.agent_id)
-    return expired
+    """Cancel jobs whose approval window has closed (all of them, or just `job_id`) and record each expiry once.
+
+    Recording is at least once: an expiry whose audit entry could not be written (a crash, a damaged log) stays
+    marked and is recorded by a later sweep; one failure never holds up the others. Returns the jobs whose
+    expiry this call recorded."""
+    queue.expire_overdue_approvals(job_id=job_id)
+    recorded: list[Job] = []
+    for jid in queue.unreported_expiries(job_id=job_id):
+        job = queue.get(jid)
+        if job.error == "approval_expired":
+            try:
+                AuditLog(cfg.audit_dir, job.id, redactions=cfg.policy.canary_strings).record(
+                    "gca", "approval_expired", expires_at=job.approval_expires_at, agent_id=job.work_item.agent_id)
+            except Exception:  # noqa: BLE001 - left marked; the next sweep records it
+                continue
+            recorded.append(job)
+        queue.settle_expiry(jid)  # recorded, or a job cancelled for another reason: nothing (more) to report
+    return recorded

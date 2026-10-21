@@ -96,6 +96,10 @@ class JobQueue:
                    name TEXT PRIMARY KEY, value TEXT NOT NULL, reason TEXT, set_by TEXT, set_at TEXT NOT NULL)"""
         )
         add_column_if_missing(self._conn, "controls", "delivery_id", "TEXT")  # databases from before 0.2.0
+        # 0.3.0: when the change a switch row holds was *requested* (the first-received time of the webhook delivery
+        # that set it, or the moment of a direct set). Supersession compares requests by this, never by when they
+        # happened to be applied. Older rows have NULL and fall back to set_at.
+        add_column_if_missing(self._conn, "controls", "version", "TEXT")
         # 0.3.0: both are copies of fields in `body`, fixed at submission, so claims and the approval sweep can
         # filter in SQL. Rows from older databases have NULL: no agent, no deadline.
         add_column_if_missing(self._conn, "jobs", "agent_id", "TEXT")
@@ -228,6 +232,21 @@ class JobQueue:
                 pass
         return expired
 
+    # The `approval_expires_at` column doubles as the "still to report" marker: it stays set on a cancelled job until
+    # its expiry has been recorded (`settle_expiry`), so an audit failure or a crash between the cancellation and
+    # the record is retried by the next sweep instead of being lost. The deadline in the job body is never cleared.
+    @_serialised
+    def unreported_expiries(self, *, job_id: str | None = None, now: str | None = None) -> builtins.list[str]:
+        sql = ("SELECT id FROM jobs WHERE status=? AND approval_expires_at IS NOT NULL AND approval_expires_at <= ?"
+               + (" AND id=?" if job_id else "") + " ORDER BY approval_expires_at")
+        params: builtins.list[str] = [JobStatus.CANCELLED.value, now or now_iso()] + ([job_id] if job_id else [])
+        return [r[0] for r in self._conn.execute(sql, params).fetchall()]
+
+    @_serialised
+    def settle_expiry(self, job_id: str) -> None:
+        self._conn.execute("UPDATE jobs SET approval_expires_at=NULL WHERE id=? AND status=?",
+                           (job_id, JobStatus.CANCELLED.value))
+
     def request_cancel(self, job_id: str) -> Job:
         """Cancel immediately if not running; otherwise flag it and let the worker stop.
 
@@ -288,40 +307,43 @@ class JobQueue:
     @_serialised
     def set_kill_switch(self, enabled: bool, *, reason: str = "", actor: str = "unknown",
                         delivery_id: str | None = None, agent_id: str | None = None) -> None:
+        now = now_iso()
         self._conn.execute(
-            "INSERT INTO controls (name, value, reason, set_by, set_at, delivery_id) VALUES (?, ?, ?, ?, ?, ?) "
+            "INSERT INTO controls (name, value, reason, set_by, set_at, delivery_id, version) VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(name) DO UPDATE SET value=excluded.value, reason=excluded.reason, "
-            "set_by=excluded.set_by, set_at=excluded.set_at, delivery_id=excluded.delivery_id",
-            (_control_name(agent_id), "on" if enabled else "off", reason, actor, now_iso(), delivery_id))
+            "set_by=excluded.set_by, set_at=excluded.set_at, delivery_id=excluded.delivery_id, version=excluded.version",
+            (_control_name(agent_id), "on" if enabled else "off", reason, actor, now, delivery_id, now))
 
     @_serialised
     def apply_kill_switch_delivery(self, delivery_id: str, first_received_at: str, enabled: bool, *, reason: str,
                                    actor: str, response: str, agent_id: str | None = None) -> str:
         """Apply a kill-switch command that arrived as webhook delivery `delivery_id`, atomically with its outcome.
 
-        One write transaction covers: the supersession check (has the switch been changed since this delivery was
-        *first* received?), the control update, and recording the delivery as done in `inbound_deliveries`. So a
-        newer change cannot slip in between the check and the update, and a crash or audit failure after the
-        commit cannot leave the delivery looking never-applied. Returns "applied", "already_applied" or
-        "superseded"; the latter two change nothing.
+        One write transaction covers: the supersession check (does the switch already hold a change that was
+        *requested* after this delivery was first received?), the control update, and recording the delivery as
+        done in `inbound_deliveries`. So a newer change cannot slip in between the check and the update, and a crash
+        or audit failure after the commit cannot leave the delivery looking never-applied. Requests are ordered by
+        when they were first received, not by when they were applied: an "off" received before an "on" but applied
+        after it arrived must not make the "on" look stale. Returns "applied", "already_applied" or "superseded";
+        the latter two change nothing.
         """
         name = _control_name(agent_id)  # supersession is per switch: an agent's switch never races the instance's
         cur = self._conn.cursor()
         cur.execute("BEGIN IMMEDIATE")
         try:
             row = cur.execute(
-                "SELECT value, set_at, delivery_id FROM controls WHERE name=?", (name,)).fetchone()
+                "SELECT value, set_at, delivery_id, version FROM controls WHERE name=?", (name,)).fetchone()
             if row and row[2] == delivery_id:
                 outcome = "already_applied"
-            elif row and (row[1] or "") > first_received_at:
+            elif row and (row[3] or row[1] or "") > first_received_at:
                 outcome = "superseded"
             else:
                 cur.execute(
-                    "INSERT INTO controls (name, value, reason, set_by, set_at, delivery_id) "
-                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value, "
+                    "INSERT INTO controls (name, value, reason, set_by, set_at, delivery_id, version) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET value=excluded.value, "
                     "reason=excluded.reason, set_by=excluded.set_by, set_at=excluded.set_at, "
-                    "delivery_id=excluded.delivery_id",
-                    (name, "on" if enabled else "off", reason, actor, now_iso(), delivery_id))
+                    "delivery_id=excluded.delivery_id, version=excluded.version",
+                    (name, "on" if enabled else "off", reason, actor, now_iso(), delivery_id, first_received_at))
                 outcome = "applied"
             # Every outcome records a valid JSON response: a replay of this delivery id is answered from the
             # row, so an empty body here would turn the second retry into a server error.

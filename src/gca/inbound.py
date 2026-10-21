@@ -325,6 +325,12 @@ class CommandHandler:
         # both mean this instance. "agent" is one platform agent's switch: its running jobs stop, its queued jobs
         # wait. "job" stops one job: it maps onto cancellation, which also interrupts a command in flight.
         scope = str(p.get("scope", "global"))
+        # A target that does not match the scope is a caller bug, and guessing would be dangerous: an agent release
+        # sent without scope "agent" would otherwise release the whole instance.
+        if p.get("agent_id") not in (None, "") and scope != "agent":
+            raise CommandError(422, "agent_id is only valid with scope 'agent'")
+        if p.get("job_id") not in (None, "") and scope != "job":
+            raise CommandError(422, "job_id is only valid with scope 'job'")
         if scope == "job":
             target = str(p.get("job_id", "")).strip()
             if not target or not p["enabled"]:

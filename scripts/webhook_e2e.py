@@ -17,7 +17,7 @@ command is rejected; a submission outside `allowed_repos` is refused; a replayed
 platform can publish the verified commit (`job.published`); the kill switch round-trips at instance scope and
 stops one job at job scope; an agent-scope stop holds that agent's work until released; an approval window that
 runs out cancels the job (`approval.expired`) and refuses the late decision; with opaque identities on, a request
-naming a person by email is refused. Writes webhook-e2e.json/.md and webhook-e2e.contract.json (one sample per
+naming a person by email or by a bare user name is refused. Writes webhook-e2e.json/.md and webhook-e2e.contract.json (one sample per
 event type and per command: request and response), which is what the adapter team codes against.
 """
 
@@ -181,7 +181,7 @@ def main() -> int:
         f'[budget]\nmax_turns = 15\nmax_cost_usd = 0.25\nmax_seconds = 300\n'
         f'[policy]\nallowed_commands = ["python", "python3", "{py.name}"]\nallowed_repos = ["{repo.as_posix()}"]\n'
         f'[approval]\nmode = "webhook"\n'
-        f'[privacy]\nopaque_identities = true\n'
+        f'[privacy]\nopaque_identities = true\nidentity_pattern = "^usr_[0-9a-f]{{12}}$"\n'
         f'[webhooks]\nenabled = true\noutbound_urls = ["{koru_url}"]\ninbound_port = {gca_port}\n'
         f'[pricing]\ninput_per_million = {{ "gpt-4.1-mini" = 0.4, "gpt-4.1" = 2.0 }}\n'
         f'output_per_million = {{ "gpt-4.1-mini" = 1.6, "gpt-4.1" = 8.0 }}\n')
@@ -189,7 +189,7 @@ def main() -> int:
            "PATH": f"{py.parent}{os.pathsep}{os.environ['PATH']}"}
     logs = {n: (tmp / f"{n}.log").open("wb") for n in ("gca", "koru")}
     koru = subprocess.Popen([sys.executable, __file__, "--receiver", str(koru_port), str(events_file), gca_url,
-                             "koru-approver"], stdout=logs["koru"], stderr=subprocess.STDOUT, env=env)
+                             "usr_a99f00000002"], stdout=logs["koru"], stderr=subprocess.STDOUT, env=env)
     gca = subprocess.Popen([sys.executable, "-m", "gca.cli", "-c", str(cfg), "webhook-serve", "--with-worker",
                             "--poll", "0.5", "--flush-every", "1"], stdout=logs["gca"], stderr=subprocess.STDOUT, env=env)
     checks: dict[str, bool] = {}
@@ -199,7 +199,7 @@ def main() -> int:
         with httpx.Client(timeout=15) as c:
             checks["unsigned_command_rejected"] = c.post(f"{gca_url}/v1/work-items", content=b"{}").status_code == 401
             work_item = {
-                "title": "Fix mean() off-by-one", "requester": "u-alice", "source": "koru", "source_ref": "KORU-REQ-1",
+                "title": "Fix mean() off-by-one", "requester": "usr_a11ce0000001", "source": "koru", "source_ref": "KORU-REQ-1",
                 "description": "stats.mean([2, 4, 6]) returns 6.0 instead of 4.0. Fix it.",
                 "acceptance_criteria": ["mean() returns the arithmetic mean", "mean([]) still raises ValueError",
                                         "all tests pass"],
@@ -213,7 +213,7 @@ def main() -> int:
             rr = signed_post(c, f"{gca_url}/v1/work-items", work_item, delivery_id=submit_delivery, sample="submit_replayed")
             checks["replayed_delivery_is_idempotent"] = rr.status_code == 201 and rr.json() == {**r.json(), "replayed": True}
             r2 = signed_post(c, f"{gca_url}/v1/work-items", {
-                "title": "x", "requester": "u-mallory", "description": "d", "acceptance_criteria": [],
+                "title": "x", "requester": "usr_ba0000000004", "description": "d", "acceptance_criteria": [],
                 "repo_path": str(outside), "test_command": ["pytest"]}, sample="submit_outside_allowed_repos")
             checks["repo_outside_allow_list_refused"] = r2.status_code == 403
             # opaque identities: a person named by email never reaches the append-only audit log
@@ -221,6 +221,10 @@ def main() -> int:
                                 {**work_item, "requester": "someone@example.com", "source_ref": "KORU-PII",
                                  "idempotency_key": "koru:KORU-PII"}, sample="submit_email_identity_refused")
             checks["email_identity_refused"] = r_pii.status_code == 422 and "someone" not in r_pii.text
+            r_name = signed_post(c, f"{gca_url}/v1/work-items",
+                                 {**work_item, "requester": "jane.doe", "source_ref": "KORU-NAME",
+                                  "idempotency_key": "koru:KORU-NAME"})
+            checks["bare_user_name_refused"] = r_name.status_code == 422 and "jane" not in r_name.text
 
             end = time.monotonic() + args.timeout
             while time.monotonic() < end:
@@ -230,7 +234,10 @@ def main() -> int:
                 time.sleep(1)
             records = read_events(events_file)
             evs = [rec["event"] for rec in records if rec.get("event")]
-            types = [e["type"] for e in evs if e.get("job_id") == job_id]
+            # delivery is at least once and arrival order is not guaranteed (inline delivery, the flusher and the
+            # worker race): deduplicate on id and order by creation time, as the contract tells receivers to
+            mine = {e["id"]: e for e in evs if e.get("job_id") == job_id}
+            types = [e["type"] for e in sorted(mine.values(), key=lambda e: e["created_at"])]
             result["event_types"] = types
             checks["all_signatures_valid"] = bool(records) and all(rec.get("valid_signature", True) for rec in records)
             checks["no_callback_errors"] = not any("callback_error" in rec for rec in records)
@@ -238,7 +245,7 @@ def main() -> int:
                         "job.finished"]
             checks["lifecycle_in_order"] = [t for t in types if t in expected] == expected
             decided = next((e for e in evs if e["type"] == "approval.decided"), {})
-            checks["approved_by_platform"] = decided.get("data", {}).get("approver") == "koru-approver"
+            checks["approved_by_platform"] = decided.get("data", {}).get("approver") == "usr_a99f00000002"
             checks["restrictions_enforced"] = decided.get("data", {}).get("restrictions") == {
                 "allowed_paths": ["stats.py"], "budget": {"max_turns": 12}}
             dec = next((rec["decision"] for rec in records if rec.get("decision")), None)
@@ -255,20 +262,20 @@ def main() -> int:
 
             hd = signed_headers(IN_SECRET, "GET", f"/v1/jobs/{job_id}", b"")
             st = c.get(f"{gca_url}/v1/jobs/{job_id}", headers=hd).json()
-            checks["status_endpoint_agrees"] = st.get("status") == fd.get("status") and st.get("approver") == "koru-approver"
-            on = signed_post(c, f"{gca_url}/v1/controls/kill-switch", {"enabled": True, "actor": "secops", "reason": "drill"})
+            checks["status_endpoint_agrees"] = st.get("status") == fd.get("status") and st.get("approver") == "usr_a99f00000002"
+            on = signed_post(c, f"{gca_url}/v1/controls/kill-switch", {"enabled": True, "actor": "usr_5ec000000003", "reason": "drill"})
             killed = c.get(f"{gca_url}/healthz").json().get("kill_switch") is True
             off = signed_post(c, f"{gca_url}/v1/controls/kill-switch",
-                              {"enabled": False, "actor": "secops", "reason": "drill over"})
+                              {"enabled": False, "actor": "usr_5ec000000003", "reason": "drill over"})
             checks["kill_switch_round_trip"] = (on.status_code == 200 and killed and off.status_code == 200
                                                 and c.get(f"{gca_url}/healthz").json().get("kill_switch") is False)
             CONTRACT["commands"]["kill_switch_on"] = {"request": {"method": "POST", "path": "/v1/controls/kill-switch",
-                                                                  "body": {"enabled": True, "actor": "secops", "reason": "drill", "scope": "global"}},
+                                                                  "body": {"enabled": True, "actor": "usr_5ec000000003", "reason": "drill", "scope": "global"}},
                                                       "response": {"status": on.status_code, "body": _json(on)}}
 
             # the platform publishes the verified commit to the tenant's remote (PR creation needs GitHub; push only here)
             pub = signed_post(c, f"{gca_url}/v1/jobs/{job_id}/publish",
-                              {"actor": "u-alice", "draft": True, "create_pr": False}, sample="publish")
+                              {"actor": "usr_a11ce0000001", "draft": True, "create_pr": False}, sample="publish")
             ls = subprocess.run(["git", "ls-remote", "--heads", "origin"], cwd=repo, capture_output=True, text=True, env=genv)
             checks["publish_pushed_verified_commit"] = (pub.status_code == 200 and pub.json().get("branch") in ls.stdout
                                                         and fd.get("branch") == pub.json().get("branch"))
@@ -280,14 +287,14 @@ def main() -> int:
             evs = [rec["event"] for rec in records if rec.get("event")]
             published = next((e for e in evs if e["type"] == "job.published"), {})
             checks["published_event"] = published.get("data", {}).get("step") == "branch_pushed" and \
-                published.get("data", {}).get("actor") == "u-alice"
+                published.get("data", {}).get("actor") == "usr_a11ce0000001"
 
             # job-scope stop: a second request is stopped by the platform while it is queued or running
             r3 = signed_post(c, f"{gca_url}/v1/work-items", {**work_item, "source_ref": "KORU-REQ-2",
                                                               "idempotency_key": "koru:KORU-REQ-2"})
             job2 = r3.json().get("job_id")
             stop = signed_post(c, f"{gca_url}/v1/controls/kill-switch",
-                               {"enabled": True, "actor": "secops", "reason": "wrong ticket", "scope": "job", "job_id": job2},
+                               {"enabled": True, "actor": "usr_5ec000000003", "reason": "wrong ticket", "scope": "job", "job_id": job2},
                                sample="kill_switch_job_scope")
             end = time.monotonic() + 60
             st2 = {}
@@ -317,7 +324,7 @@ def main() -> int:
 
             # agent-scope stop: everything of one platform agent waits while its switch is on, and runs once released
             agent_on = signed_post(c, f"{gca_url}/v1/controls/kill-switch",
-                                   {"enabled": True, "actor": "secops", "reason": "agent misbehaving", "scope": "agent",
+                                   {"enabled": True, "actor": "usr_5ec000000003", "reason": "agent misbehaving", "scope": "agent",
                                     "agent_id": "koru-agent-2"}, sample="kill_switch_agent_scope")
             r4 = signed_post(c, f"{gca_url}/v1/work-items", {**work_item, "agent_id": "koru-agent-2", "source_ref": "KORU-REQ-3",
                                                               "idempotency_key": "koru:KORU-REQ-3"})
@@ -325,7 +332,7 @@ def main() -> int:
             time.sleep(3)  # the platform approves within ~1 s and a worker polls every 0.5 s: unheld, it would have run
             held = r4.json().get("agent_stopped") is True and job_status(job3).get("status") == "approved"
             agent_off = signed_post(c, f"{gca_url}/v1/controls/kill-switch",
-                                    {"enabled": False, "actor": "secops", "reason": "agent fixed", "scope": "agent",
+                                    {"enabled": False, "actor": "usr_5ec000000003", "reason": "agent fixed", "scope": "agent",
                                      "agent_id": "koru-agent-2"})
             st3 = wait_status(job3, lambda s_: s_.get("status") in ("succeeded", "failed", "cancelled"), 60)
             checks["agent_stop_holds_then_releases"] = (agent_on.status_code == 200 and held
@@ -339,7 +346,7 @@ def main() -> int:
             st4 = wait_status(job4, lambda s_: s_.get("status") != "submitted", 30)
             checks["approval_window_expires"] = (r5.status_code == 201 and bool(r5.json().get("approval_expires_at"))
                                                  and st4.get("status") == "cancelled" and st4.get("error") == "approval_expired")
-            late = signed_post(c, f"{gca_url}/v1/jobs/{job4}/decision", {"decision": "approve", "approver": "koru-approver"},
+            late = signed_post(c, f"{gca_url}/v1/jobs/{job4}/decision", {"decision": "approve", "approver": "usr_a99f00000002"},
                                sample="decision_after_expiry")
             checks["late_decision_refused"] = late.status_code == 409 and "expired" in late.json().get("error", "")
             end = time.monotonic() + 15
