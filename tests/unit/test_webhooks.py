@@ -801,3 +801,43 @@ def test_kill_switch_scopes(hook_cfg, work_item, receiver):
     s, r = h.handle("POST", "/v1/controls/kill-switch", hd, rw)
     assert s == 200 and r["scope"] == "tenant" and q.kill_switch() is not None
     assert receiver.of("control.kill_switch")[0]["data"]["scope"] == "tenant"
+
+
+def test_transient_lock_while_recording_a_delivery_is_retried(tmp_path, monkeypatch):
+    """Windows CI: a `database is locked` from SQLite while marking a posted event aborted the whole pass, left
+    that row in flight (to be posted again after its lease) and skipped the rest of the batch."""
+    import sqlite3
+
+    from gca.config import Config, WebhookConfig
+    from gca.webhooks import Deliverer, Outbox
+
+    class Flaky:
+        def __init__(self, conn):
+            self.conn, self.failures = conn, 2
+
+        def execute(self, sql, *a):
+            if self.failures and sql.startswith(("UPDATE webhook_outbox SET status=?", "UPDATE webhook_outbox SET status='inflight'")):
+                self.failures -= 1
+                raise sqlite3.OperationalError("database is locked")
+            return self.conn.execute(sql, *a)
+
+    monkeypatch.setenv("GCA_WEBHOOK_SECRET", "s")
+    cfg = Config(data_dir=str(tmp_path / "d"), webhooks=WebhookConfig(enabled=True, outbound_urls=["https://k/h"]))
+    ob = Outbox(cfg.db_path)
+    for i in range(3):
+        ob.add({"id": f"e{i}", "type": "job.finished", "created_at": "2026-01-01T00:00:00+00:00", "job_id": "j",
+                "data": {}}, ["https://k/h"])
+    posts: list[str] = []
+
+    def receiver(req: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(req.content)["id"])
+        return httpx.Response(204)
+
+    real = ob._conn
+    ob._conn = Flaky(real)
+    try:
+        stats = Deliverer(cfg, ob, transport=httpx.MockTransport(receiver)).deliver_pending()
+    finally:
+        ob._conn = real
+    assert stats["delivered"] == 3 and sorted(posts) == ["e0", "e1", "e2"]
+    assert [r["status"] for r in ob.rows()] == ["delivered"] * 3

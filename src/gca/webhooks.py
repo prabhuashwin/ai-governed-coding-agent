@@ -38,7 +38,7 @@ import httpx
 
 from . import audit as _audit
 from .config import Config
-from .models import AuditEvent, Job, now_iso, open_db
+from .models import AuditEvent, Job, _retry_locked, now_iso, open_db
 
 EVENT_TYPES = (
     "job.submitted", "approval.requested", "approval.decided", "job.started", "job.blocked_action",
@@ -220,20 +220,23 @@ class Outbox:
         flusher, a worker, another process) may see the same due row; only the one whose UPDATE wins posts it."""
         lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
         with self._lock:
-            cur = self._conn.execute(
+            cur = _retry_locked(lambda: self._conn.execute(
                 "UPDATE webhook_outbox SET status='inflight', next_attempt_at=? "
                 "WHERE id=? AND url=? AND status IN ('pending','inflight') AND next_attempt_at <= ?",
-                (lease, event_id, url, now_iso()))
+                (lease, event_id, url, now_iso())))
             return cur.rowcount == 1
 
     def mark(self, event_id: str, url: str, *, status: str, attempts: int, error: str | None = None,
              retry_in: float | None = None) -> None:
         nxt = (datetime.now(timezone.utc) + timedelta(seconds=retry_in or 0)).isoformat()
+        # Retried on transient lock errors (seen on Windows under concurrent deliverers): this runs after the POST
+        # succeeded, so giving up here would leave the row in flight, post it again when the lease ran out, and
+        # abandon the rest of this delivery pass.
         with self._lock:
-            self._conn.execute(
+            _retry_locked(lambda: self._conn.execute(
                 "UPDATE webhook_outbox SET status=?, attempts=?, last_error=?, next_attempt_at=?, "
                 "delivered_at=CASE WHEN ?='delivered' THEN ? ELSE delivered_at END WHERE id=? AND url=?",
-                (status, attempts, (error or "")[:500], nxt, status, now_iso(), event_id, url))
+                (status, attempts, (error or "")[:500], nxt, status, now_iso(), event_id, url)))
 
     def rows(self, status: str | None = None) -> list[dict[str, Any]]:
         q = "SELECT id, url, type, job_id, attempts, status, last_error, created_at, delivered_at FROM webhook_outbox"

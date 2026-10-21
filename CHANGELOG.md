@@ -24,6 +24,9 @@ Koru integration gaps (`tests/unit/test_koru_gaps.py`, contract test now 25 chec
   id → person mapping is then the whole of "forget user" for gca. Free text is still recorded as given.
 - Schema: `jobs.agent_id` and `jobs.approval_expires_at` are added on first open (older rows: no agent, no
   deadline). `gca approve` now exits 2 with a message instead of a traceback when a job is already decided.
+- Outbox: a transient SQLite lock error while claiming or recording a delivery (seen on Windows CI with
+  concurrent deliverers) is retried instead of aborting the delivery pass, which had left the posted event in
+  flight to be posted again after its lease and skipped the rest of the batch.
 
 Fifth external review (of `e05ad46`): eight findings, all fixed with regression tests
 (`tests/unit/test_review_round5.py`; table in `docs/how-to-test.md`).
