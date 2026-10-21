@@ -28,6 +28,7 @@ from ..cmdline import split_command
 from ..config import Config, ServiceNowConfig
 from ..models import TERMINAL_STATES, Job, JobStatus, WorkItem
 from ..policy import check_repo_allowed
+from ..privacy import check_identity
 from ..queue import JobQueue
 
 
@@ -76,10 +77,13 @@ class ServiceNowSource:
             return r.json().get("result", [])
 
     @staticmethod
-    def _ref(v: Any) -> str:
-        return v.get("display_value") or v.get("value") or "" if isinstance(v, dict) else (v or "")
+    def _ref(v: Any, *, opaque: bool = False) -> str:
+        """A reference field's value. With `opaque`, only the sys_id, never a display value (a person's name)."""
+        if isinstance(v, dict):
+            return (v.get("value") or "") if opaque else (v.get("display_value") or v.get("value") or "")
+        return v or ""
 
-    def to_work_item(self, rec: dict[str, Any]) -> WorkItem:
+    def to_work_item(self, rec: dict[str, Any], *, opaque: bool = False) -> WorkItem:
         g = self.g
         crit = [c.strip() for c in (g(rec, "acceptance_criteria") or "").splitlines() if c.strip()]
         allowed = [p.strip() for p in (g(rec, "allowed_paths") or "").split(",") if p.strip()]
@@ -87,7 +91,9 @@ class ServiceNowSource:
         label = g(rec, "number") or rec.get("sys_id")
         if not g(rec, "repo_path"):
             raise ValueError(f"{label}: repo_path is empty")
-        requester = self._ref(g(rec, "opened_by")) or rec.get("sys_created_by") or "servicenow"
+        # sys_created_by is a user name: never used when people must be recorded by opaque id
+        requester = self._ref(g(rec, "opened_by"), opaque=opaque) or (None if opaque else rec.get("sys_created_by")) \
+            or "servicenow"
         return WorkItem(
             title=g(rec, "short_description") or g(rec, "number") or "ServiceNow work item",
             description=g(rec, "description") or "", acceptance_criteria=crit,
@@ -120,14 +126,18 @@ def sync_once(cfg: Config, queue: JobQueue, source: ServiceNowSource) -> dict[st
 
     for rec in source.fetch_approved():
         try:
-            item = source.to_work_item(rec)
+            opaque = cfg.privacy.opaque_identities
+            item = source.to_work_item(rec, opaque=opaque)
             item.repo_path = check_repo_allowed(cfg.policy.allowed_repos, item.repo_path)
+            approver = source._ref(source.g(rec, "approver"), opaque=opaque) or "servicenow"
+            for who, field in ((item.requester, "opened_by"), (approver, "approver")):
+                if who != "servicenow":  # "servicenow": no person on the record
+                    check_identity(cfg, who, field)
             job = queue.submit(item, cfg.budget)
             audit = AuditLog(cfg.audit_dir, job.id, redactions=cfg.policy.canary_strings)
             if job.status == JobStatus.SUBMITTED:
                 audit.record(item.requester, "submitted", work_item=item.model_dump(), source="servicenow",
                              record=source.g(rec, "number"))
-                approver = source._ref(source.g(rec, "approver")) or "servicenow"
                 job = queue.approve(job.id, approver, note=f"approved in ServiceNow ({source.g(rec, 'number')})")
                 audit.record(approver, "approved", note="mirrored from ServiceNow")
             source.write_back(rec["sys_id"], job)

@@ -7,11 +7,12 @@ server (OpenAI, Azure, Ollama, vLLM, OpenRouter, Groq, ...) never touches code.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from .models import Budget
 
@@ -143,10 +144,38 @@ class RetentionConfig(BaseModel):
     inbound_days: int = 14   # inbound idempotency records; must exceed the platform's longest retry horizon
 
 
+MAX_APPROVAL_TIMEOUT_SECONDS = 90 * 24 * 3600  # 90 days
+
+# Default shape of an opaque user id: a token such as a UUID or "u_12ab…". No "@" and no spaces, so neither an
+# email address nor a "First Last" name can match. Set your platform's exact id shape for a strict guarantee.
+DEFAULT_IDENTITY_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$"
+
+
+class PrivacyConfig(BaseModel):
+    """How people are identified in what gca stores. The audit log is append-only and hash-chained, so it cannot
+    forget anyone; with `opaque_identities` it never learns who anyone is. Every identity a caller supplies
+    (requester, approver, actor, by) must then be an opaque platform user id matching `identity_pattern`; the
+    platform keeps the id -> person mapping, and deleting that mapping is what "forget user" means for gca."""
+    opaque_identities: bool = False
+    identity_pattern: str = DEFAULT_IDENTITY_PATTERN
+
+    @field_validator("identity_pattern")
+    @classmethod
+    def _compiles(cls, v: str) -> str:
+        try:
+            re.compile(v)
+        except re.error as e:
+            raise ValueError(f"identity_pattern is not a valid regular expression: {e}") from e
+        return v
+
+
 class ApprovalConfig(BaseModel):
     # local: `gca approve` (or ServiceNow mirror). webhook: approval comes only from an inbound signed decision.
     mode: str = "local"
     allow_self_approval: bool = False  # enforced for webhook decisions
+    # Longest a job may wait for a decision; None = no limit. A submission may ask for a shorter window
+    # (`approval_timeout_seconds`), never a longer one. Overdue jobs end `cancelled` with error "approval_expired".
+    timeout_seconds: int | None = Field(default=None, gt=0, le=MAX_APPROVAL_TIMEOUT_SECONDS)
 
 
 class Config(BaseModel):
@@ -155,6 +184,7 @@ class Config(BaseModel):
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     publish: PublishConfig = Field(default_factory=PublishConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     servicenow: ServiceNowConfig = Field(default_factory=ServiceNowConfig)
     budget: Budget = Field(default_factory=Budget)

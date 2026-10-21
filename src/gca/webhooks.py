@@ -43,6 +43,7 @@ from .models import AuditEvent, Job, now_iso, open_db
 EVENT_TYPES = (
     "job.submitted", "approval.requested", "approval.decided", "job.started", "job.blocked_action",
     "job.verified", "job.finished", "job.cancel_requested", "job.published", "control.kill_switch",
+    "approval.expired",
 )
 
 # audit event name -> public event type
@@ -50,6 +51,7 @@ _AUDIT_MAP = {
     "submitted": "job.submitted",
     "approved": "approval.decided",
     "rejected": "approval.decided",
+    "approval_expired": "approval.expired",
     "claimed": "job.started",
     "blocked_action": "job.blocked_action",
     "verified": "job.verified",
@@ -319,12 +321,19 @@ def build_event(cfg: Config, ev: AuditEvent) -> dict[str, Any] | None:
     if etype == "job.submitted":
         wi = d.get("work_item", {})
         data = {"work_item": {k: wi.get(k) for k in ("id", "title", "description", "acceptance_criteria", "repo_path",
-                                                    "base_ref", "allowed_paths", "requester", "source", "source_ref")},
-                "budget": d.get("budget")}
+                                                    "base_ref", "allowed_paths", "requester", "source", "source_ref",
+                                                    "agent_id")},
+                "budget": d.get("budget"), "approval_expires_at": d.get("approval_expires_at")}
     elif etype == "approval.decided":
         data = {"decision": "approve" if ev.event == "approved" else "reject", "approver": ev.actor,
                 "note": d.get("note", ""), "conditions": d.get("conditions", []),
                 "restrictions": d.get("restrictions")}
+    elif etype == "approval.expired":
+        job = _load_job(cfg, ev.job_id)
+        wi = job.work_item if job else None
+        data = {"expired_at": d.get("expires_at"), "title": wi.title if wi else None,
+                "requester": wi.requester if wi else None, "agent_id": d.get("agent_id"),
+                "source": wi.source if wi else None, "source_ref": wi.source_ref if wi else None}
     elif etype == "job.started":
         job = _load_job(cfg, ev.job_id)
         data = {"worker": ev.actor.removeprefix("worker:"), "attempt": d.get("attempt"),
@@ -335,7 +344,8 @@ def build_event(cfg: Config, ev: AuditEvent) -> dict[str, Any] | None:
         data = {k: d.get(k) for k in ("passed", "flags", "exit_code", "files_changed")}
     elif etype == "job.finished":
         job = _load_job(cfg, ev.job_id)
-        data = {"status": d.get("status"), "error": d.get("error"), "audit_tail_hash": ev.hash}
+        data = {"status": d.get("status"), "error": d.get("error"), "audit_tail_hash": ev.hash,
+                "agent_id": job.work_item.agent_id if job else None}
         if job and job.result:
             r = job.result
             a, v = r.agent, r.verification
@@ -356,7 +366,7 @@ def build_event(cfg: Config, ev: AuditEvent) -> dict[str, Any] | None:
                 "commit": d.get("commit"), "url": d.get("url"), "base": d.get("base"), "draft": d.get("draft")}
     elif etype == "control.kill_switch":
         data = {"enabled": d.get("enabled"), "reason": d.get("reason", ""), "actor": ev.actor,
-                "scope": d.get("scope", "global")}
+                "scope": d.get("scope", "global"), "agent_id": d.get("agent_id")}
     else:  # job.cancel_requested
         data = {"by": ev.actor, "scope": d.get("scope", "job"), "reason": d.get("reason", "")}
     event = {"id": f"evt_{uuid.uuid4().hex}", "type": etype, "created_at": now_iso(), "source": cfg.webhooks.source_name,
@@ -383,6 +393,7 @@ def approval_requested_event(cfg: Config, job: Job) -> dict[str, Any]:
         "data": {"title": wi.title, "description": wi.description[:4000], "acceptance_criteria": wi.acceptance_criteria,
                  "requester": wi.requester, "repo_path": wi.repo_path, "allowed_paths": wi.allowed_paths,
                  "budget": job.budget.model_dump(), "source": wi.source, "source_ref": wi.source_ref,
+                 "agent_id": wi.agent_id, "approval_expires_at": job.approval_expires_at,
                  "decide": {"method": "POST", "path": f"/v1/jobs/{job.id}/decision",
                             "body": {"decision": "approve|reject", "approver": "<user>", "note": "", "conditions": [],
                                      "restrictions": {"allowed_paths": None, "allowed_commands": None,

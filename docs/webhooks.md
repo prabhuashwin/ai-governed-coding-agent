@@ -9,7 +9,7 @@ other's SDK, only this contract.
    job.submitted, approval.requested, approval.decided,        POST /v1/work-items
    job.started, job.blocked_action, job.verified,              POST /v1/jobs/{id}/decision
    job.finished, job.cancel_requested, job.published,          POST /v1/jobs/{id}/cancel
-   control.kill_switch                                         POST /v1/jobs/{id}/publish
+   control.kill_switch, approval.expired                       POST /v1/jobs/{id}/publish
                                                                POST /v1/controls/kill-switch
                                                                GET  /v1/jobs/{id}
 ```
@@ -22,8 +22,9 @@ stay in step: `docs/koru-adapter.md`.
 
 | Koru capability | Wiring |
 |---|---|
-| Approval operations (risk, routing, SLA, delegate, conditions) | `approval.mode = "webhook"`. gca emits `approval.requested`; Koru routes it through its approval policy and POSTs the decision back. Free-text `conditions` are recorded on the approval, in the audit log and in the report (advisory); structured `restrictions` (paths, commands, budget) are **enforced** by the policy engine, the agent loop and the verifier. Self-approval is refused by gca as well |
-| Emergency containment (kill switch) | Koru POSTs `/v1/controls/kill-switch` with a `scope`. `global`/`tenant` stop this instance: running agents stop at their next turn or, if a command or the verifier's test run is in flight, within about a second (`stop_reason = kill_switch`, job `cancelled`, `error = kill_switch`); nothing new is claimed, and disengaging requires a reason. `job` stops one job (it maps onto cancellation) |
+| Approval operations (risk, routing, SLA, delegate, conditions) | `approval.mode = "webhook"`. gca emits `approval.requested`; Koru routes it through its approval policy and POSTs the decision back. Free-text `conditions` are recorded on the approval, in the audit log and in the report (advisory); structured `restrictions` (paths, commands, budget) are **enforced** by the policy engine, the agent loop and the verifier. Self-approval is refused by gca as well. Koru's SLA/timeout maps onto `approval_timeout_seconds` on submission: if no decision arrives in time gca cancels the job (`approval.expired`) and refuses the late decision |
+| Emergency containment (kill switch) | Koru POSTs `/v1/controls/kill-switch` with a `scope`. `global`/`tenant` stop this instance: running agents stop at their next turn or, if a command or the verifier's test run is in flight, within about a second (`stop_reason = kill_switch`, job `cancelled`, `error = kill_switch`); nothing new is claimed, and disengaging requires a reason. `agent` (with `agent_id`) is Koru's per-agent switch: that agent's running jobs stop the same way (`error = agent_stopped`) and its queued jobs wait until it is released. `job` stops one job (it maps onto cancellation) |
+| Privacy ("Forget user") | With `[privacy] opaque_identities = true`, every person (requester, approver, actor, by) must be an opaque Koru user id, never a name or email. The audit log is append-only, so it never holds anything a "forget user" request would need to erase; Koru deletes its id → person mapping instead. See `docs/multi-tenancy.md` § Identity |
 | Publishing | After `job.finished` with `status = succeeded`, Koru POSTs `/v1/jobs/{id}/publish` naming the human who asked; gca pushes the verified commit and opens a draft PR, emitting `job.published`. Operators can turn this off with `allow_publish = false` |
 | Observability & economics | `job.started`, `job.verified` and `job.finished` (status, model, tokens, cost, verification, report, audit tail hash) feed Koru's per-agent activity and cost views |
 | Channels (Portal, Slack, Teams) | A Koru agent or skill POSTs `/v1/work-items`; the result returns as `job.finished` with the branch and PR-ready report |
@@ -34,6 +35,11 @@ stay in step: `docs/koru-adapter.md`.
 ```toml
 [approval]
 mode = "webhook"                       # decisions only via signed POST /v1/jobs/<id>/decision
+timeout_seconds = 86400                # longest wait for a decision; requests may ask for less (default: no limit)
+
+[privacy]
+opaque_identities = true               # people only as opaque platform user ids (no names or emails)
+# identity_pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"   # your platform's id shape
 
 [webhooks]
 enabled = true
@@ -138,16 +144,17 @@ Envelope (every event):
 
 | Type | `data` |
 |---|---|
-| `job.submitted` | `work_item` {id, title, description, acceptance_criteria, repo_path, base_ref, allowed_paths, requester, source, source_ref}, `budget` |
-| `approval.requested` | title, description, acceptance_criteria, requester, repo_path, allowed_paths, budget, source, source_ref, `decide` {method, path, body template}. Emitted only when `approval.mode = "webhook"` |
+| `job.submitted` | `work_item` {id, title, description, acceptance_criteria, repo_path, base_ref, allowed_paths, requester, source, source_ref, agent_id}, `budget`, approval_expires_at |
+| `approval.requested` | title, description, acceptance_criteria, requester, repo_path, allowed_paths, budget, source, source_ref, agent_id, approval_expires_at (null = no deadline), `decide` {method, path, body template}. Emitted only when `approval.mode = "webhook"` |
+| `approval.expired` | expired_at, title, requester, agent_id, source, source_ref. The window closed without a decision; the job is now `cancelled` with error `approval_expired`. Close the approval request on your side |
 | `approval.decided` | decision (`approve` or `reject`), approver, note, conditions[], restrictions (object or null) |
 | `job.started` | worker, attempt, branch, title |
 | `job.blocked_action` | tool, args (truncated), reason |
 | `job.verified` | passed, flags[], exit_code, files_changed[] |
-| `job.finished` | status, error, audit_tail_hash, title, branch, provider, model, requester, approver, source, source_ref, `agent` {stop_reason, claimed_success, blocked_actions, usage}, `verification` {passed, flags, exit_code, files_changed, insertions, deletions}, report_markdown (optional) |
+| `job.finished` | status, error, audit_tail_hash, agent_id, title, branch, provider, model, requester, approver, source, source_ref, `agent` {stop_reason, claimed_success, blocked_actions, usage}, `verification` {passed, flags, exit_code, files_changed, insertions, deletions}, report_markdown (optional) |
 | `job.cancel_requested` | by, scope (`job`), reason |
 | `job.published` | step (`branch_pushed` or `pull_request_opened`), actor, branch, remote, commit, url, base, draft |
-| `control.kill_switch` | enabled, reason, actor, scope (`global` or `tenant`; `job_id` is null) |
+| `control.kill_switch` | enabled, reason, actor, scope (`global`, `tenant` or `agent`), agent_id (for `agent`, else null); `job_id` is null |
 
 Delivery is **at least once**: deduplicate on `id`. Order is creation order per process, but receivers
 should not depend on it. Any configured canary secret is replaced with `[REDACTED]` before an event leaves.
@@ -158,16 +165,29 @@ should not depend on it. Any configured canary secret is replaced with `[REDACTE
 ```json
 {"title": "Fix mean() off-by-one", "description": "…", "acceptance_criteria": ["…"],
  "repo_path": "/srv/repos/calc", "base_ref": "main", "test_command": ["python", "-m", "pytest", "-q"],
- "allowed_paths": ["src"], "requester": "alice@corp", "source": "koru", "source_ref": "koru-req-123",
- "idempotency_key": "koru:req-123", "budget": {"max_turns": 15, "max_cost_usd": 0.25}}
+ "allowed_paths": ["src"], "requester": "u_7f3a91", "source": "koru", "source_ref": "koru-req-123",
+ "idempotency_key": "koru:req-123", "budget": {"max_turns": 15, "max_cost_usd": 0.25},
+ "agent_id": "koru-agent-42", "approval_timeout_seconds": 3600}
 ```
-Response: `{"job_id": "job_…", "status": "submitted", "approval": "pending_webhook_decision"}`.
+Response: `{"job_id": "job_…", "status": "submitted", "approval": "pending_webhook_decision",
+"approval_expires_at": "2026-10-21T13:00:00+00:00"}` (deadline only when one applies), plus `"agent_stopped": true`
+when that agent's switch is engaged (the job is accepted and waits).
 403 when `repo_path` is not inside one of the instance's `[policy] allowed_repos`.
 `budget` can only **lower** the operator's configured limits.
 
+- `agent_id` (optional): the platform agent submitting the work. Letters, digits and `_ . : / -`, at most 128.
+  It is what the `agent` kill-switch scope stops, and it is echoed on `approval.requested`, `job.submitted` and
+  `job.finished` for per-agent views.
+- `approval_timeout_seconds` (optional, whole seconds, 1–7,776,000): how long to wait for a decision. It can
+  only **shorten** `[approval] timeout_seconds`. With neither set, a job waits for a decision indefinitely. The
+  deadline is fixed at the first submission; a resubmission with the same idempotency key keeps it.
+- With `[privacy] opaque_identities = true`, `requester` is required and must match `identity_pattern`
+  (default: letters, digits and `_ . : -`, so no email address or "First Last" name); otherwise 422. The refused
+  value is never echoed back or stored.
+
 ### `POST /v1/jobs/{id}/decision` → 200
 ```json
-{"decision": "approve", "approver": "bob@corp", "note": "…",
+{"decision": "approve", "approver": "u_2c9e04", "note": "…",
  "conditions": ["no API changes"],
  "restrictions": {"allowed_paths": ["src/stats"], "allowed_commands": ["pytest"],
                   "budget": {"max_turns": 10, "max_cost_usd": 0.50, "max_files_changed": 3, "max_lines_changed": 80, "max_seconds": 600}}}
@@ -183,18 +203,19 @@ only **narrow** what the work item and the operator's policy already allow:
 
 Every field is optional; omit the whole object for an unrestricted approval. The response echoes what is now
 in force as `enforced` and the report carries an "Approval restrictions (enforced)" line.
-Errors: 409 when not in webhook mode or when the job was already decided, 403 for self-approval,
+Errors: 409 when not in webhook mode, when the job was already decided, or when its approval window has closed
+(`approval expired: …`; the job is then `cancelled` and `approval.expired` has been sent), 403 for self-approval,
 422 for invalid input or rejected restrictions (`restrictions rejected: …`); a rejected decision leaves the
 job awaiting approval.
 
 ### `POST /v1/jobs/{id}/cancel` → 200
-`{"by": "alice@corp"}`. Before the job runs it is cancelled immediately; while running, the agent stops at
+`{"by": "u_7f3a91"}` (optional; recorded as `webhook` when absent). Before the job runs it is cancelled immediately; while running, the agent stops at
 its next turn, and a command or verifier test run in flight is killed within about a second
 (`stop_reason = cancelled`, detail `command interrupted`). A job that was mid-verification finishes as
 `cancelled` with the verification flagged `interrupted`; its branch is kept for inspection.
 
 ### `POST /v1/jobs/{id}/publish` → 200
-`{"actor": "alice@corp", "draft": true, "base": "main", "remote": "origin", "create_pr": true}`. `actor` is
+`{"actor": "u_7f3a91", "draft": true, "base": "main", "remote": "origin", "create_pr": true}`. `actor` is
 required (every publish is attributed to a person). `remote`, `base` and `draft` default to `[publish]`; the
 token and API endpoint always come from `[publish]` and cannot be chosen by the request. Pushes the verified commit and opens a draft PR, exactly
 like `gca publish`: the job must be `succeeded` and its branch must still point at the verified commit.
@@ -204,14 +225,21 @@ branch moved after verification, 502 when git or GitHub fails. Needs `GITHUB_TOK
 the PR step (push alone works without it).
 
 ### `POST /v1/controls/kill-switch` → 200
-`{"enabled": true, "reason": "incident 42", "actor": "secops@corp", "scope": "global"}`. `scope` is
-`global` (default) or `tenant`, both meaning this gca instance (run one instance per tenant), or `job` with a
-`job_id`, which stops that one job and cannot be undone (`enabled` must be `true`). Disengaging the instance
-switch requires a non-empty `reason`. Every change is recorded in the hash-chained
-`.gca/audit/_controls.jsonl` (job stops in that job's log as `cancel_requested` with `scope = job`).
+`{"enabled": true, "reason": "incident 42", "actor": "u_secops1", "scope": "global"}`. `scope` is:
+
+| scope | stops | while engaged | release |
+|---|---|---|---|
+| `global` (default), `tenant` | this gca instance (run one instance per tenant) | running jobs stop within ~1 s (`error = kill_switch`); nothing is claimed | `enabled: false` + `reason` |
+| `agent` + `agent_id` | every job submitted with that `agent_id` | its running jobs stop within ~1 s (`error = agent_stopped`); its queued jobs wait, approved; new submissions are accepted and wait | `enabled: false` + `reason`; waiting jobs then run (cancel any that should not) |
+| `job` + `job_id` | that one job | cancelled, cannot be undone (`enabled` must be `true`) | — |
+
+Disengaging requires a non-empty `reason`. The instance switch and each agent's switch are separate: one
+never clears another, and an old "off" delivery retried after a newer "on" for the same switch is refused as
+superseded (409). Every change is recorded in the hash-chained `.gca/audit/_controls.jsonl` (with `scope` and
+`agent_id`); job stops in that job's log as `cancel_requested` with `scope = job`.
 
 ### `GET /v1/jobs/{id}` → 200
-`{"job_id", "status", "title", "error", "cancel_requested", "approver", "branch", "verification_passed", "cost_usd", "updated_at"}`
+`{"job_id", "status", "title", "error", "cancel_requested", "approver", "branch", "verification_passed", "cost_usd", "agent_id", "approval_expires_at", "updated_at"}`
 
 ### `GET /healthz` → 200 (unsigned)
 `{"ok": true, "kill_switch": false}`
@@ -226,16 +254,21 @@ switch requires a non-empty `reason`. Every change is recorded in the hash-chain
   before the command runs, so a retry can never create a second job. A work item submitted without an
   `idempotency_key` gets `delivery:<delivery id>` as its key.
 - The kill switch is global to this gca instance (`scope` `global` or `tenant`). Koru's per-tenant switch maps
-  onto it, one gca instance per tenant; per-agent (per-job) stops use `scope = "job"`. The tenancy model —
+  onto it, one gca instance per tenant; Koru's per-agent switch maps onto `scope = "agent"`; a single job stop
+  uses `scope = "job"`. The tenancy model —
   what is per instance, how identities are trusted, where TLS terminates — is in `docs/multi-tenancy.md`.
 - Stops are prompt: a running command or verifier test run is killed within `STOP_POLL_SECONDS` (0.25 s) of
   the cancel or kill switch landing in the queue, in both the host and container workspaces.
+- Approval deadlines are exact for decisions (a decision after the deadline is refused even if the sweep has
+  not run yet) and prompt for the expiry itself: the worker sweeps on every poll and `gca webhook-serve` on every
+  flush, so `approval.expired` follows the deadline within `--poll` / `--flush-every` seconds.
 - Tested end to end against a mocked platform (`tests/unit/test_webhooks.py`: signing, retries, dead letters,
   approval flow, self-approval, restrictions, idempotent replay, publish, kill switch before and during a run
   and its scopes, real HTTP server; `tests/safety/test_worker_controls.py`: restrictions enforced end to end,
   interruption of a running command and of verification).
   The cross-process contract test (`scripts/webhook_e2e.py`, run in CI) covers submit, replay, allow-list
-  refusal, approval with enforced restrictions, the lifecycle, status, publish and both kill-switch scopes
-  over real signed HTTP, and regenerates the samples.
+  refusal, approval with enforced restrictions, the lifecycle, status, publish, the instance-, agent- and
+  job-scope stops, an approval window running out, and an email identity refused in opaque mode, over real
+  signed HTTP (25 checks), and regenerates the samples.
   **Not yet exercised against Koru itself.** That needs Koru's endpoint and shared secrets
   (`docs/koru-adapter.md` lists the acceptance run).

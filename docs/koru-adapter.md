@@ -11,12 +11,14 @@ gca speaks one neutral contract — signed JSON events out, signed JSON commands
 
 | gca side (contract) | Adapter does | Koru side |
 |---|---|---|
-| `approval.requested` event | opens a Koru approval with the work item, budget and `decide` pointer; on decision POSTs `/v1/jobs/{id}/decision` with the approver's identity, free-text conditions and any enforced `restrictions` the policy chose | approval operations (risk routing, SLA, delegation) |
+| `approval.requested` event | opens a Koru approval with the work item, budget, deadline (`approval_expires_at`) and `decide` pointer; on decision POSTs `/v1/jobs/{id}/decision` with the approver's opaque user id, free-text conditions and any enforced `restrictions` the policy chose | approval operations (risk routing, SLA, delegation) |
+| `approval.expired` event | closes the Koru approval request as timed out (gca has already cancelled the job and will refuse a late decision with 409) | approval operations (SLA, timeout behaviour) |
 | `job.finished` event | posts the result (status, branch, report, cost) to the originating channel/thread and Koru's activity log; on success offers "publish" | channels (Portal, Slack, Teams), observability |
-| `POST /v1/work-items` | exposed as a Koru agent skill ("Governed Coding: fix this in repo X"); fills `requester`, `source_ref`, `idempotency_key` from the Koru request | agent skills |
+| `POST /v1/work-items` | exposed as a Koru agent skill ("Governed Coding: fix this in repo X"); fills `requester` (the acting user's opaque id), `agent_id` (the calling Koru agent), `approval_timeout_seconds` (the approval policy's SLA), `source_ref` and `idempotency_key` from the Koru request | agent skills, identity |
 | `POST /v1/jobs/{id}/publish` | called when a human clicks "publish" on a succeeded job; passes that human as `actor` | channels |
-| `POST /v1/controls/kill-switch` | wired to Koru's emergency containment: tenant stop → `scope = "tenant"` on that tenant's instance; per-agent stop → `scope = "job"` | emergency containment |
-| `job.started`, `job.verified`, `job.blocked_action`, `control.kill_switch`, `job.published` | forwarded to Koru's per-agent activity and cost views | observability and economics |
+| `POST /v1/controls/kill-switch` | wired to Koru's emergency containment: global stop → `scope = "global"` on every instance; tenant stop → `scope = "tenant"` on that tenant's instance; agent stop → `scope = "agent"` + `agent_id` on that tenant's instance; one job → `scope = "job"` | emergency containment |
+| "Forget user" | nothing to send: gca stores only opaque user ids (`[privacy] opaque_identities = true`); Koru deletes its id → person mapping | privacy requests, retention |
+| `job.started`, `job.verified`, `job.blocked_action`, `control.kill_switch`, `job.published` | forwarded to Koru's per-agent activity and cost views (`job.submitted`, `approval.requested` and `job.finished` carry `agent_id`) | observability and economics |
 | signing | holds the tenant's two secrets; verifies every event, signs every command; deduplicates on event `id`; retries commands with the same delivery id | secrets, platform plumbing |
 
 ## Ownership decision
@@ -55,6 +57,8 @@ developed.
 | Koru's approval API and decision callback shape | to confirm `approver`, `conditions` and `restrictions` can be populated from Koru's approval policy | the contract supports all three; the adapter maps whatever Koru provides |
 | Koru's agent-skill API | to expose `POST /v1/work-items` as a skill with `requester` = the authenticated Koru user | `requester` is a string gca records; Koru must fill it from its own identity |
 | Identity model within a tenant | decides whether one instance per tenant suffices or key ids are needed (`docs/multi-tenancy.md`) | one instance per tenant |
+| The shape of Koru user ids and agent ids | sets `[privacy] identity_pattern` exactly, and confirms agent ids fit `agent_id` (letters, digits, `_ . : / -`, ≤ 128) | the default pattern, which refuses emails and names |
+| How Koru's approval SLA and timeout behaviour are expressed | to pass the right `approval_timeout_seconds` and to handle `approval.expired` | a deadline per request; none by default |
 | Secret distribution | how the two shared secrets and the publish token reach a tenant instance | environment variables from the platform's secret store |
 | A Koru staging endpoint and secrets | to run `scripts/webhook_e2e.py` against the real adapter instead of the fake receiver | the fake receiver; the script's checks are the acceptance criteria for that run |
 

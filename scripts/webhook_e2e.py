@@ -15,8 +15,10 @@ the lifecycle is submitted -> approval.requested -> approval.decided (by the pla
 restrictions) -> started -> verified -> finished(succeeded); the job status endpoint agrees; an unsigned
 command is rejected; a submission outside `allowed_repos` is refused; a replayed delivery is idempotent; the
 platform can publish the verified commit (`job.published`); the kill switch round-trips at instance scope and
-stops one job at job scope. Writes webhook-e2e.json/.md and webhook-e2e.contract.json (one sample per event
-type and per command: request and response), which is what the adapter team codes against.
+stops one job at job scope; an agent-scope stop holds that agent's work until released; an approval window that
+runs out cancels the job (`approval.expired`) and refuses the late decision; with opaque identities on, a request
+naming a person by email is refused. Writes webhook-e2e.json/.md and webhook-e2e.contract.json (one sample per
+event type and per command: request and response), which is what the adapter team codes against.
 """
 
 from __future__ import annotations
@@ -65,7 +67,9 @@ def run_receiver(port: int, out_file: Path, gca_url: str, approver: str) -> None
             self.send_response(204 if reason is None else 401)
             self.end_headers()
             ev = record.get("event") or {}
-            if ev.get("type") == "approval.requested":  # Koru's approval routing decides and calls back
+            ref = ((ev.get("data") or {}).get("source_ref") or "")
+            if ev.get("type") == "approval.requested" and not ref.startswith("KORU-EXPIRE"):
+                # Koru's approval routing decides and calls back (except for requests left to time out)
                 decide = json.dumps({"decision": "approve", "approver": approver, "note": "approved by e2e policy",
                                      "conditions": ["touch only stats.py"],
                                      "restrictions": {"allowed_paths": ["stats.py"], "budget": {"max_turns": 12}}}).encode()
@@ -177,6 +181,7 @@ def main() -> int:
         f'[budget]\nmax_turns = 15\nmax_cost_usd = 0.25\nmax_seconds = 300\n'
         f'[policy]\nallowed_commands = ["python", "python3", "{py.name}"]\nallowed_repos = ["{repo.as_posix()}"]\n'
         f'[approval]\nmode = "webhook"\n'
+        f'[privacy]\nopaque_identities = true\n'
         f'[webhooks]\nenabled = true\noutbound_urls = ["{koru_url}"]\ninbound_port = {gca_port}\n'
         f'[pricing]\ninput_per_million = {{ "gpt-4.1-mini" = 0.4, "gpt-4.1" = 2.0 }}\n'
         f'output_per_million = {{ "gpt-4.1-mini" = 1.6, "gpt-4.1" = 8.0 }}\n')
@@ -194,12 +199,12 @@ def main() -> int:
         with httpx.Client(timeout=15) as c:
             checks["unsigned_command_rejected"] = c.post(f"{gca_url}/v1/work-items", content=b"{}").status_code == 401
             work_item = {
-                "title": "Fix mean() off-by-one", "requester": "alice@corp", "source": "koru", "source_ref": "KORU-REQ-1",
+                "title": "Fix mean() off-by-one", "requester": "u-alice", "source": "koru", "source_ref": "KORU-REQ-1",
                 "description": "stats.mean([2, 4, 6]) returns 6.0 instead of 4.0. Fix it.",
                 "acceptance_criteria": ["mean() returns the arithmetic mean", "mean([]) still raises ValueError",
                                         "all tests pass"],
                 "repo_path": str(repo), "test_command": [str(py), "-m", "pytest", "-q", "-p", "no:cacheprovider"],
-                "idempotency_key": "koru:KORU-REQ-1"}
+                "idempotency_key": "koru:KORU-REQ-1", "agent_id": "koru-agent-1"}
             submit_delivery = f"drv-{uuid.uuid4().hex}"
             r = signed_post(c, f"{gca_url}/v1/work-items", work_item, delivery_id=submit_delivery, sample="submit")
             checks["submit_accepted"] = r.status_code == 201
@@ -208,9 +213,14 @@ def main() -> int:
             rr = signed_post(c, f"{gca_url}/v1/work-items", work_item, delivery_id=submit_delivery, sample="submit_replayed")
             checks["replayed_delivery_is_idempotent"] = rr.status_code == 201 and rr.json() == {**r.json(), "replayed": True}
             r2 = signed_post(c, f"{gca_url}/v1/work-items", {
-                "title": "x", "requester": "mallory@corp", "description": "d", "acceptance_criteria": [],
+                "title": "x", "requester": "u-mallory", "description": "d", "acceptance_criteria": [],
                 "repo_path": str(outside), "test_command": ["pytest"]}, sample="submit_outside_allowed_repos")
             checks["repo_outside_allow_list_refused"] = r2.status_code == 403
+            # opaque identities: a person named by email never reaches the append-only audit log
+            r_pii = signed_post(c, f"{gca_url}/v1/work-items",
+                                {**work_item, "requester": "someone@example.com", "source_ref": "KORU-PII",
+                                 "idempotency_key": "koru:KORU-PII"}, sample="submit_email_identity_refused")
+            checks["email_identity_refused"] = r_pii.status_code == 422 and "someone" not in r_pii.text
 
             end = time.monotonic() + args.timeout
             while time.monotonic() < end:
@@ -258,7 +268,7 @@ def main() -> int:
 
             # the platform publishes the verified commit to the tenant's remote (PR creation needs GitHub; push only here)
             pub = signed_post(c, f"{gca_url}/v1/jobs/{job_id}/publish",
-                              {"actor": "alice@corp", "draft": True, "create_pr": False}, sample="publish")
+                              {"actor": "u-alice", "draft": True, "create_pr": False}, sample="publish")
             ls = subprocess.run(["git", "ls-remote", "--heads", "origin"], cwd=repo, capture_output=True, text=True, env=genv)
             checks["publish_pushed_verified_commit"] = (pub.status_code == 200 and pub.json().get("branch") in ls.stdout
                                                         and fd.get("branch") == pub.json().get("branch"))
@@ -270,7 +280,7 @@ def main() -> int:
             evs = [rec["event"] for rec in records if rec.get("event")]
             published = next((e for e in evs if e["type"] == "job.published"), {})
             checks["published_event"] = published.get("data", {}).get("step") == "branch_pushed" and \
-                published.get("data", {}).get("actor") == "alice@corp"
+                published.get("data", {}).get("actor") == "u-alice"
 
             # job-scope stop: a second request is stopped by the platform while it is queued or running
             r3 = signed_post(c, f"{gca_url}/v1/work-items", {**work_item, "source_ref": "KORU-REQ-2",
@@ -291,6 +301,56 @@ def main() -> int:
             evs = [rec["event"] for rec in records if rec.get("event")]
             cr = next((e for e in evs if e["type"] == "job.cancel_requested" and e.get("job_id") == job2), {})
             checks["job_scope_stop_event"] = cr.get("data", {}).get("scope") == "job"
+
+            def job_status(jid: str) -> dict:
+                return c.get(f"{gca_url}/v1/jobs/{jid}",
+                             headers=signed_headers(IN_SECRET, "GET", f"/v1/jobs/{jid}", b"")).json()
+
+            def wait_status(jid: str, done, seconds: float) -> dict:
+                end, st_ = time.monotonic() + seconds, {}
+                while time.monotonic() < end:
+                    st_ = job_status(jid)
+                    if done(st_):
+                        break
+                    time.sleep(0.5)
+                return st_
+
+            # agent-scope stop: everything of one platform agent waits while its switch is on, and runs once released
+            agent_on = signed_post(c, f"{gca_url}/v1/controls/kill-switch",
+                                   {"enabled": True, "actor": "secops", "reason": "agent misbehaving", "scope": "agent",
+                                    "agent_id": "koru-agent-2"}, sample="kill_switch_agent_scope")
+            r4 = signed_post(c, f"{gca_url}/v1/work-items", {**work_item, "agent_id": "koru-agent-2", "source_ref": "KORU-REQ-3",
+                                                              "idempotency_key": "koru:KORU-REQ-3"})
+            job3 = r4.json().get("job_id")
+            time.sleep(3)  # the platform approves within ~1 s and a worker polls every 0.5 s: unheld, it would have run
+            held = r4.json().get("agent_stopped") is True and job_status(job3).get("status") == "approved"
+            agent_off = signed_post(c, f"{gca_url}/v1/controls/kill-switch",
+                                    {"enabled": False, "actor": "secops", "reason": "agent fixed", "scope": "agent",
+                                     "agent_id": "koru-agent-2"})
+            st3 = wait_status(job3, lambda s_: s_.get("status") in ("succeeded", "failed", "cancelled"), 60)
+            checks["agent_stop_holds_then_releases"] = (agent_on.status_code == 200 and held
+                                                        and agent_off.status_code == 200 and st3.get("status") == "succeeded")
+
+            # approval deadline: a request nobody decides in time is cancelled, and the late decision is refused
+            r5 = signed_post(c, f"{gca_url}/v1/work-items",
+                             {**work_item, "source_ref": "KORU-EXPIRE-1", "idempotency_key": "koru:KORU-EXPIRE-1",
+                              "approval_timeout_seconds": 2}, sample="submit_with_approval_timeout")
+            job4 = r5.json().get("job_id")
+            st4 = wait_status(job4, lambda s_: s_.get("status") != "submitted", 30)
+            checks["approval_window_expires"] = (r5.status_code == 201 and bool(r5.json().get("approval_expires_at"))
+                                                 and st4.get("status") == "cancelled" and st4.get("error") == "approval_expired")
+            late = signed_post(c, f"{gca_url}/v1/jobs/{job4}/decision", {"decision": "approve", "approver": "koru-approver"},
+                               sample="decision_after_expiry")
+            checks["late_decision_refused"] = late.status_code == 409 and "expired" in late.json().get("error", "")
+            end = time.monotonic() + 15
+            while time.monotonic() < end and not any(
+                    (rec.get("event") or {}).get("type") == "approval.expired" for rec in read_events(events_file)):
+                time.sleep(0.5)
+            records = read_events(events_file)
+            evs = [rec["event"] for rec in records if rec.get("event")]
+            checks["approval_expired_event"] = any(e["type"] == "approval.expired" and e.get("job_id") == job4 for e in evs)
+            checks["agent_stop_event"] = any(e["type"] == "control.kill_switch" and e["data"].get("scope") == "agent"
+                                             and e["data"].get("agent_id") == "koru-agent-2" for e in evs)
             checks["all_signatures_valid"] = checks["all_signatures_valid"] and all(rec.get("valid_signature", True) for rec in records)
             CONTRACT["commands"]["status"] = {"request": {"method": "GET", "path": f"/v1/jobs/{job_id}", "body": None},
                                               "response": {"status": 200, "body": st}}

@@ -323,7 +323,7 @@ def test_kill_switch_blocks_claims_and_stops_running_agent(hook_cfg, work_item, 
     hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": True, "actor": "sec-ops", "reason": "incident 42"}, delivery_id="k-1")
     assert h.handle("POST", "/v1/controls/kill-switch", hd, rw)[0] == 200
     assert receiver.of("control.kill_switch")[0]["data"] == {"enabled": True, "reason": "incident 42", "actor": "sec-ops",
-                                                             "scope": "global"}
+                                                             "scope": "global", "agent_id": None}
     assert Worker(hook_cfg, q).run_once() is None  # nothing is claimed while killed
     hd, rw = signed("POST", "/v1/controls/kill-switch", {"enabled": False, "actor": "sec-ops", "reason": "resolved"}, delivery_id="k-2")
     h.handle("POST", "/v1/controls/kill-switch", hd, rw)

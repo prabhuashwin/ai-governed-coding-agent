@@ -119,7 +119,7 @@ class AgentLoop:
         while True:
             self.heartbeat()
             if self.kill_check():
-                return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="global kill switch engaged")
+                return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="kill switch engaged")
             if self.cancel_check():
                 return self._outcome(StopReason.CANCELLED, blocked=blocked)
             limit = self.tracker.exceeded()
@@ -183,7 +183,7 @@ class AgentLoop:
                                   interrupted=res.interrupted)
                 if res.interrupted:  # a stop request ended the command mid-way: do not give the model another turn
                     if self.kill_check():
-                        return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="global kill switch engaged")
+                        return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="kill switch engaged")
                     return self._outcome(StopReason.CANCELLED, blocked=blocked, detail="command interrupted")
                 if res.blocked:
                     blocked += 1

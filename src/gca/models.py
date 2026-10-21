@@ -119,6 +119,12 @@ class Budget(BaseModel):
     max_lines_changed: int = 800  # insertions + deletions
 
 
+# An identifier the submitting platform gives the agent that asked for the work (e.g. a Koru agent id). Not a
+# person: used to stop all of one agent's jobs at once. Letters, digits and _ . : / - only, so it is safe in logs,
+# control names and SQL parameters and can never be an email address.
+AGENT_ID_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$"
+
+
 class WorkItem(BaseModel):
     """What an engineer submits. Text fields are UNTRUSTED input to the agent."""
 
@@ -134,6 +140,7 @@ class WorkItem(BaseModel):
     source: str = "local"  # local | servicenow | ...
     source_ref: str | None = None  # e.g. ServiceNow sys_id
     idempotency_key: str | None = None
+    agent_id: str | None = Field(default=None, pattern=AGENT_ID_PATTERN)  # the platform agent that submitted it
 
 
 class Restrictions(BaseModel):
@@ -276,6 +283,9 @@ class Job(BaseModel):
     result: RunResult | None = None
     error: str | None = None
     cancel_requested: bool = False
+    # When the approval window closes (UTC ISO 8601), or None to wait for a decision indefinitely. A job still
+    # awaiting approval at this time is cancelled with error "approval_expired"; a later decision is refused.
+    approval_expires_at: str | None = None
 
 
 class AuditEvent(BaseModel):

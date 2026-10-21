@@ -43,6 +43,7 @@ A **malicious or gullible model** obeys injected instructions. They answer: *do 
 - Blocked-action limit halts the run (`policy_halt`).
 - Canary secret: withheld from tool output, flagged in the diff (`secret_canary_in_diff`), redacted from the audit log.
 - Verifier catches: deleted test file, reduced test count, newly skipped tests, test-config tampering, claimed success with failing tests, no-op runs, and diffs larger than the job's `max_files_changed` / `max_lines_changed` budget.
+- Koru integration (`tests/unit/test_koru_gaps.py`): a per-agent stop holds that agent's queue, interrupts its running command and wins over a success about to commit, without touching other agents or the instance switch, and a stale release is refused; approval deadlines refuse late decisions inside the transaction and are swept to `approval_expired` exactly once; opaque-identity mode refuses names and emails at every webhook, CLI and ServiceNow entry point and keeps them out of the audit log and stored responses.
 - Worker controls (`test_worker_controls.py`): approval restrictions that widen are refused; narrowed paths and commands are enforced by the file tools, the command policy and the verifier (the job fails with blocked actions); a cancel kills a 20-second command within a few seconds; a kill switch engaged during the verifier's test run ends the job `cancelled`/`kill_switch` with verification flagged `interrupted`.
 
 Add a new attack by adding a scripted step list; if the harness lets it through, the test fails.
@@ -54,8 +55,9 @@ run-before-approval does nothing → approve → run → status → report (+dif
 working copy untouched. Reject and cancel paths. The eval runner itself with a scripted model.
 
 **Webhook contract test** (`test_webhook_e2e_script.py` → `scripts/webhook_e2e.py`): gca, a fake Koru and a
-driver as three OS processes over real signed HTTP. Nineteen checks covering every inbound command and
-every event type except `job.blocked_action`; writes `webhook-e2e.contract.json`, and the test fails if the
+driver as three OS processes over real signed HTTP, with opaque identities on. Twenty-five checks covering
+every inbound command (including agent-scope stops and an approval window running out) and every event type
+except `job.blocked_action`; writes `webhook-e2e.contract.json`, and the test fails if the
 event shapes differ from the committed `docs/webhook-contract-samples.json` (the adapter team's reference).
 Run `python scripts/webhook_e2e.py --provider openai --model gpt-4.1-mini` for the same conversation with a
 real model.
