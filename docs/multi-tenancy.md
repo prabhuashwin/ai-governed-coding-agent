@@ -38,7 +38,9 @@ instances" covers that.
 | Who may talk to this instance | `GCA_INBOUND_SECRET` (commands in), `GCA_WEBHOOK_SECRET` (events out) — one pair per instance | signature v2 on every request/event |
 | Where results are published | `[publish] remote / base / draft / token_env / api_base` — one GitHub token (or GHE endpoint) per instance, scoped to that tenant's repositories | `gca publish`, `POST /v1/jobs/{id}/publish`. A publish request may narrow `remote`, `base`, `draft`; it cannot name a token or API endpoint |
 | Whether the platform may publish at all | `[webhooks] allow_publish` | `POST /v1/jobs/{id}/publish` → 403 |
-| Emergency stop | `POST /v1/controls/kill-switch` with `scope` `global` or `tenant` (both = this instance); `job` for one job | queue `controls` row, worker, running commands |
+| Emergency stop | `POST /v1/controls/kill-switch` with `scope` `global` or `tenant` (both = this instance); `agent` + `agent_id` for one platform agent's jobs; `job` for one job | queue `controls` rows (one for the instance, one per stopped agent), claims, worker, running commands, the success transaction |
+| Approval deadline | `[approval] timeout_seconds` (ceiling) and per-request `approval_timeout_seconds` | decisions after the deadline refused (409); overdue jobs cancelled by the worker and `webhook-serve` sweeps |
+| How people are recorded | `[privacy] opaque_identities`, `identity_pattern` | every identity entry point: webhook, CLI, ServiceNow sync |
 | Model and gateway | `[provider]` — a per-tenant gateway route or key | provider construction |
 | Budgets and command policy | `[budget]`, `[policy]` | agent loop, verifier |
 | Data | `data_dir` (queue, outbox, audit logs, worktrees) | every component |
@@ -56,6 +58,39 @@ Koru authenticates the human  →  Koru signs the command with the tenant's secr
 gca enforces the one identity rule it can: a decision's `approver` may not equal the work item's `requester`
 (`allow_self_approval = false`). Everything else — who may submit against which repository, who may approve
 at which risk level, who may publish — is Koru approval policy, applied before the command reaches gca.
+
+### Opaque identities and "Forget user"
+
+The audit log is append-only and hash-chained: removing or editing an entry breaks `gca audit --verify`, which
+is the point of it. A "forget user" request therefore cannot be met by deleting from it. Instead, set
+
+```toml
+[privacy]
+opaque_identities = true
+identity_pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"   # Koru's user-id shape
+```
+
+and gca only ever records people as opaque platform user ids. Every identity a caller supplies — `requester`
+(required in this mode), `approver`, `actor`, `by`, on the webhook API and the CLI — must match
+`identity_pattern`; anything else is refused (422 / exit 2) before anything is written, and the refused value is
+not echoed back or stored. `identity_pattern` is **required** in this mode: no generic pattern can tell a user
+name such as `jane.doe` from an id, so you state the platform's exact id format, and gca refuses to start if
+the pattern would accept an email address or a spaced name. ServiceNow people are recorded only as `sys_id`s
+(32 hex characters, a separate id space checked on its own): a record whose `opened_by` or `approver` holds
+anything else — a display name, a user name typed into a text field — is refused for that record. Make those
+fields references to `sys_user` (the bootstrap's `u_approver` is a text field: put the approver's `sys_id` in
+it, or leave it empty). Labels gca uses when no person is named (`cli`, `webhook`, `servicenow`, `gca`,
+`worker:<id>`) are not people.
+
+Koru keeps the id → person mapping. **Forgetting a user = Koru deletes that mapping.** Every gca record about
+the person (audit log, job rows, events already delivered, the PR description) then holds an id that resolves
+to no one, and the audit chain stays intact. Nothing in gca needs to be edited.
+
+What opaque identities do **not** cover: free text the caller sends (title, description, acceptance criteria,
+approval notes and conditions, cancel and kill-switch reasons) is recorded as given, and the agent's tool calls
+record paths and output from the repository. Keep personal data out of task text (Koru can enforce that at its
+side); job rows holding it are deleted by `gca prune` after `[retention] jobs_days`, but the audit log keeps the
+text. Recording free text as a digest instead is an open item.
 
 **Blocked on Koru:** if Koru's identity model needs gca to distinguish callers *within* a tenant (e.g.
 several Koru agents with different repository rights sharing one tenant instance), the smallest change is a
@@ -98,6 +133,8 @@ the platform's certificate with the system trust store (httpx defaults).
 ## Not done / open
 
 - Key ids for several callers per instance (above; blocked on Koru identity model).
+- Free text in the audit log (task text, notes, reasons) is kept verbatim; a digest mode that records only its
+  hash in the log and keeps the text in prunable job rows would let "forget user" cover it too.
 - A token broker (short-lived GitHub App installation tokens per tenant instead of a long-lived PAT in the
   environment). `token_env` is the seam: point it at a variable the broker refreshes.
 - Automated provisioning of a tenant instance (template + secrets + proxy route). Manual for the pilot;

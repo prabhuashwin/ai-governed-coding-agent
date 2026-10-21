@@ -39,6 +39,9 @@ provider; that is the one data flow out of the boundary besides events to Koru.
 | C14 | One tenant cannot reach another's repositories or credentials | instance per tenant; `allowed_repos`; per-instance `[publish]` | `tests/unit/test_tenancy.py`; `docs/multi-tenancy.md` |
 | C15 | The plain-HTTP server is never exposed off loopback without an operator declaring the TLS proxy | bind guard | `test_plain_http_bind_off_loopback_needs_tls_proxy` |
 | C16 | Dependencies are pinned and the same pins are what CI tests | `requirements*.lock` | CI installs from the lock |
+| C17 | One platform agent can be stopped without stopping the tenant: no tool call of its running jobs starts after the stop, a command in flight is killed within ~1 s (a model call in flight returns first and is not acted on), they never end `succeeded`, its queued jobs are not claimed, other agents are unaffected, and an older request can never undo a newer one (ordered by receipt, not by application) | per-agent `controls` rows with a request version; claim filter; stop checks before every tool call; `stop_cause` in the worker and in `complete()` | `tests/unit/test_koru_gaps.py` (per-agent stop, receipt-order and scope-mismatch tests); contract test `agent_stop_holds_then_releases` |
+| C18 | A job cannot be approved after its approval window closes; it is cancelled and the platform told (at least once) | `_check_window` inside the decision transaction; worker and `webhook-serve` sweeps; expiry stays marked until recorded; `approval.expired` | `tests/unit/test_koru_gaps.py` (deadline tests, including a failed record retried); contract tests `approval_window_expires`, `late_decision_refused` |
+| C19 | With opaque identities on, every identity written to the append-only audit log or the stored responses matches the operator's declared id format (which cannot accept an email or a spaced name), or is a ServiceNow `sys_id`; anything else, including bare user names, is refused at every entry point and never echoed | required `identity_pattern`; `privacy.check_identity` (webhook, CLI); `sys_id` check (ServiceNow) | `test_opaque_mode_refuses_names_and_emails_at_every_entry_point`, `test_opaque_mode_needs_an_explicit_id_pattern_that_refuses_emails_and_names`, `test_servicenow_records_people_by_sys_id_in_opaque_mode`; contract tests `email_identity_refused`, `bare_user_name_refused` |
 
 All automated evidence runs on every CI build (`.github/workflows/ci.yml`, Ubuntu 3.10/3.12 with Docker and
 Windows 3.12). The matrix in `docs/pilot-scenarios.md` maps scenarios to the same tests.
@@ -59,6 +62,10 @@ Windows 3.12). The matrix in `docs/pilot-scenarios.md` maps scenarios to the sam
 - [ ] `gca prune` runs on a schedule and `.gca/audit/` is archived per the tenant's records policy (§ 7 of
       the runbook); the audit directory is on a filesystem with the repository's classification.
 - [ ] Koru's approval policy forbids self-approval at its level too (gca enforces it by name only).
+- [ ] `[privacy] opaque_identities = true` with `identity_pattern` set to Koru's user-id shape, and Koru's
+      "forget user" deletes its id → person mapping (gca's records then resolve to no one).
+- [ ] `[approval] timeout_seconds` is set to the longest wait the tenant accepts, and Koru sends its SLA as
+      `approval_timeout_seconds`.
 - [ ] The model provider or gateway route is the one approved for this tenant's data classification.
 
 ## 4. Residual risks accepted for the pilot
@@ -71,11 +78,15 @@ Windows 3.12). The matrix in `docs/pilot-scenarios.md` maps scenarios to the sam
 3. **Worktree mode** gives allow-listed programs host access. Accepted only on single-developer machines.
 4. **Advisory conditions** are not enforced (by design); eval task 11 measures how often a model honours them.
    A condition that must hold is expressed as a restriction or a test.
-5. **Identity is the platform's.** gca records the names Koru supplies. A compromised Koru can submit, approve
-   (as a different name) and publish within the tenant's `allowed_repos` and the token's scope — but still
+5. **Identity is the platform's.** gca records the ids Koru supplies. A compromised Koru can submit, approve
+   (as a different id) and publish within the tenant's `allowed_repos` and the token's scope — but still
    only to draft PRs behind branch protection, and every action is in the audit log.
 6. **Licence**: the code is marked `Proprietary` in `pyproject.toml` pending a decision; no third-party code
    with copyleft obligations is vendored (dependencies: pydantic, httpx, tomli — MIT/BSD).
+7. **Free text in the audit log.** Opaque identities keep people's names out of the identity fields; the task
+   text, approval notes and reasons the caller sends, and repository output the agent sees, are recorded as
+   given. Personal data in them is not covered by "forget user". Mitigation: keep personal data out of task
+   text at the platform; a digest mode is an open item.
 
 ## 5. Open items blocking "integrated" (as opposed to "pilot") sign-off
 

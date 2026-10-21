@@ -13,6 +13,7 @@ from collections.abc import Callable
 
 from . import webhooks
 from .agent import AgentLoop
+from .approvals import expire_overdue
 from .audit import AuditLog
 from .config import Config
 from .models import Job, JobStatus, RunResult, StopReason
@@ -52,6 +53,10 @@ class Worker:
         return recovered
 
     def run_once(self) -> Job | None:
+        try:  # close approval windows that have run out, whether or not anything is ready to claim
+            expire_overdue(self.cfg, self.queue)
+        except Exception:  # noqa: BLE001 - a failed sweep is retried on the next poll; it must not stop claiming
+            pass
         job = self.queue.claim_next(self.worker_id)
         if job is None:
             return None
@@ -97,8 +102,16 @@ class Worker:
             test_policy = PolicyEngine(self.cfg.policy, ws.root, wi.allowed_paths) if policy_cfg is not self.cfg.policy else policy
             tracker = BudgetTracker(job.budget)
 
-            def stop_requested() -> bool:  # polled while commands run: a cancel or kill switch ends them at once
-                return self.queue.kill_switch() is not None or self.queue.cancel_requested(job.id)
+            seen_stop: dict[str, str | None] = {"cause": None}  # the first emergency stop observed, kept for the record
+
+            def stop_cause() -> str | None:  # the instance switch, or this job's agent's switch
+                cause = self.queue.stop_cause(wi.agent_id)
+                if cause and seen_stop["cause"] is None:
+                    seen_stop["cause"] = cause
+                return cause
+
+            def stop_requested() -> bool:  # polled while commands run: a cancel or a kill switch ends them at once
+                return stop_cause() is not None or self.queue.cancel_requested(job.id)
 
             executor = ToolExecutor(ws, policy, wi.test_command, stop_check=stop_requested, test_policy=test_policy)
             provider = self.provider_factory()
@@ -109,7 +122,7 @@ class Worker:
                 cost_fn=lambda i, o: estimate_cost(self.cfg, provider.model, i, o),
                 max_blocked_actions=self.cfg.policy.max_blocked_actions,
                 cancel_check=lambda: self.queue.cancel_requested(job.id),
-                kill_check=lambda: self.queue.kill_switch() is not None,
+                kill_check=lambda: stop_cause() is not None,
                 heartbeat=lambda: self.queue.heartbeat(job.id),
             )
             outcome = loop.run(wi)
@@ -120,7 +133,8 @@ class Worker:
             audit.record(f"worker:{self.worker_id}", "committed", commit=commit, changed_files=ws.changed_files())
 
             if outcome.stop_reason in (StopReason.CANCELLED, StopReason.KILL_SWITCH):
-                why = "kill_switch" if outcome.stop_reason == StopReason.KILL_SWITCH else "cancelled by request"
+                why = seen_stop["cause"] or ("kill_switch" if outcome.stop_reason == StopReason.KILL_SWITCH
+                                             else "cancelled by request")
                 job = self.queue.finish(job.id, JobStatus.CANCELLED, result=result, error=why)
                 audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value, error=why)
                 return job
@@ -138,7 +152,7 @@ class Worker:
                          exit_code=verification.exit_code, files_changed=verification.files_changed)
 
             if "interrupted" in verification.flags:  # a stop request landed while the tests ran
-                why = "kill_switch" if self.queue.kill_switch() is not None else "cancelled during verification"
+                why = seen_stop["cause"] or stop_cause() or "cancelled during verification"
                 job = self.queue.complete(job.id, JobStatus.CANCELLED, result=result, error=why, render=render_report)
                 audit.record(f"worker:{self.worker_id}", "finished", status=job.status.value, error=job.error)
                 return job

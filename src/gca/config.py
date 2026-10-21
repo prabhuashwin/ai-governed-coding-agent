@@ -7,11 +7,12 @@ server (OpenAI, Azure, Ollama, vLLM, OpenRouter, Groq, ...) never touches code.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from .models import Budget
 
@@ -143,10 +144,45 @@ class RetentionConfig(BaseModel):
     inbound_days: int = 14   # inbound idempotency records; must exceed the platform's longest retry horizon
 
 
+MAX_APPROVAL_TIMEOUT_SECONDS = 90 * 24 * 3600  # 90 days
+
+# Values an identity pattern must never accept, whatever the platform's id format: an email address and a name.
+_NEVER_IDENTITIES = ("someone@example.com", "Jane Doe")
+
+
+class PrivacyConfig(BaseModel):
+    """How people are identified in what gca stores. The audit log is append-only and hash-chained, so it cannot
+    forget anyone; with `opaque_identities` it never learns who anyone is. Every identity a caller supplies
+    (requester, approver, actor, by) must then be an opaque platform user id matching `identity_pattern`, which
+    is required in that mode: no generic pattern can tell a user name such as "jane.doe" from an id, so the
+    operator states the platform's exact id format (e.g. a UUID). The platform keeps the id -> person mapping;
+    deleting that mapping is what "forget user" means for gca."""
+    opaque_identities: bool = False
+    identity_pattern: str | None = None
+
+    @model_validator(mode="after")
+    def _pattern(self) -> PrivacyConfig:
+        if self.identity_pattern is None:
+            if self.opaque_identities:
+                raise ValueError("opaque_identities needs identity_pattern: the platform's exact user-id format, "
+                                 "e.g. \"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$\"")
+            return self
+        try:
+            rx = re.compile(self.identity_pattern)
+        except re.error as e:
+            raise ValueError(f"identity_pattern is not a valid regular expression: {e}") from e
+        if any(rx.fullmatch(v) for v in _NEVER_IDENTITIES):
+            raise ValueError("identity_pattern must not accept an email address or a name with spaces")
+        return self
+
+
 class ApprovalConfig(BaseModel):
     # local: `gca approve` (or ServiceNow mirror). webhook: approval comes only from an inbound signed decision.
     mode: str = "local"
     allow_self_approval: bool = False  # enforced for webhook decisions
+    # Longest a job may wait for a decision; None = no limit. A submission may ask for a shorter window
+    # (`approval_timeout_seconds`), never a longer one. Overdue jobs end `cancelled` with error "approval_expired".
+    timeout_seconds: int | None = Field(default=None, gt=0, le=MAX_APPROVAL_TIMEOUT_SECONDS)
 
 
 class Config(BaseModel):
@@ -155,6 +191,7 @@ class Config(BaseModel):
     approval: ApprovalConfig = Field(default_factory=ApprovalConfig)
     publish: PublishConfig = Field(default_factory=PublishConfig)
     retention: RetentionConfig = Field(default_factory=RetentionConfig)
+    privacy: PrivacyConfig = Field(default_factory=PrivacyConfig)
     workspace: WorkspaceConfig = Field(default_factory=WorkspaceConfig)
     servicenow: ServiceNowConfig = Field(default_factory=ServiceNowConfig)
     budget: Budget = Field(default_factory=Budget)

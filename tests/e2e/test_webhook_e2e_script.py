@@ -24,7 +24,9 @@ def test_cross_process_webhook_conversation(tmp_path):
     # the contract samples the adapter team codes against cover every command and every event type gca emits
     contract = json.loads(out.with_suffix(".contract.json").read_text())
     assert set(contract["commands"]) >= {"submit", "submit_replayed", "submit_outside_allowed_repos", "decision",
-                                         "publish", "kill_switch_on", "kill_switch_job_scope", "status"}
+                                         "publish", "kill_switch_on", "kill_switch_job_scope", "status",
+                                         "kill_switch_agent_scope", "submit_with_approval_timeout",
+                                         "decision_after_expiry", "submit_email_identity_refused"}
     from gca.webhooks import EVENT_TYPES
     assert set(contract["events"]) == set(EVENT_TYPES) - {"job.blocked_action"}  # no hostile step in the smoke script
     committed = json.loads((SCRIPT.parents[1] / "docs" / "webhook-contract-samples.json").read_text())

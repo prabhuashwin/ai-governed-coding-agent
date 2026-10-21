@@ -119,7 +119,7 @@ class AgentLoop:
         while True:
             self.heartbeat()
             if self.kill_check():
-                return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="global kill switch engaged")
+                return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="kill switch engaged")
             if self.cancel_check():
                 return self._outcome(StopReason.CANCELLED, blocked=blocked)
             limit = self.tracker.exceeded()
@@ -161,6 +161,12 @@ class AgentLoop:
 
             results: list[Any] = []
             for call in calls:
+                # A stop that landed while the model was thinking (or while an earlier tool in this response ran)
+                # must keep every remaining tool call from starting: the model's reply is not acted on.
+                if self.kill_check():
+                    return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="kill switch engaged")
+                if self.cancel_check():
+                    return self._outcome(StopReason.CANCELLED, blocked=blocked)
                 if call.name == "finish":
                     # Tools earlier in this same response may have used up the clock since the post-charge check.
                     if "max_seconds" in self.tracker.exceeded_all():
@@ -183,7 +189,7 @@ class AgentLoop:
                                   interrupted=res.interrupted)
                 if res.interrupted:  # a stop request ended the command mid-way: do not give the model another turn
                     if self.kill_check():
-                        return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="global kill switch engaged")
+                        return self._outcome(StopReason.KILL_SWITCH, blocked=blocked, detail="kill switch engaged")
                     return self._outcome(StopReason.CANCELLED, blocked=blocked, detail="command interrupted")
                 if res.blocked:
                     blocked += 1

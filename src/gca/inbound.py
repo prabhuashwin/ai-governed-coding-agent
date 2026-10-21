@@ -3,7 +3,7 @@
     POST /v1/work-items              submit a work item                      -> 201 {"job_id", "status"}
     POST /v1/jobs/{id}/decision      approve | reject (approval.mode=webhook) -> 200 {"job_id", "status"}
     POST /v1/jobs/{id}/cancel        request cancellation                    -> 200 {"job_id", "status", ...}
-    POST /v1/controls/kill-switch    {"enabled": bool, "reason", "actor"}    -> 200 {"enabled", ...}
+    POST /v1/controls/kill-switch    {"enabled", "reason", "actor", "scope"} -> 200 {"enabled", ...}
     GET  /v1/jobs/{id}               job status summary (signed, empty body) -> 200 {...}
     GET  /healthz                    liveness, unsigned                      -> 200 {"ok": true}
 
@@ -25,10 +25,21 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from .approvals import approval_deadline, expire_overdue
 from .audit import AuditLog
 from .config import Config
-from .models import Budget, JobStatus, Restrictions, WorkItem, add_column_if_missing, now_iso, open_db
+from .models import (
+    AGENT_ID_PATTERN,
+    Budget,
+    JobStatus,
+    Restrictions,
+    WorkItem,
+    add_column_if_missing,
+    now_iso,
+    open_db,
+)
 from .policy import PolicyViolation, check_repo_allowed
+from .privacy import IdentityError, check_identity
 from .publish import publish_job
 from .queue import InvalidTransition, JobQueue
 from .webhooks import verify_signature
@@ -63,6 +74,13 @@ class CommandHandler:
     def _audit(self, job_id: str) -> AuditLog:
         return AuditLog(self.cfg.audit_dir, job_id, redactions=self.cfg.policy.canary_strings)
 
+    def _identity(self, value: str | None, field: str) -> str:
+        """A caller-supplied person identity; an opaque user id when `[privacy] opaque_identities` is on."""
+        try:
+            return check_identity(self.cfg, value, field)
+        except IdentityError as e:
+            raise CommandError(422, str(e)) from e
+
     # ------------------------------------------------------------- dispatch
     def handle(self, method: str, path: str, headers: dict[str, str], body: bytes) -> tuple[int, dict[str, Any]]:
         if method == "GET" and path == "/healthz":
@@ -90,8 +108,10 @@ class CommandHandler:
             status, resp = e.status, {"error": e.message}
         except json.JSONDecodeError:
             status, resp = 400, {"error": "invalid JSON"}
-        except ValidationError as e:
-            status, resp = 422, {"error": "validation failed", "detail": json.loads(e.json())[:10]}
+        except ValidationError as e:  # which field and why, never the submitted value (it may be personal data)
+            status, resp = 422, {"error": "validation failed",
+                                 "detail": [{k: v for k, v in err.items() if k not in ("input", "url")}
+                                            for err in json.loads(e.json())[:10]]}
         except Exception:
             if method == "POST":
                 self._release(delivery_id)
@@ -176,10 +196,17 @@ class CommandHandler:
     # ------------------------------------------------------------- commands
     def submit(self, p: dict[str, Any], delivery_id: str = "") -> tuple[int, dict[str, Any]]:
         budget_in = p.pop("budget", None)
+        timeout_in = p.pop("approval_timeout_seconds", None)
         p.setdefault("source", "webhook")
         if delivery_id and not p.get("idempotency_key"):
             p["idempotency_key"] = f"delivery:{delivery_id}"  # a retried delivery can never create a second job
         item = WorkItem.model_validate(p)
+        if self.cfg.privacy.opaque_identities:
+            item.requester = self._identity(p.get("requester"), "requester")
+        try:
+            expires_at = approval_deadline(self.cfg, timeout_in)
+        except ValueError as e:
+            raise CommandError(422, str(e)) from e
         try:
             item.repo_path = check_repo_allowed(self.cfg.policy.allowed_repos, item.repo_path)
         except PolicyViolation as e:
@@ -190,22 +217,34 @@ class CommandHandler:
         for f in ("max_turns", "max_input_tokens", "max_output_tokens", "max_cost_usd", "max_seconds",
                   "max_tool_calls", "max_files_changed", "max_lines_changed"):
             setattr(budget, f, min(getattr(budget, f), getattr(self.cfg.budget, f)))
-        job = self.queue.submit(item, budget)
+        job = self.queue.submit(item, budget, approval_expires_at=expires_at)
         if job.status == JobStatus.SUBMITTED and not self._audit(job.id).events():
             self._audit(job.id).record(item.requester, "submitted", work_item=item.model_dump(),
-                                       budget=budget.model_dump(), via="webhook")
-        return 201, {"job_id": job.id, "status": job.status.value,
-                     "approval": "pending_webhook_decision" if self.cfg.approval.mode == "webhook" else "local"}
+                                       budget=budget.model_dump(), approval_expires_at=job.approval_expires_at,
+                                       via="webhook")
+        out: dict[str, Any] = {"job_id": job.id, "status": job.status.value,
+                               "approval": "pending_webhook_decision" if self.cfg.approval.mode == "webhook" else "local"}
+        if job.approval_expires_at:
+            out["approval_expires_at"] = job.approval_expires_at
+        if job.work_item.agent_id and self.queue.kill_switch(job.work_item.agent_id):
+            out["agent_stopped"] = True  # accepted, but held until that agent's switch is released
+        return 201, out
 
     def decision(self, job_id: str, p: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         if self.cfg.approval.mode != "webhook":
             raise CommandError(409, "approval.mode is not 'webhook'; decisions are taken locally")
+        self._job(job_id)
+        # a decision that arrives after the window closed finds the job expired (and the platform hears so)
+        expire_overdue(self.cfg, self.queue, job_id=job_id)
         job = self._job(job_id)
+        if job.status == JobStatus.CANCELLED and job.error == "approval_expired":
+            raise CommandError(409, f"approval expired: the window for {job_id} closed at {job.approval_expires_at}")
         decision, approver = p.get("decision"), (p.get("approver") or "").strip()
         if decision not in ("approve", "reject"):
             raise CommandError(422, "decision must be 'approve' or 'reject'")
         if not approver:
             raise CommandError(422, "approver is required")
+        approver = self._identity(approver, "approver")
         if approver == job.work_item.requester and not self.cfg.approval.allow_self_approval:
             raise CommandError(403, "self-approval is not allowed")
         note = str(p.get("note", ""))
@@ -237,11 +276,12 @@ class CommandHandler:
 
     def cancel(self, job_id: str, p: dict[str, Any]) -> tuple[int, dict[str, Any]]:
         self._job(job_id)
+        by = self._identity(str(p["by"]), "by") if "by" in p else "webhook"  # "webhook": no person named
         try:
             job = self.queue.request_cancel(job_id)
         except InvalidTransition as e:
             raise CommandError(409, str(e)) from e
-        self._audit(job_id).record(str(p.get("by", "webhook")), "cancel_requested", via="webhook")
+        self._audit(job_id).record(by, "cancel_requested", via="webhook")
         return 200, {"job_id": job_id, "status": job.status.value, "cancel_requested": job.cancel_requested}
 
     def publish(self, job_id: str, p: dict[str, Any]) -> tuple[int, dict[str, Any]]:
@@ -254,6 +294,7 @@ class CommandHandler:
         actor = str(p.get("actor", "")).strip()
         if not actor:
             raise CommandError(422, "actor is required")
+        actor = self._identity(actor, "actor")
         if job.status != JobStatus.SUCCEEDED:
             raise CommandError(409, f"{job_id} is {job.status.value}; only succeeded jobs can be published")
         draft = p.get("draft", self.cfg.publish.draft)
@@ -279,10 +320,17 @@ class CommandHandler:
         actor, reason = str(p.get("actor", "")).strip(), str(p.get("reason", "")).strip()
         if not actor:
             raise CommandError(422, "actor is required")
+        actor = self._identity(actor, "actor")
         # Scopes. This gca instance is one containment scope (run one instance per tenant); "global" and "tenant"
-        # both mean this instance. "job" stops one running job: it maps onto cancellation, which also interrupts a
-        # command in flight.
+        # both mean this instance. "agent" is one platform agent's switch: its running jobs stop, its queued jobs
+        # wait. "job" stops one job: it maps onto cancellation, which also interrupts a command in flight.
         scope = str(p.get("scope", "global"))
+        # A target that does not match the scope is a caller bug, and guessing would be dangerous: an agent release
+        # sent without scope "agent" would otherwise release the whole instance.
+        if p.get("agent_id") not in (None, "") and scope != "agent":
+            raise CommandError(422, "agent_id is only valid with scope 'agent'")
+        if p.get("job_id") not in (None, "") and scope != "job":
+            raise CommandError(422, "job_id is only valid with scope 'job'")
         if scope == "job":
             target = str(p.get("job_id", "")).strip()
             if not target or not p["enabled"]:
@@ -295,8 +343,13 @@ class CommandHandler:
             self._audit(target).record(actor, "cancel_requested", via="webhook", reason=reason, scope="job")
             return 200, {"scope": "job", "job_id": target, "status": job.status.value,
                          "cancel_requested": job.cancel_requested}
-        if scope not in ("global", "tenant"):
-            raise CommandError(422, "scope must be 'global', 'tenant' or 'job'")
+        if scope not in ("global", "tenant", "agent"):
+            raise CommandError(422, "scope must be 'global', 'tenant', 'agent' or 'job'")
+        agent_id: str | None = None
+        if scope == "agent":
+            agent_id = str(p.get("agent_id", "")).strip()
+            if not re.fullmatch(AGENT_ID_PATTERN, agent_id):
+                raise CommandError(422, "scope 'agent' needs an agent_id (letters, digits and _ . : / -, at most 128)")
         if not p["enabled"] and not reason:
             raise CommandError(422, "a reason is required to disengage the kill switch")
         # The kill switch is the one command whose re-run is not harmless: an old "off" re-applied after a newer
@@ -304,16 +357,19 @@ class CommandHandler:
         # delivery's outcome are one transaction (JobQueue.apply_kill_switch_delivery). The audit entry is written
         # afterwards; if that fails the change and its delivery record are already durable, so a retry replays.
         resp: dict[str, Any] = {"enabled": p["enabled"], "actor": actor, "reason": reason, "scope": scope}
+        if agent_id:
+            resp["agent_id"] = agent_id
         outcome = self.queue.apply_kill_switch_delivery(
             delivery_id, first_received_at or now_iso(), p["enabled"], reason=reason, actor=actor,
-            response=json.dumps(resp, default=str))
+            response=json.dumps(resp, default=str), agent_id=agent_id)
         if outcome == "superseded":
             raise CommandError(409, "superseded: the kill switch was changed after this delivery was first received")
         if outcome == "already_applied":
             return 200, {**resp, "already_applied": True}
         try:
             AuditLog(self.cfg.audit_dir, "_controls").record(actor, "kill_switch", enabled=p["enabled"], reason=reason,
-                                                               via="webhook", delivery_id=delivery_id, scope=scope)
+                                                               via="webhook", delivery_id=delivery_id, scope=scope,
+                                                               agent_id=agent_id)
         except Exception as e:  # noqa: BLE001 - the control change is committed; say so rather than fail the request
             resp["audit_recorded"] = False
             resp["audit_error"] = str(e)[:200]
@@ -328,6 +384,7 @@ class CommandHandler:
             "branch": r.branch if r else None,
             "verification_passed": r.verification.passed if r and r.verification else None,
             "cost_usd": round(r.agent.usage.cost_usd, 6) if r and r.agent else None,
+            "agent_id": job.work_item.agent_id, "approval_expires_at": job.approval_expires_at,
             "updated_at": job.updated_at,
         }
 
@@ -339,10 +396,11 @@ class CommandHandler:
 
 
 def set_kill_switch(cfg: Config, queue: JobQueue, enabled: bool, *, reason: str, actor: str, via: str,
-                    delivery_id: str | None = None) -> None:
-    """Engage/disengage the global stop and record it in a dedicated audit stream."""
-    queue.set_kill_switch(enabled, reason=reason, actor=actor, delivery_id=delivery_id)
-    AuditLog(cfg.audit_dir, "_controls").record(actor, "kill_switch", enabled=enabled, reason=reason, via=via)
+                    delivery_id: str | None = None, agent_id: str | None = None) -> None:
+    """Engage/disengage the instance stop (or one agent's) and record it in the `_controls` audit stream."""
+    queue.set_kill_switch(enabled, reason=reason, actor=actor, delivery_id=delivery_id, agent_id=agent_id)
+    AuditLog(cfg.audit_dir, "_controls").record(actor, "kill_switch", enabled=enabled, reason=reason, via=via,
+                                                scope="agent" if agent_id else "global", agent_id=agent_id)
 
 
 # ----------------------------------------------------------------------------- HTTP adapter

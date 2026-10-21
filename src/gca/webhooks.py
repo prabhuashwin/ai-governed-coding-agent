@@ -38,11 +38,12 @@ import httpx
 
 from . import audit as _audit
 from .config import Config
-from .models import AuditEvent, Job, now_iso, open_db
+from .models import AuditEvent, Job, _retry_locked, now_iso, open_db
 
 EVENT_TYPES = (
     "job.submitted", "approval.requested", "approval.decided", "job.started", "job.blocked_action",
     "job.verified", "job.finished", "job.cancel_requested", "job.published", "control.kill_switch",
+    "approval.expired",
 )
 
 # audit event name -> public event type
@@ -50,6 +51,7 @@ _AUDIT_MAP = {
     "submitted": "job.submitted",
     "approved": "approval.decided",
     "rejected": "approval.decided",
+    "approval_expired": "approval.expired",
     "claimed": "job.started",
     "blocked_action": "job.blocked_action",
     "verified": "job.verified",
@@ -218,20 +220,23 @@ class Outbox:
         flusher, a worker, another process) may see the same due row; only the one whose UPDATE wins posts it."""
         lease = (datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)).isoformat()
         with self._lock:
-            cur = self._conn.execute(
+            cur = _retry_locked(lambda: self._conn.execute(
                 "UPDATE webhook_outbox SET status='inflight', next_attempt_at=? "
                 "WHERE id=? AND url=? AND status IN ('pending','inflight') AND next_attempt_at <= ?",
-                (lease, event_id, url, now_iso()))
+                (lease, event_id, url, now_iso())))
             return cur.rowcount == 1
 
     def mark(self, event_id: str, url: str, *, status: str, attempts: int, error: str | None = None,
              retry_in: float | None = None) -> None:
         nxt = (datetime.now(timezone.utc) + timedelta(seconds=retry_in or 0)).isoformat()
+        # Retried on transient lock errors (seen on Windows under concurrent deliverers): this runs after the POST
+        # succeeded, so giving up here would leave the row in flight, post it again when the lease ran out, and
+        # abandon the rest of this delivery pass.
         with self._lock:
-            self._conn.execute(
+            _retry_locked(lambda: self._conn.execute(
                 "UPDATE webhook_outbox SET status=?, attempts=?, last_error=?, next_attempt_at=?, "
                 "delivered_at=CASE WHEN ?='delivered' THEN ? ELSE delivered_at END WHERE id=? AND url=?",
-                (status, attempts, (error or "")[:500], nxt, status, now_iso(), event_id, url))
+                (status, attempts, (error or "")[:500], nxt, status, now_iso(), event_id, url)))
 
     def rows(self, status: str | None = None) -> list[dict[str, Any]]:
         q = "SELECT id, url, type, job_id, attempts, status, last_error, created_at, delivered_at FROM webhook_outbox"
@@ -319,12 +324,19 @@ def build_event(cfg: Config, ev: AuditEvent) -> dict[str, Any] | None:
     if etype == "job.submitted":
         wi = d.get("work_item", {})
         data = {"work_item": {k: wi.get(k) for k in ("id", "title", "description", "acceptance_criteria", "repo_path",
-                                                    "base_ref", "allowed_paths", "requester", "source", "source_ref")},
-                "budget": d.get("budget")}
+                                                    "base_ref", "allowed_paths", "requester", "source", "source_ref",
+                                                    "agent_id")},
+                "budget": d.get("budget"), "approval_expires_at": d.get("approval_expires_at")}
     elif etype == "approval.decided":
         data = {"decision": "approve" if ev.event == "approved" else "reject", "approver": ev.actor,
                 "note": d.get("note", ""), "conditions": d.get("conditions", []),
                 "restrictions": d.get("restrictions")}
+    elif etype == "approval.expired":
+        job = _load_job(cfg, ev.job_id)
+        wi = job.work_item if job else None
+        data = {"expired_at": d.get("expires_at"), "title": wi.title if wi else None,
+                "requester": wi.requester if wi else None, "agent_id": d.get("agent_id"),
+                "source": wi.source if wi else None, "source_ref": wi.source_ref if wi else None}
     elif etype == "job.started":
         job = _load_job(cfg, ev.job_id)
         data = {"worker": ev.actor.removeprefix("worker:"), "attempt": d.get("attempt"),
@@ -335,7 +347,8 @@ def build_event(cfg: Config, ev: AuditEvent) -> dict[str, Any] | None:
         data = {k: d.get(k) for k in ("passed", "flags", "exit_code", "files_changed")}
     elif etype == "job.finished":
         job = _load_job(cfg, ev.job_id)
-        data = {"status": d.get("status"), "error": d.get("error"), "audit_tail_hash": ev.hash}
+        data = {"status": d.get("status"), "error": d.get("error"), "audit_tail_hash": ev.hash,
+                "agent_id": job.work_item.agent_id if job else None}
         if job and job.result:
             r = job.result
             a, v = r.agent, r.verification
@@ -356,7 +369,7 @@ def build_event(cfg: Config, ev: AuditEvent) -> dict[str, Any] | None:
                 "commit": d.get("commit"), "url": d.get("url"), "base": d.get("base"), "draft": d.get("draft")}
     elif etype == "control.kill_switch":
         data = {"enabled": d.get("enabled"), "reason": d.get("reason", ""), "actor": ev.actor,
-                "scope": d.get("scope", "global")}
+                "scope": d.get("scope", "global"), "agent_id": d.get("agent_id")}
     else:  # job.cancel_requested
         data = {"by": ev.actor, "scope": d.get("scope", "job"), "reason": d.get("reason", "")}
     event = {"id": f"evt_{uuid.uuid4().hex}", "type": etype, "created_at": now_iso(), "source": cfg.webhooks.source_name,
@@ -383,6 +396,7 @@ def approval_requested_event(cfg: Config, job: Job) -> dict[str, Any]:
         "data": {"title": wi.title, "description": wi.description[:4000], "acceptance_criteria": wi.acceptance_criteria,
                  "requester": wi.requester, "repo_path": wi.repo_path, "allowed_paths": wi.allowed_paths,
                  "budget": job.budget.model_dump(), "source": wi.source, "source_ref": wi.source_ref,
+                 "agent_id": wi.agent_id, "approval_expires_at": job.approval_expires_at,
                  "decide": {"method": "POST", "path": f"/v1/jobs/{job.id}/decision",
                             "body": {"decision": "approve|reject", "approver": "<user>", "note": "", "conditions": [],
                                      "restrictions": {"allowed_paths": None, "allowed_commands": None,

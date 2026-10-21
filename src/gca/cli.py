@@ -8,13 +8,17 @@ import os
 import sys
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from . import __version__
+from .approvals import approval_deadline, expire_overdue
 from .audit import AuditLog, verify_chain
 from .cmdline import split_command
 from .config import Config, load_config
 from .models import JobStatus, Restrictions, WorkItem
 from .policy import PolicyViolation, check_repo_allowed
-from .queue import JobQueue
+from .privacy import IdentityError, check_identity
+from .queue import InvalidTransition, JobQueue
 from .worker import Worker
 
 EXAMPLE_CONFIG = """# gca.toml — governed coding agent configuration
@@ -124,19 +128,31 @@ def cmd_init(args, cfg):
     return 0
 
 
+def _cli_identity(cfg: Config, value: str, field: str, default: str = "cli") -> str:
+    """A person named on the command line; the command's own default label ("cli") names no one."""
+    return value if value == default else check_identity(cfg, value, field)
+
+
 def cmd_submit(args, cfg):
     desc = Path(args.description_file).read_text(encoding="utf-8") if args.description_file else (args.description or "")
     try:
         repo_path = check_repo_allowed(cfg.policy.allowed_repos, args.repo)
-    except PolicyViolation as e:
+        requester = _cli_identity(cfg, args.requester, "--requester")
+        expires_at = approval_deadline(cfg, args.approval_timeout)
+        item = WorkItem(
+            title=args.title, description=desc, acceptance_criteria=args.criteria or [],
+            repo_path=repo_path, base_ref=args.base,
+            test_command=split_command(args.test_cmd) if args.test_cmd else WorkItem.model_fields["test_command"].default_factory(),
+            allowed_paths=args.allowed_path or [], requester=requester, idempotency_key=args.idempotency_key,
+            agent_id=args.agent_id,
+        )
+    except ValidationError as e:
+        print("invalid work item: " + "; ".join(f"{'.'.join(str(x) for x in err['loc'])}: {err['msg']}"
+                                                for err in e.errors()), file=sys.stderr)
+        return 2
+    except (PolicyViolation, ValueError) as e:  # repo not allowed, identity refused, bad approval timeout
         print(str(e), file=sys.stderr)
         return 2
-    item = WorkItem(
-        title=args.title, description=desc, acceptance_criteria=args.criteria or [],
-        repo_path=repo_path, base_ref=args.base,
-        test_command=split_command(args.test_cmd) if args.test_cmd else WorkItem.model_fields["test_command"].default_factory(),
-        allowed_paths=args.allowed_path or [], requester=args.requester, idempotency_key=args.idempotency_key,
-    )
     budget = cfg.budget.model_copy()
     if args.max_cost is not None:
         budget.max_cost_usd = args.max_cost
@@ -147,8 +163,9 @@ def cmd_submit(args, cfg):
     if args.max_lines is not None:
         budget.max_lines_changed = args.max_lines
     q = _queue(cfg)
-    job = q.submit(item, budget)
-    AuditLog(cfg.audit_dir, job.id).record(args.requester, "submitted", work_item=item.model_dump(), budget=budget.model_dump())
+    job = q.submit(item, budget, approval_expires_at=expires_at)
+    AuditLog(cfg.audit_dir, job.id).record(item.requester, "submitted", work_item=item.model_dump(),
+                                           budget=budget.model_dump(), approval_expires_at=job.approval_expires_at)
     print(job.id)
     return 0
 
@@ -159,6 +176,16 @@ def cmd_approve(args, cfg):
               "Use --override (recorded in the audit log) only for break-glass situations.", file=sys.stderr)
         return 4
     q = _queue(cfg)
+    try:
+        approver = check_identity(cfg, args.approver, "--approver")
+    except IdentityError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    expire_overdue(cfg, q, job_id=args.job_id)  # a decision after the window closed finds the job expired
+    current = q.get(args.job_id)
+    if current.status == JobStatus.CANCELLED and current.error == "approval_expired":
+        print(f"approval expired: the window for {current.id} closed at {current.approval_expires_at}", file=sys.stderr)
+        return 2
     restrictions = None
     budget = {k: v for k, v in (("max_cost_usd", args.max_cost), ("max_turns", args.max_turns),
                                 ("max_files_changed", args.max_files), ("max_lines_changed", args.max_lines))
@@ -167,13 +194,16 @@ def cmd_approve(args, cfg):
         restrictions = Restrictions(allowed_paths=args.allow_path or None, allowed_commands=args.allow_command or None,
                                     budget=budget or None)
     try:
-        job = q.reject(args.job_id, args.approver, args.note) if args.reject else \
-            q.approve(args.job_id, args.approver, args.note, restrictions=restrictions,
+        job = q.reject(args.job_id, approver, args.note) if args.reject else \
+            q.approve(args.job_id, approver, args.note, restrictions=restrictions,
                       operator_commands=cfg.policy.allowed_commands)
+    except InvalidTransition as e:  # already decided, or the window closed at this very moment
+        print(str(e), file=sys.stderr)
+        return 2
     except ValueError as e:
         print(f"restrictions rejected: {e}", file=sys.stderr)
         return 2
-    AuditLog(cfg.audit_dir, job.id).record(args.approver, "rejected" if args.reject else "approved", note=args.note,
+    AuditLog(cfg.audit_dir, job.id).record(approver, "rejected" if args.reject else "approved", note=args.note,
                                            override=bool(getattr(args, "override", False)),
                                            restrictions=restrictions.model_dump(exclude_none=True) if restrictions else None)
     print(f"{job.id} -> {job.status.value}")
@@ -181,9 +211,14 @@ def cmd_approve(args, cfg):
 
 
 def cmd_cancel(args, cfg):
+    try:
+        by = _cli_identity(cfg, args.by, "--by")
+    except IdentityError as e:
+        print(str(e), file=sys.stderr)
+        return 2
     q = _queue(cfg)
     job = q.request_cancel(args.job_id)
-    AuditLog(cfg.audit_dir, job.id).record(args.by, "cancel_requested")
+    AuditLog(cfg.audit_dir, job.id).record(by, "cancel_requested")
     print(f"{job.id} -> {job.status.value} (cancel_requested={job.cancel_requested})")
     return 0
 
@@ -280,6 +315,10 @@ def cmd_webhook_serve(args, cfg):
 
     def flusher():
         while not stop.wait(args.flush_every):
+            try:  # approval windows close even when this process runs no worker
+                expire_overdue(cfg, q)
+            except Exception as e:  # noqa: BLE001
+                print(f"approval expiry sweep error: {e}", file=sys.stderr)
             try:
                 _wh.flush(cfg)
             except Exception as e:  # noqa: BLE001
@@ -339,17 +378,28 @@ def cmd_webhook_status(args, cfg):
 
 
 def cmd_kill(args, cfg):
+    import re as _re
+
     from .inbound import set_kill_switch
+    from .models import AGENT_ID_PATTERN
     q = _queue(cfg)
     if args.state == "status":
         ks = q.kill_switch()
-        print(json.dumps({"enabled": bool(ks), **(ks or {})}))
+        print(json.dumps({"enabled": bool(ks), **(ks or {}), "stopped_agents": q.stopped_agents()}))
         return 0
+    if args.agent is not None and not _re.fullmatch(AGENT_ID_PATTERN, args.agent):
+        print("--agent must be an agent id (letters, digits and _ . : / -, at most 128)", file=sys.stderr)
+        return 2
     if args.state == "off" and not args.reason:
         print("a --reason is required to disengage the kill switch", file=sys.stderr)
         return 2
-    set_kill_switch(cfg, q, args.state == "on", reason=args.reason or "", actor=args.by, via="cli")
-    print(f"kill switch {args.state}")
+    try:
+        actor = _cli_identity(cfg, args.by, "--by")
+    except IdentityError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+    set_kill_switch(cfg, q, args.state == "on", reason=args.reason or "", actor=actor, via="cli", agent_id=args.agent)
+    print(f"kill switch {args.state}" + (f" for agent {args.agent}" if args.agent else ""))
     return 0
 
 
@@ -392,6 +442,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--allowed-path", action="append"); s.add_argument("--requester", default="cli")
     s.add_argument("--idempotency-key"); s.add_argument("--max-cost", type=float); s.add_argument("--max-turns", type=int)
     s.add_argument("--max-files", type=int, help="diff may touch at most N files"); s.add_argument("--max-lines", type=int, help="diff may change at most N lines")
+    s.add_argument("--agent-id", help="the platform agent submitting this work (lets `gca kill on --agent` stop it)")
+    s.add_argument("--approval-timeout", type=int, help="seconds to wait for a decision (at most [approval] timeout_seconds)")
     s.set_defaults(fn=cmd_submit)
 
     s = sub.add_parser("approve", help="approve (or --reject) a job"); s.add_argument("job_id"); s.add_argument("--approver", required=True); s.add_argument("--note", default=""); s.add_argument("--reject", action="store_true"); s.add_argument("--override", action="store_true", help="break-glass: approve locally even when approval.mode=webhook"); s.add_argument("--allow-path", action="append", help="enforced condition: restrict writes to this path (repeatable; must lie inside the work item's allowed paths)"); s.add_argument("--allow-command", action="append", help="enforced condition: restrict the agent to this command (repeatable; subset of the operator allow-list)"); s.add_argument("--max-cost", type=float, help="enforced condition: lower the cost budget (USD)"); s.add_argument("--max-turns", type=int); s.add_argument("--max-files", type=int); s.add_argument("--max-lines", type=int); s.set_defaults(fn=cmd_approve)
@@ -405,7 +457,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("webhook-deliver", help="deliver pending outbound webhook events now"); s.add_argument("--requeue-dead", action="store_true"); s.set_defaults(fn=cmd_webhook_deliver)
     s = sub.add_parser("prune", help="apply [retention]: drop old terminal jobs, delivered/dead outbound events and inbound idempotency records (audit logs are kept)"); s.add_argument("--dry-run", action="store_true"); s.set_defaults(fn=cmd_prune)
     s = sub.add_parser("webhook-status", help="list outbound webhook deliveries"); s.add_argument("--status", choices=["pending", "inflight", "delivered", "dead"]); s.add_argument("--limit", type=int, default=50); s.set_defaults(fn=cmd_webhook_status)
-    s = sub.add_parser("kill", help="global kill switch: stop running agents and claim nothing new"); s.add_argument("state", choices=["on", "off", "status"]); s.add_argument("--reason", default=""); s.add_argument("--by", default="cli"); s.set_defaults(fn=cmd_kill)
+    s = sub.add_parser("kill", help="kill switch: stop running work and claim nothing new (the instance, or one --agent)"); s.add_argument("state", choices=["on", "off", "status"]); s.add_argument("--agent", help="stop only this platform agent's jobs"); s.add_argument("--reason", default=""); s.add_argument("--by", default="cli"); s.set_defaults(fn=cmd_kill)
     s = sub.add_parser("servicenow-sync", help="poll ServiceNow for approved work items and write status back"); s.add_argument("--once", action="store_true"); s.add_argument("--poll", type=float); s.set_defaults(fn=cmd_servicenow_sync)
     s = sub.add_parser("eval", help="run golden-task evals against the configured provider"); s.add_argument("--tasks-dir", default="evals/tasks"); s.add_argument("--out", default="evals/results"); s.add_argument("--only"); s.add_argument("--repeats", type=int, default=1); s.set_defaults(fn=cmd_eval)
     return p

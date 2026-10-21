@@ -5,10 +5,10 @@
    "request": {
     "method": "POST",
     "path": "/v1/work-items",
-    "delivery_id": "drv-69a548bd681a493c8745afc805d36875",
+    "delivery_id": "drv-e22e2b91de8045988634974c49678243",
     "body": {
      "title": "Fix mean() off-by-one",
-     "requester": "alice@corp",
+     "requester": "usr_a11ce0000001",
      "source": "koru",
      "source_ref": "KORU-REQ-1",
      "description": "stats.mean([2, 4, 6]) returns 6.0 instead of 4.0. Fix it.",
@@ -26,13 +26,14 @@
       "-p",
       "no:cacheprovider"
      ],
-     "idempotency_key": "koru:KORU-REQ-1"
+     "idempotency_key": "koru:KORU-REQ-1",
+     "agent_id": "koru-agent-1"
     }
    },
    "response": {
     "status": 201,
     "body": {
-     "job_id": "job_a2567a25056b",
+     "job_id": "job_605fc2a49da2",
      "status": "submitted",
      "approval": "pending_webhook_decision"
     }
@@ -42,10 +43,10 @@
    "request": {
     "method": "POST",
     "path": "/v1/work-items",
-    "delivery_id": "drv-69a548bd681a493c8745afc805d36875",
+    "delivery_id": "drv-e22e2b91de8045988634974c49678243",
     "body": {
      "title": "Fix mean() off-by-one",
-     "requester": "alice@corp",
+     "requester": "usr_a11ce0000001",
      "source": "koru",
      "source_ref": "KORU-REQ-1",
      "description": "stats.mean([2, 4, 6]) returns 6.0 instead of 4.0. Fix it.",
@@ -63,13 +64,14 @@
       "-p",
       "no:cacheprovider"
      ],
-     "idempotency_key": "koru:KORU-REQ-1"
+     "idempotency_key": "koru:KORU-REQ-1",
+     "agent_id": "koru-agent-1"
     }
    },
    "response": {
     "status": 201,
     "body": {
-     "job_id": "job_a2567a25056b",
+     "job_id": "job_605fc2a49da2",
      "status": "submitted",
      "approval": "pending_webhook_decision",
      "replayed": true
@@ -80,10 +82,10 @@
    "request": {
     "method": "POST",
     "path": "/v1/work-items",
-    "delivery_id": "drv-2b8bd1bf82dd480c939f17bb9c6b7af9",
+    "delivery_id": "drv-4a427404d3bc4e3f86d6039880863fc3",
     "body": {
      "title": "x",
-     "requester": "mallory@corp",
+     "requester": "usr_ba0000000004",
      "description": "d",
      "acceptance_criteria": [],
      "repo_path": "/srv/gca/e2e/outside",
@@ -99,13 +101,49 @@
     }
    }
   },
+  "submit_email_identity_refused": {
+   "request": {
+    "method": "POST",
+    "path": "/v1/work-items",
+    "delivery_id": "drv-e28fbbe042e543fa99b02d1d3beb8ef1",
+    "body": {
+     "title": "Fix mean() off-by-one",
+     "requester": "someone@example.com",
+     "source": "koru",
+     "source_ref": "KORU-PII",
+     "description": "stats.mean([2, 4, 6]) returns 6.0 instead of 4.0. Fix it.",
+     "acceptance_criteria": [
+      "mean() returns the arithmetic mean",
+      "mean([]) still raises ValueError",
+      "all tests pass"
+     ],
+     "repo_path": "/srv/gca/e2e/repo",
+     "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "-q",
+      "-p",
+      "no:cacheprovider"
+     ],
+     "idempotency_key": "koru:KORU-PII",
+     "agent_id": "koru-agent-1"
+    }
+   },
+   "response": {
+    "status": 422,
+    "body": {
+     "error": "requester must be an opaque user id matching '^usr_[0-9a-f]{12}$', not a name, user name or email address ([privacy] opaque_identities = true)"
+    }
+   }
+  },
   "decision": {
    "request": {
     "method": "POST",
-    "path": "/v1/jobs/job_a2567a25056b/decision",
+    "path": "/v1/jobs/job_605fc2a49da2/decision",
     "body": {
      "decision": "approve",
-     "approver": "koru-approver",
+     "approver": "usr_a99f00000002",
      "note": "approved by e2e policy",
      "conditions": [
       "touch only stats.py"
@@ -123,7 +161,7 @@
    "response": {
     "status": 200,
     "body": {
-     "job_id": "job_a2567a25056b",
+     "job_id": "job_605fc2a49da2",
      "status": "approved",
      "enforced": {
       "allowed_paths": [
@@ -150,7 +188,7 @@
     "path": "/v1/controls/kill-switch",
     "body": {
      "enabled": true,
-     "actor": "secops",
+     "actor": "usr_5ec000000003",
      "reason": "drill",
      "scope": "global"
     }
@@ -159,7 +197,7 @@
     "status": 200,
     "body": {
      "enabled": true,
-     "actor": "secops",
+     "actor": "usr_5ec000000003",
      "reason": "drill",
      "scope": "global"
     }
@@ -168,10 +206,10 @@
   "publish": {
    "request": {
     "method": "POST",
-    "path": "/v1/jobs/job_a2567a25056b/publish",
-    "delivery_id": "drv-b120b2b5fb4745da949ee7e9b3249ba2",
+    "path": "/v1/jobs/job_605fc2a49da2/publish",
+    "delivery_id": "drv-b005596f9ea14de187c0622e05f9b28c",
     "body": {
-     "actor": "alice@corp",
+     "actor": "usr_a11ce0000001",
      "draft": true,
      "create_pr": false
     }
@@ -179,8 +217,8 @@
    "response": {
     "status": 200,
     "body": {
-     "job_id": "job_a2567a25056b",
-     "branch": "gca/job_a2567a25056b",
+     "job_id": "job_605fc2a49da2",
+     "branch": "gca/job_605fc2a49da2",
      "pushed_to": "/srv/gca/e2e/remote.git",
      "pr_url": null,
      "note": "branch pushed; PR creation skipped"
@@ -191,59 +229,142 @@
    "request": {
     "method": "POST",
     "path": "/v1/controls/kill-switch",
-    "delivery_id": "drv-d16b89ffb7c74c27874f4524dff2ffcd",
+    "delivery_id": "drv-c952d654e1024cd5bb670f96b10353ef",
     "body": {
      "enabled": true,
-     "actor": "secops",
+     "actor": "usr_5ec000000003",
      "reason": "wrong ticket",
      "scope": "job",
-     "job_id": "job_3d7d059c5e5f"
+     "job_id": "job_7a43873cad5c"
     }
    },
    "response": {
     "status": 200,
     "body": {
      "scope": "job",
-     "job_id": "job_3d7d059c5e5f",
+     "job_id": "job_7a43873cad5c",
      "status": "cancelled",
      "cancel_requested": false
+    }
+   }
+  },
+  "kill_switch_agent_scope": {
+   "request": {
+    "method": "POST",
+    "path": "/v1/controls/kill-switch",
+    "delivery_id": "drv-d6515dad24b14c9bb046a451412af0e3",
+    "body": {
+     "enabled": true,
+     "actor": "usr_5ec000000003",
+     "reason": "agent misbehaving",
+     "scope": "agent",
+     "agent_id": "koru-agent-2"
+    }
+   },
+   "response": {
+    "status": 200,
+    "body": {
+     "enabled": true,
+     "actor": "usr_5ec000000003",
+     "reason": "agent misbehaving",
+     "scope": "agent",
+     "agent_id": "koru-agent-2"
+    }
+   }
+  },
+  "submit_with_approval_timeout": {
+   "request": {
+    "method": "POST",
+    "path": "/v1/work-items",
+    "delivery_id": "drv-f5d7cbd1bbfb4037a75bc096d0353b78",
+    "body": {
+     "title": "Fix mean() off-by-one",
+     "requester": "usr_a11ce0000001",
+     "source": "koru",
+     "source_ref": "KORU-EXPIRE-1",
+     "description": "stats.mean([2, 4, 6]) returns 6.0 instead of 4.0. Fix it.",
+     "acceptance_criteria": [
+      "mean() returns the arithmetic mean",
+      "mean([]) still raises ValueError",
+      "all tests pass"
+     ],
+     "repo_path": "/srv/gca/e2e/repo",
+     "test_command": [
+      "python",
+      "-m",
+      "pytest",
+      "-q",
+      "-p",
+      "no:cacheprovider"
+     ],
+     "idempotency_key": "koru:KORU-EXPIRE-1",
+     "agent_id": "koru-agent-1",
+     "approval_timeout_seconds": 2
+    }
+   },
+   "response": {
+    "status": 201,
+    "body": {
+     "job_id": "job_96a8c156cfd8",
+     "status": "submitted",
+     "approval": "pending_webhook_decision",
+     "approval_expires_at": "2026-10-21T13:33:41.696409+00:00"
+    }
+   }
+  },
+  "decision_after_expiry": {
+   "request": {
+    "method": "POST",
+    "path": "/v1/jobs/job_96a8c156cfd8/decision",
+    "delivery_id": "drv-3ee402abcde5472d88b09ea600fab1fb",
+    "body": {
+     "decision": "approve",
+     "approver": "usr_a99f00000002"
+    }
+   },
+   "response": {
+    "status": 409,
+    "body": {
+     "error": "approval expired: the window for job_96a8c156cfd8 closed at 2026-10-21T13:33:41.696409+00:00"
     }
    }
   },
   "status": {
    "request": {
     "method": "GET",
-    "path": "/v1/jobs/job_a2567a25056b",
+    "path": "/v1/jobs/job_605fc2a49da2",
     "body": null
    },
    "response": {
     "status": 200,
     "body": {
-     "job_id": "job_a2567a25056b",
+     "job_id": "job_605fc2a49da2",
      "status": "succeeded",
      "title": "Fix mean() off-by-one",
      "error": null,
      "cancel_requested": false,
-     "approver": "koru-approver",
-     "branch": "gca/job_a2567a25056b",
+     "approver": "usr_a99f00000002",
+     "branch": "gca/job_605fc2a49da2",
      "verification_passed": true,
      "cost_usd": 0.0,
-     "updated_at": "2026-10-19T09:40:52.020340+00:00"
+     "agent_id": "koru-agent-1",
+     "approval_expires_at": null,
+     "updated_at": "2026-10-21T13:33:34.029926+00:00"
     }
    }
   }
  },
  "events": {
   "job.submitted": {
-   "id": "evt_ab0525a70e754c798336ce846c97e31e",
+   "id": "evt_c3f54aa045184a659187f9291f43b72d",
    "type": "job.submitted",
-   "created_at": "2026-10-19T09:40:50.013776+00:00",
+   "created_at": "2026-10-21T13:33:32.123038+00:00",
    "source": "gca",
-   "job_id": "job_a2567a25056b",
+   "job_id": "job_605fc2a49da2",
    "audit_seq": 1,
    "data": {
     "work_item": {
-     "id": "wi_13856b3c803c",
+     "id": "wi_cf980502c5e4",
      "title": "Fix mean() off-by-one",
      "description": "stats.mean([2, 4, 6]) returns 6.0 instead of 4.0. Fix it.",
      "acceptance_criteria": [
@@ -254,9 +375,10 @@
      "repo_path": "/srv/gca/e2e/repo",
      "base_ref": "HEAD",
      "allowed_paths": [],
-     "requester": "alice@corp",
+     "requester": "usr_a11ce0000001",
      "source": "koru",
-     "source_ref": "KORU-REQ-1"
+     "source_ref": "KORU-REQ-1",
+     "agent_id": "koru-agent-1"
     },
     "budget": {
      "max_turns": 15,
@@ -267,15 +389,16 @@
      "max_tool_calls": 120,
      "max_files_changed": 20,
      "max_lines_changed": 800
-    }
+    },
+    "approval_expires_at": null
    }
   },
   "approval.requested": {
-   "id": "evt_007b01714531497cafa8191cff47c733",
+   "id": "evt_be50f98783864ba5ae253a7362ccd711",
    "type": "approval.requested",
-   "created_at": "2026-10-19T09:40:50.064929+00:00",
+   "created_at": "2026-10-21T13:33:32.170912+00:00",
    "source": "gca",
-   "job_id": "job_a2567a25056b",
+   "job_id": "job_605fc2a49da2",
    "audit_seq": null,
    "data": {
     "title": "Fix mean() off-by-one",
@@ -285,7 +408,7 @@
      "mean([]) still raises ValueError",
      "all tests pass"
     ],
-    "requester": "alice@corp",
+    "requester": "usr_a11ce0000001",
     "repo_path": "/srv/gca/e2e/repo",
     "allowed_paths": [],
     "budget": {
@@ -300,9 +423,11 @@
     },
     "source": "koru",
     "source_ref": "KORU-REQ-1",
+    "agent_id": "koru-agent-1",
+    "approval_expires_at": null,
     "decide": {
      "method": "POST",
-     "path": "/v1/jobs/job_a2567a25056b/decision",
+     "path": "/v1/jobs/job_605fc2a49da2/decision",
      "body": {
       "decision": "approve|reject",
       "approver": "<user>",
@@ -318,15 +443,15 @@
    }
   },
   "approval.decided": {
-   "id": "evt_4656f3ad81d9426198ed3e60f50cc21f",
+   "id": "evt_5658ce867464458db8403114710140e6",
    "type": "approval.decided",
-   "created_at": "2026-10-19T09:40:50.145676+00:00",
+   "created_at": "2026-10-21T13:33:32.248317+00:00",
    "source": "gca",
-   "job_id": "job_a2567a25056b",
+   "job_id": "job_605fc2a49da2",
    "audit_seq": 2,
    "data": {
     "decision": "approve",
-    "approver": "koru-approver",
+    "approver": "usr_a99f00000002",
     "note": "approved by e2e policy",
     "conditions": [
      "touch only stats.py"
@@ -342,25 +467,25 @@
    }
   },
   "job.started": {
-   "id": "evt_bb732091ecf14ee1ac2ce49c4f5e286a",
+   "id": "evt_57ecf350533940efabca936126a16aed",
    "type": "job.started",
-   "created_at": "2026-10-19T09:40:50.362471+00:00",
+   "created_at": "2026-10-21T13:33:32.475056+00:00",
    "source": "gca",
-   "job_id": "job_a2567a25056b",
+   "job_id": "job_605fc2a49da2",
    "audit_seq": 3,
    "data": {
     "worker": "e2e-worker",
     "attempt": 1,
-    "branch": "gca/job_a2567a25056b",
+    "branch": "gca/job_605fc2a49da2",
     "title": "Fix mean() off-by-one"
    }
   },
   "job.verified": {
-   "id": "evt_2d359b47907542fdb0a48bddeee811d3",
+   "id": "evt_d1565353f9b64962b06bf8b653a57c54",
    "type": "job.verified",
-   "created_at": "2026-10-19T09:40:51.967915+00:00",
+   "created_at": "2026-10-21T13:33:33.996492+00:00",
    "source": "gca",
-   "job_id": "job_a2567a25056b",
+   "job_id": "job_605fc2a49da2",
    "audit_seq": 18,
    "data": {
     "passed": true,
@@ -372,22 +497,23 @@
    }
   },
   "job.finished": {
-   "id": "evt_e19debe50eaa40b580336ccf09e157cd",
+   "id": "evt_cf2001ef3f2244ac9be8a355d364fc0b",
    "type": "job.finished",
-   "created_at": "2026-10-19T09:40:52.023340+00:00",
+   "created_at": "2026-10-21T13:33:34.031426+00:00",
    "source": "gca",
-   "job_id": "job_a2567a25056b",
+   "job_id": "job_605fc2a49da2",
    "audit_seq": 19,
    "data": {
     "status": "succeeded",
     "error": null,
-    "audit_tail_hash": "0816eabcc9f4a846e7d54c8f4925db84709169c4cfca3116baced9c5d416e669",
+    "audit_tail_hash": "dcfcdd0bce0748dde0880d62ccb7d75def733914441790f85a8fbe5b7f76baa1",
+    "agent_id": "koru-agent-1",
     "title": "Fix mean() off-by-one",
-    "branch": "gca/job_a2567a25056b",
+    "branch": "gca/job_605fc2a49da2",
     "provider": "scripted",
     "model": "scripted-smoke",
-    "requester": "alice@corp",
-    "approver": "koru-approver",
+    "requester": "usr_a11ce0000001",
+    "approver": "usr_a99f00000002",
     "source": "koru",
     "source_ref": "KORU-REQ-1",
     "agent": {
@@ -400,7 +526,7 @@
       "cost_usd": 0.0,
       "turns": 5,
       "tool_calls": 4,
-      "seconds": 0.6830018720002045
+      "seconds": 0.6383689170002071
      }
     },
     "verification": {
@@ -413,52 +539,69 @@
      "insertions": 1,
      "deletions": 1
     },
-    "report_markdown": "# Fix mean() off-by-one\n\nJob `job_a2567a25056b` \u00b7 branch `gca/job_a2567a25056b` \u00b7 status **succeeded**\nRequested by alice@corp; approved by koru-approver; provider scripted/scripted-smoke\nApproval conditions (advisory): touch only stats.py\nApproval restrictions (enforced): writes limited to ['stats.py']; budget lowered: max_turns=12\n\n## Verdict\n- Independent verification: **PASSED** (exit 0)\n- Agent stop reason: `finished`; agent claimed success: True\n\n## Acceptance criteria\n- [ ] mean() returns the arithmetic mean\n- [ ] mean([]) still raises ValueError\n- [ ] all tests pass\n\n## Agent summary (unverified)\nmean() divided by len(values) - 1; changed the divisor to len(values). All tests pass.\n\n## Changes\n1 file(s), +1 \u22121\n- `stats.py`\n\n## Test evidence (verifier run, clean checkout)\n```\n....                                                                     [100%]\n4 passed in 0.10s\n```\n\n## Cost\nturns 5 \u00b7 tool calls 4 \u00b7 tokens in/out 5000/500 \u00b7 $0.0000 \u00b7 1s\n\n## Audit\nHash-chained audit log: `.gca/audit/job_a2567a25056b.jsonl` (verify with `gca audit job_a2567a25056b --verify`).\n\n_Merge, release and production actions remain separate human approvals._"
+    "report_markdown": "# Fix mean() off-by-one\n\nJob `job_605fc2a49da2` \u00b7 branch `gca/job_605fc2a49da2` \u00b7 status **succeeded**\nRequested by usr_a11ce0000001; approved by usr_a99f00000002; provider scripted/scripted-smoke\nApproval conditions (advisory): touch only stats.py\nApproval restrictions (enforced): writes limited to ['stats.py']; budget lowered: max_turns=12\n\n## Verdict\n- Independent verification: **PASSED** (exit 0)\n- Agent stop reason: `finished`; agent claimed success: True\n\n## Acceptance criteria\n- [ ] mean() returns the arithmetic mean\n- [ ] mean([]) still raises ValueError\n- [ ] all tests pass\n\n## Agent summary (unverified)\nmean() divided by len(values) - 1; changed the divisor to len(values). All tests pass.\n\n## Changes\n1 file(s), +1 \u22121\n- `stats.py`\n\n## Test evidence (verifier run, clean checkout)\n```\n....                                                                     [100%]\n4 passed in 0.09s\n```\n\n## Cost\nturns 5 \u00b7 tool calls 4 \u00b7 tokens in/out 5000/500 \u00b7 $0.0000 \u00b7 1s\n\n## Audit\nHash-chained audit log: `.gca/audit/job_605fc2a49da2.jsonl` (verify with `gca audit job_605fc2a49da2 --verify`).\n\n_Merge, release and production actions remain separate human approvals._"
    }
   },
   "control.kill_switch": {
-   "id": "evt_62037ba880be41d3808b798f988c674a",
+   "id": "evt_73e8e41528a54fc396ddc3cf019874eb",
    "type": "control.kill_switch",
-   "created_at": "2026-10-19T09:40:52.119286+00:00",
+   "created_at": "2026-10-21T13:33:34.221183+00:00",
    "source": "gca",
    "job_id": null,
    "audit_seq": 1,
    "data": {
     "enabled": true,
     "reason": "drill",
-    "actor": "secops",
-    "scope": "global"
+    "actor": "usr_5ec000000003",
+    "scope": "global",
+    "agent_id": null
    }
   },
   "job.published": {
-   "id": "evt_8c75188d47d14d85807f8d4026f0329f",
+   "id": "evt_62b46e23e5724b1282e6feb697db8639",
    "type": "job.published",
-   "created_at": "2026-10-19T09:40:52.235595+00:00",
+   "created_at": "2026-10-21T13:33:34.314326+00:00",
    "source": "gca",
-   "job_id": "job_a2567a25056b",
+   "job_id": "job_605fc2a49da2",
    "audit_seq": 21,
    "data": {
     "step": "branch_pushed",
-    "actor": "alice@corp",
-    "branch": "gca/job_a2567a25056b",
+    "actor": "usr_a11ce0000001",
+    "branch": "gca/job_605fc2a49da2",
     "remote": "/srv/gca/e2e/remote.git",
-    "commit": "999447843af1151902e8e118bd0df6bb354685ed",
+    "commit": "881702a594dcb2964e799c6f34abee11ffeaca16",
     "url": null,
     "base": null,
     "draft": null
    }
   },
   "job.cancel_requested": {
-   "id": "evt_603c2c397fc74b148b240e87f52131f2",
+   "id": "evt_782bafb21f9c4ce38540d496a991df56",
    "type": "job.cancel_requested",
-   "created_at": "2026-10-19T09:40:52.357318+00:00",
+   "created_at": "2026-10-21T13:33:34.439069+00:00",
    "source": "gca",
-   "job_id": "job_3d7d059c5e5f",
+   "job_id": "job_7a43873cad5c",
    "audit_seq": 2,
    "data": {
-    "by": "secops",
+    "by": "usr_5ec000000003",
     "scope": "job",
     "reason": "wrong ticket"
+   }
+  },
+  "approval.expired": {
+   "id": "evt_9f7f68b9ba1f46338985d38e4a165d41",
+   "type": "approval.expired",
+   "created_at": "2026-10-21T13:33:41.823878+00:00",
+   "source": "gca",
+   "job_id": "job_96a8c156cfd8",
+   "audit_seq": 2,
+   "data": {
+    "expired_at": "2026-10-21T13:33:41.696409+00:00",
+    "title": "Fix mean() off-by-one",
+    "requester": "usr_a11ce0000001",
+    "agent_id": "koru-agent-1",
+    "source": "koru",
+    "source_ref": "KORU-EXPIRE-1"
    }
   }
  },

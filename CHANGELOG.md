@@ -4,6 +4,40 @@ Versions are git tags `v<version>`. Review rounds are summarised in `docs/how-to
 
 ## 0.3.0 — unreleased
 
+Koru integration gaps (`tests/unit/test_koru_gaps.py`, contract test now 26 checks):
+
+- **Per-agent stop.** Work items may carry `agent_id` (the platform agent that submitted them). The kill switch
+  gains `scope = "agent"` + `agent_id`: no further tool call of that agent's running jobs starts, a command in
+  flight is killed within about a second (a model call in flight returns first and is not acted on), and the jobs
+  end `cancelled` with error `agent_stopped` (never `succeeded`, also when the stop lands just before success
+  commits); its queued jobs are not claimed until it is released (with a reason); other agents are unaffected;
+  a stale release cannot undo a newer stop. `gca kill on|off --agent <id>`; `gca kill status` lists stopped
+  agents. `agent_id` appears on `job.submitted`, `approval.requested`, `job.finished` and `control.kill_switch`.
+- **Approval deadline.** `[approval] timeout_seconds` (operator ceiling) and `approval_timeout_seconds` on a
+  submission (may only shorten it; `gca submit --approval-timeout`). A decision after the deadline is refused
+  (409 / exit 2) inside the decision transaction; overdue jobs are cancelled with error `approval_expired` by
+  the worker and by `webhook-serve`, recorded, and reported as the new `approval.expired` event. Without
+  either setting jobs wait indefinitely, as before.
+- **Opaque identities ("Forget user").** `[privacy] opaque_identities = true` (+ `identity_pattern`) requires
+  every person — requester (then mandatory), approver, actor, by — to be an opaque platform user id on the
+  webhook API, the CLI and the ServiceNow sync (which then records only `sys_id`s and refuses anything else).
+  `identity_pattern` is required in this mode and may not accept an email address or a spaced name; whatever
+  does not match it — emails, names, user names — is refused before anything is written and is not echoed back.
+  The platform deleting its id → person mapping is then the whole of "forget user" for gca. Free text is still
+  recorded as given.
+- Schema: `jobs.agent_id` and `jobs.approval_expires_at` are added on first open (older rows: no agent, no
+  deadline). `gca approve` now exits 2 with a message instead of a traceback when a job is already decided.
+- Pre-merge independent review of the above found six issues, all fixed with tests: kill-switch requests (the
+  instance's too — this predates 0.3.0) are now ordered by when they were first received, not when they were
+  applied, so an older "off" applied late can no longer make a newer "on" look stale; opaque mode requires an
+  explicit `identity_pattern` and refuses ServiceNow people that are not `sys_id`s; `agent_id`/`job_id` with a
+  mismatched `scope` is refused instead of acting on the instance switch; an expiry whose audit record fails is
+  retried by the next sweep instead of being lost; no tool call starts after a stop that lands during a model
+  call; and the docs no longer overstate stop latency or how often a plain worker sweeps expiries.
+- Outbox: a transient SQLite lock error while claiming or recording a delivery (seen on Windows CI with
+  concurrent deliverers) is retried instead of aborting the delivery pass, which had left the posted event in
+  flight to be posted again after its lease and skipped the rest of the batch.
+
 Fifth external review (of `e05ad46`): eight findings, all fixed with regression tests
 (`tests/unit/test_review_round5.py`; table in `docs/how-to-test.md`).
 

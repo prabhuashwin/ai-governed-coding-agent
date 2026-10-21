@@ -172,7 +172,12 @@ What you can rely on:
 - **Inbound commands are idempotent** per delivery id.
 - **Self-approval is refused**, and a caller can lower a job's budget but never raise it.
 - **The kill switch** stops running agents at their next turn, kills a command or verifier test run in flight
-  within about a second, and blocks new work. Turning it off requires a reason. `scope = "job"` stops one job.
+  within about a second, and blocks new work. Turning it off requires a reason. `scope = "agent"` stops one
+  platform agent's jobs and holds its queue; `scope = "job"` stops one job.
+- **Approvals can expire**: an operator ceiling and a per-request `approval_timeout_seconds`; an undecided job
+  is cancelled (`approval.expired`) and a late decision refused.
+- **People can be opaque ids only** (`[privacy] opaque_identities`): no name or email reaches the append-only
+  audit log, so "forget user" is the platform deleting its id → person mapping.
 - **Approvals can restrict**: structured `restrictions` (paths, commands, budget) can only narrow what the
   work item and operator policy allow, and are enforced, not advisory. Free-text `conditions` are shown to
   the reviewer.
@@ -214,7 +219,7 @@ verification report. Without `GITHUB_TOKEN`, it pushes the branch only.
 | `gca webhook-serve [--with-worker]` | Serve signed inbound commands and deliver outbound events |
 | `gca webhook-deliver [--requeue-dead]` / `gca webhook-status` | Flush or inspect outbound deliveries |
 | `gca prune [--dry-run]` | Apply `[retention]`: drop old terminal jobs, delivered/dead events and inbound idempotency records (audit logs are kept) |
-| `gca kill on\|off\|status` | Global kill switch |
+| `gca kill on\|off\|status [--agent ID]` | Kill switch for the instance, or for one platform agent |
 | `gca servicenow-sync [--once]` | Poll ServiceNow for approved work and write results back |
 | `gca eval [--repeats N] [--only name]` | Run the golden-task evals against the configured model |
 
@@ -224,7 +229,7 @@ Every command accepts `-c path/to/gca.toml` (default `./gca.toml`, or `$GCA_CONF
 
 | Layer | Command | Needs |
 |---|---|---|
-| Unit, loop, safety (red-team), end-to-end: 310 tests | `pytest -q` | nothing; about 2 minutes |
+| Unit, loop, safety (red-team), end-to-end: 342 tests | `pytest -q` | nothing; about 2 minutes |
 | Real containers | `GCA_TEST_RUNTIME=docker GCA_TEST_IMAGE=<image with pytest> pytest tests/unit/test_container_workspace.py` | Docker or Podman |
 | Golden-task evals, real model | `gca eval`, or the **evals (real model)** GitHub workflow | an API key |
 | Local model (no external inference) | **evals (local model, Ollama)** workflow | nothing |

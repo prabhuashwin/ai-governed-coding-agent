@@ -40,6 +40,11 @@ canary_strings = ["GCA-CANARY-<random>"]    # plant the same string in the envir
 
 [approval]
 mode = "webhook"
+timeout_seconds = 86400                     # longest wait for a decision; Koru may ask for less per request
+
+[privacy]
+opaque_identities = true                    # people only as opaque Koru user ids (see docs/multi-tenancy.md)
+identity_pattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"   # Koru's user-id shape
 
 [webhooks]
 enabled = true
@@ -112,7 +117,9 @@ Upgrade one tenant first; watch one job through `job.finished`; then the rest.
 | `database is locked` on start | two processes opened a fresh database at once | startup retries for 10 s; if persistent, check for a stuck process holding `jobs.sqlite3` |
 | Orphan `gca-<job id>-*` worktree directories | crash before cleanup | `recover_stale` removes the ones it knows; otherwise `git worktree prune` in the repository, then delete the directory |
 | Platform retries an old command | within `inbound_days` it is answered from the record (`replayed: true`); after that it would run again | keep `inbound_days` above the platform's retry horizon |
-| Kill switch "on" but nobody remembers why | | `gca kill status`; the actor and reason are in `.gca/audit/_controls.jsonl`; disengage with `gca kill off --reason "…" --by <you>` |
+| Kill switch "on" but nobody remembers why | | `gca kill status` (the instance switch and every stopped agent); the actor and reason are in `.gca/audit/_controls.jsonl`; disengage with `gca kill off [--agent <id>] --reason "…" --by <you>` |
+| Approved jobs of one agent never start | that agent's switch is on (`scope = "agent"`) | `gca kill status` lists it under `stopped_agents`; release it with `gca kill off --agent <id> --reason "…"`, or cancel the waiting jobs first if they should not run |
+| Job `cancelled` with error `approval_expired` | no decision arrived before its deadline | resubmit (a new idempotency key) if the work is still wanted; check the approval route and SLA on the platform side |
 | Audit log suspected tampered | | `gca audit <job> --verify` recomputes the hash chain; a break names the line |
 | Need to undo a job's branch | | `git branch -D gca/<job id>` in the repository; the audit log and report keep the record |
 
@@ -137,6 +144,11 @@ inbound idempotency records after their windows. It never deletes files. What st
 Audit logs can contain file paths, command lines and tool output excerpts from the tenant's repository,
 redacted only for configured canary strings. Treat them with the repository's own classification.
 
+**People in the records.** With `[privacy] opaque_identities = true` every person is recorded as an opaque
+platform user id, so a "forget user" request is met by the platform deleting its id → person mapping; nothing in
+gca is edited. Free text (task title and description, approval notes and conditions, reasons) is recorded as
+given: keep personal data out of it. See `docs/multi-tenancy.md` § Opaque identities.
+
 ## 8. Dependencies
 
 Runtime dependencies are pinned in `requirements.lock`; test/dev tools in `requirements-dev.lock`; CI
@@ -160,6 +172,10 @@ Pins are reviewed with each release; `CHANGELOG.md` notes dependency bumps that 
 - **`restrictions rejected`** on approval: the approver tried to widen scope, commands or budget; only
   narrowing is possible.
 - **403 on `/v1/work-items`**: `repo_path` is outside `allowed_repos`. Check the symlink-resolved path.
+- **422 "must be an opaque user id"**: opaque identities are on and the platform sent a name or an email address
+  (or nothing, for `requester`). Send the platform's user id; adjust `identity_pattern` if your ids have another
+  shape.
+- **409 "approval expired"** on a decision: the job's approval window closed first. The job is `cancelled`; resubmit.
 - **Refusing to bind**: `inbound_host` is not loopback and `behind_tls_proxy` is false.
 - **Signature failures** (`401`): clock skew beyond `max_skew_seconds`, a proxy that rewrites the path, or
   mismatched secrets. The receiver's log says which check failed.

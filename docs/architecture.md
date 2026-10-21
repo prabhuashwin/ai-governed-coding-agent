@@ -67,6 +67,9 @@ dies leaves a stale heartbeat; `recover_stale` moves the job to `failed` with a 
 | Webhook signatures bind method, path, delivery id and body; inbound delivery ids reserved before execution | `webhooks.sign`, `inbound.handle` | unit, fuzz |
 | Repository allow-list: a work item may only target a checkout under `[policy] allowed_repos` (symlinks resolved), from any source | `policy.check_repo_allowed` | unit |
 | One tenant per instance: own secrets, repos, publishing token and data dir; plain-HTTP server refuses non-loopback binds unless declared behind a TLS proxy | `docs/multi-tenancy.md`, `inbound.make_server` | unit |
+| Per-agent stop: one agent's running jobs stop (never `succeeded`), its queued jobs are not claimed; supersession per switch | `JobQueue.stop_cause`, claim filter, `Worker`, `complete()` | unit, contract |
+| Approval deadline: decisions after the window are refused inside the decision transaction; overdue jobs are cancelled and reported | `queue._check_window`, `approvals.expire_overdue` | unit, contract |
+| Opaque identities: people recorded only as opaque ids matching `[privacy] identity_pattern` | `privacy.check_identity` (webhook, CLI, ServiceNow) | unit, contract |
 | Independent test run from clean checkout | `Verifier.verify` | safety, e2e |
 | Hash-chained audit log, appended under a cross-process lock | `AuditLog`, `verify_chain` | unit, e2e |
 | Idempotent submit, atomic claim, crash recovery | `JobQueue` | unit |
